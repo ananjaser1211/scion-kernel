@@ -4,14 +4,18 @@
 <dict>
 	<key>Label</key>
 	<string>com.hakios.gnssd</string>
-	<!-- the GNSS receiver (the BCM4775) for iOS: gnssd turns the receiver on while a position may be wanted (the
-	     screen on, Location Services on), reads its fixes and hands them to locationd, which gives them to every app.
-	     Without the receiver's firmware (devices/star2lte/firmware/gnss, gnss-esw-N-ADDR.bin in /redwood/fw) it says
-	     so and waits, and locationd keeps to Wi-Fi. src/gnssd.m, docs/gnssd.md -->
+	<!-- the GNSS receiver (the BCM4775) for iOS: gnssd answers com.apple.gpsd, where locationd asks for GNSS (Apple's gpsd
+	     job is left out, mkjobs.py), runs the receiver while locationd or the GNSS app wants it, and writes the status
+	     the app shows. Needs the ESW in /redwood/fw (devices/star2lte/firmware/gnss). src/gnssd.m, docs/gnssd.md -->
 	<key>ProgramArguments</key>
 	<array>
 		<string>/redwood/bin/gnssd</string>
 	</array>
+	<key>MachServices</key>
+	<dict>
+		<key>com.apple.gpsd</key>
+		<true/>
+	</dict>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>

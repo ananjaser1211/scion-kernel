@@ -217,7 +217,8 @@ INJECT=${INJECT-"/redwood/lib/libhakios.dylib backboardd containermanagerd conta
 /redwood/lib/libhakios.sb.dylib SpringBoard MobilePhone InCallService
 /redwood/lib/libhakios.media.dylib mediaserverd
 /redwood/lib/libhakios.app.dylib Sileo
-/redwood/lib/libhakios.tweaks.dylib Preferences"}
+/redwood/lib/libhakios.tweaks.dylib Preferences
+/redwood/lib/libhakios.locationd.dylib locationd"}
 [ -n "$BT" ] && INJECT="$INJECT
 /redwood/lib/libhakios.bluetool.dylib BlueTool
 /redwood/lib/libhakios.bluetoothd.dylib bluetoothd"
@@ -464,9 +465,10 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 		# the GNSS bring-up's raw RPCs, SSP transactions and hub memory reads through /dev/hakios-gnss
 		# (src/gnsstool.c, docs/gnss.md)
 		$DYN -o obj/gnsstool src/gnsstool.c
-		# the GNSS receiver for iOS: its fixes to locationd, for every app (src/gnssd.m, docs/gnssd.md); locationd takes
-		# them only from a program with its simulation entitlement: by ldid, or by ../tools/machosign.py
-		$DYN -fobjc-arc -framework Foundation -framework CoreLocation -o obj/gnssd src/gnssd.m &&
+		# the GNSS receiver for iOS (src/gnssd.m, src/gnss_chip.c, docs/gnssd.md): the chip's bring-up, its fixes to
+		# locationd as com.apple.gpsd, and the status the GNSS app shows. Signed for locationd's simulation interface (its
+		# fallback, -L sim): by ldid, or by ../tools/machosign.py
+		$DYN -fobjc-arc -framework Foundation -framework CoreLocation -o obj/gnssd src/gnssd.m src/gnss_chip.c &&
 			{ ${LDID:-ldid} -Ssrc/gnssd.entitlements obj/gnssd 2>/dev/null ||
 			  python3 ../tools/machosign.py obj/gnssd src/gnssd.entitlements com.hakios.gnssd ||
 			  echo "build.sh: no ldid: gnssd is unsigned, and locationd will refuse its fixes"; }
@@ -485,6 +487,9 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 		# ... and inside BlueTool, so that it runs the Galaxy S9's Bluetooth scripts (BT=1, src/inject_bluetool.c)
 		$DYN -dynamiclib -install_name /redwood/lib/libhakios.bluetool.dylib -framework CoreFoundation -lMobileGestalt \
 			-o obj/libhakios.bluetool.dylib src/inject_bluetool.c
+		# ... and inside locationd, so that its GNSS device is gpsd's, which gnssd serves (src/inject_locationd.c)
+		$DYN -dynamiclib -install_name /redwood/lib/libhakios.locationd.dylib \
+			-o obj/libhakios.locationd.dylib src/inject_locationd.c
 		# ... and inside bluetoothd, so that its iAP PTY cannot stop its stack (BT=1, src/inject_bluetoothd.c)
 		$DYN -dynamiclib -install_name /redwood/lib/libhakios.bluetoothd.dylib \
 			-o obj/libhakios.bluetoothd.dylib src/inject_bluetoothd.c
@@ -768,6 +773,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	[ -f obj/libhakios.media.dylib ] && cp obj/libhakios.media.dylib root/lib/     # (as with cpu_test)
 	[ -f obj/libhakios.app.dylib ] && cp obj/libhakios.app.dylib root/lib/
 	[ -f obj/libhakios.tweaks.dylib ] && cp obj/libhakios.tweaks.dylib root/lib/
+	[ -f obj/libhakios.locationd.dylib ] && cp obj/libhakios.locationd.dylib root/lib/
 	if [ -n "$BT" ]; then
 		[ -f obj/libhakios.bluetool.dylib ] && cp obj/libhakios.bluetool.dylib root/lib/
 		[ -f obj/libhakios.bluetoothd.dylib ] && cp obj/libhakios.bluetoothd.dylib root/lib/
