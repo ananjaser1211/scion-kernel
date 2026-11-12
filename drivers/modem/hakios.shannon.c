@@ -424,46 +424,37 @@ load_part(volatile uint8_t *cp, uint64_t at, uint64_t from, uint64_t length, con
 
 /*
  * cbd makes both security requests with CPU 0 taken out of its affinity (std_security_req: sched_setaffinity with
- * bit 0 cleared, restored after). The SMC is made here from a core whose MPIDR is not 0, bound for the call.
+ * bit 0 cleared, restored after). No thread is bound here: binding to a processor that is not up yet panicked build
+ * 37 in thread_setrun. Instead the call is made with interrupts off (so the thread cannot move between the check and
+ * the SMC; EL3 runs the call with them masked anyway) on whatever core the thread is on, if its MPIDR's affinity is not
+ * 0; on core 0 the thread sleeps 10 ms and looks again, up to 2 s.
  */
-static bool
-bind_off_core0(void)
-{
-	const ml_topology_info_t *topology = ml_get_topology_info();
-
-	for (unsigned int i = 0; i < topology->num_cpus; i++) {
-		int cpu = (int)topology->cpus[i].cpu_id;
-		processor_t processor = cpu_to_processor(cpu);
-
-		if (processor == NULL) {
-			continue;
-		}
-		(void)thread_bind(processor);
-		(void)thread_block(NULL);
-		if ((__builtin_arm_rsr64("MPIDR_EL1") & 0xffffffull) != 0) {
-			return true;
-		}
-	}
-	(void)thread_bind(NULL);
-	(void)thread_block(NULL);
-	return false;
-}
-
 static uint64_t
 security_request(uint32_t mode, uint32_t size_boot, uint32_t size_main)
 {
-	uint64_t answer, mpidr;
+	uint64_t answer = ~0ull, mpidr = 0;
+	int tries;
 
-	if (!bind_off_core0()) {
-		say("shannon: no core but CPU 0 to make the security call from: not made\n");
+	say("shannon: security SMC %#x(mode %#x, %#x, %#x): looking for a core other than CPU 0\n", SMC_CP, mode, size_boot,
+	    size_main);
+	for (tries = 0; tries < 200; tries++) {
+		boolean_t enabled = ml_set_interrupts_enabled(FALSE);
+
+		mpidr = __builtin_arm_rsr64("MPIDR_EL1");
+		if ((mpidr & 0xffffffull) != 0) {
+			(void)smc(SMC_SSS_CLK, 0, 0, 0);
+			answer = smc(SMC_CP, mode, size_boot, size_main);
+			(void)smc(SMC_SSS_CLK, 1, 0, 0);
+			(void)ml_set_interrupts_enabled(enabled);
+			break;
+		}
+		(void)ml_set_interrupts_enabled(enabled);
+		IOSleep(10);
+	}
+	if (tries == 200) {
+		say("shannon: the thread stayed on CPU 0 for 2 s: the security call was not made\n");
 		return ~0ull;
 	}
-	mpidr = __builtin_arm_rsr64("MPIDR_EL1");
-	(void)smc(SMC_SSS_CLK, 0, 0, 0);
-	answer = smc(SMC_CP, mode, size_boot, size_main);
-	(void)smc(SMC_SSS_CLK, 1, 0, 0);
-	(void)thread_bind(NULL);
-	(void)thread_block(NULL);
 	say("shannon: security SMC %#x(mode %#x, %#x, %#x) from MPIDR %#llx answered %#llx (%s)\n", SMC_CP, mode, size_boot,
 	    size_main, mpidr, answer, answer < sizeof(smc_errors) / sizeof(smc_errors[0]) ? smc_errors[answer] : "unknown");
 	return answer;
