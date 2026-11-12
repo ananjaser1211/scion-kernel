@@ -781,6 +781,64 @@ open sky, the same build).
   timers; the ESW file belongs in the userland firmware path; and a daemon can be restarted without a reboot. The
   kernel keeps the transport, the 0x1E/0x1F records and the 0x19 log routing, as now.
 
+**What gpsd's host engine programs into the radio, compared with the MiniMe** (offline, 13 Nov; GPS worked on this
+phone under Android, so the antenna and LNA hardware are taken as good).
+- The radio is set up in INIT_STAGE B by `GlMeSrdAsicinit::ProgramRfFrequencyPlanPike` (gpsd 0x48d3f4; the ROM's copy
+  is around 0x000b5050). It sends one ESW message: a 60-byte RF init block (`GlMeSrdRfInit4755::GetRfInit`, gpsd
+  0x4bb0b4, ROM 0x000d51d2), then a list of analog radio (AR, type 0xe0) register writes. The ESW protocol is big-endian.
+- The hub log prints every ME<->ESW packet in base64 (`@^@hs..`/`@^@sh..`). Decoded from the build-33 log, the MiniMe's
+  INIT_STAGE B message is the RF init block plus **104 AR writes** (from the hub patch's table at 0x008300b0), and then
+  a DR (type 0xc0) message from `patch_ProgramDrRegs`.
+- gpsd, run in an emulator (unicorn, the vendor gpsd's own code) with this phone's inputs (radio 0x03 -> RF version 4,
+  `GL_MULTI_CARR_RF_MODE_L1` = 1, LNA mask 1, external LNA), sends something different:
+
+| | gpsd host engine (Android navigation) | the chip's MiniMe (ours) |
+|---|---|---|
+| RF init block, word 7 (+32) | **0x88eac856** (modes 1-4; 0x15dcbf8a only for mode 5 = L1_L2_L5) | **0x15dcbf8a**: the ROM (literal 0x000d561c) uses it for every mode 1-5 |
+| RF init, the other 14 words | the same | the same |
+| AR register writes | **none** for mode L1 (`ProgramArRegs` 0x4bb200 skips modes 1, 2 and 5; the ESW's own settings stay) | **104 writes** from the hub patch's table (0x008300b0, chosen by the patch's ProgramArRegs at 0x0085b44c for RF version 4, mode 1), plus 0xEF bit 7 for the external LNA |
+
+- The AR tables have changed between builds: the ROM's (0x0000cde4) and the hub patch's (0x008300b0) differ in about
+  20 registers (0x16, 0x28, 0x2f, 0x30, 0x32, 0x33, 0x40, 0x41, 0x50, 0x53, 0x58, 0x63, 0x68, 0x71, 0x93, 0x9c, 0xc0,
+  0xea, 0xeb, 0xef, 0xf0). gpsd's newer code carries no table at all for RF version 4, so with the ESW that gpsd loads
+  (`4775_B0@394878`, the one we load) the radio's analog settings are the ESW's own. The MiniMe (GLL 68.19.21 build
+  282318, Jan 2017) was written for ESW `@292538` and overwrites them with its older table. The same kind of change
+  shows in word 7 of the RF init block. **These two are the prime suspects**: on Android, ordinary navigation never lets
+  the MiniMe program the radio.
+- No GPIO, LNA-enable, antenna-select or "Radio 0x03" write was found on the host side beyond these: lhd's pin mux
+  (P17 = M1, which we send) is the only pin setting, and gpsd's ESW messages for the radio are the two above.
+- The AR table loader (ROM 0x000d5a60) stops at a register number 0xFFFF. The hub patch is in RAM, so **writing 0xFFFF
+  over the first entry (0x008300b0) makes the MiniMe send no AR table**, only 0xEF |= 0x80, which is gpsd's behaviour
+  apart from that one bit. RPC 0x05 `[u32 address][u16 n][data]` is the ROM's memory write (the patch download uses it);
+  whether it is still served after the application starts is untested. `gnsstool peek 8300b0 8` checks it.
+- Word 7 comes from a ROM literal, so it cannot be changed the same way. If the AR test alone does not help, the next
+  step is to have the MiniMe's outgoing INIT_STAGE B message rewritten in the hub patch at download time (a kernel
+  change), or to run INIT_STAGE B ourselves through PASSTHROUGH.
+
+**The CNTIN reference (49.152 MHz) is missing.** At the first IDLE -> ON (build 33) the ESW reported
+`gll_sysevt_rpc_frequency_captured: there is no reference cnt in clk detected` (hs_clk_cnt = 1). In gpsd that means
+no CNTIN clock: the result is marked invalid (gpsd 0x4c0ae8), and the engine goes on with the TCXO alone. gps.xml's
+"49.152 MHz 300 ppb" is the network-locked clock from the modem. gpsd asks for it through RIL
+(`RildClientModuleControlPlaneSamsung::cntinRequest`), and the CP firmware (RADIO.img) has `[SIPC_0_GPS] GPS FREQ.AID
+SET (clk enable=%d)` and the `LCS_FREQ_AID` machinery. Our CP never boots, so CNTIN is absent. That costs only the
+fast frequency aiding. The first open-sky run, with the chip's defaults (no external oscillator, so no CNTIN), found
+nothing either. So **sending gpsd's EXT_OSC item is wrong here**: it announces a reference that is not there. Leave it
+out until the CP runs.
+
+**The modem and the antenna** (RADIO.img, read for strings only): the CP drives its own antenna tuners and switches
+(AIT, X-GND, ANT_SW0-7, MIPI RFFE), and makes a GNSS blanking signal (`DSPTX_Gnss_GeneratePaenSig`, `IRAT_MUX_GPS_SEL`).
+None of its strings or tables mentions a GNSS antenna path, LNA or switch. Nothing found says the GNSS antenna needs the
+CP. It cannot be ruled out offline, because a tuner on a shared antenna would be configured by RF data, not strings.
+Booting the CP minimally (cbd-like loading of RADIO.img through the modem_v1 interface, plus the CP's NV/EFS) is a
+large job, and identity data is involved. It is not the next step.
+
+**Next test (phone, cold chip, indoors first and then open sky):** before the GNSS sequence, `gnsstool rpc 05
+b0008300 0200 ffff` (address LE, n = 2, the 0xFFFF terminator), then `gnsstool peek 8300b0 8` to see it applied. Then
+run the usual sequence with the CONFIG_SET **without EXT_OSC** (item 10) and with item 5's byte at +8 back to 6. Check in
+the hub log that INIT_STAGE B is ACKed and that the decoded `hs Q` message has no AR list, then compare AGC/noise
+indoors, and the detections outdoors. Record `MEIF:OSC GetOscOffset` / `SetCntinMeas` at the first IDLE -> ON (now
+unmasked).
+
 ## The tools (kernel and userland)
 
 - `/dev/hakios-gnss` (made at `shub=6`, root only; `drivers/input/ssp/hakios.ssp.c`): every RPC from the hub that is
