@@ -13,3 +13,5 @@
 # at the 5 s check-in deadline (the Galaxy S9, on two cores); nothing is done where they came up (src/poster_retry.c)
 /redwood/bin/poster_retry &
 /redwood/bin/cpu_test 240 &
+# which processes take the processors, every 10 s, one line to the log (src/cputop.c)
+/redwood/bin/cputop 10 &
