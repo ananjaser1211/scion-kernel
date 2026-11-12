@@ -160,7 +160,7 @@ check_tables(void)
 			}
 		}
 	}
-	for (int k = 0; k < 2; k++) {
+	for (int k = 0; k < 3; k++) {
 		const struct ha8_panel *panel = &ha8_panels[k];
 		const struct ha8_row *last = &panel->rows[HA8_ROWS - 1];
 
@@ -175,7 +175,7 @@ check_tables(void)
 		for (int r = 0; r < HA8_ROWS; r++) {
 			const struct ha8_row *row = &panel->rows[r];
 
-			if ((r > 0 && row->nits <= panel->rows[r - 1].nits) || row->base > 400 || row->base < 105 ||
+			if ((r > 0 && row->nits <= panel->rows[r - 1].nits) || row->base > 400 || row->base < 102 ||
 			    (r > 0 && row->base < panel->rows[r - 1].base)) {
 				fail("row's luminances", k, r);
 			}
@@ -211,8 +211,9 @@ check_tables(void)
 	    ha8_row_of_level(8) != 2 || ha8_row_of_level(255) != HA8_ROWS - 1) {
 		fail("row of level", ha8_row_of_level(1), ha8_row_of_level(8));
 	}
-	if (ha8_panel_of(0x910444) != &ha8_panels[1] || ha8_panel_of(0x910443) != &ha8_panels[0] ||
-	    ha8_panel_of(0x910453) != &ha8_panels[0] || ha8_panel_of(0) != &ha8_panels[0]) {
+	if (ha8_panel_of(0x910444, false) != &ha8_panels[1] || ha8_panel_of(0x910443, false) != &ha8_panels[0] ||
+	    ha8_panel_of(0x910453, false) != &ha8_panels[0] || ha8_panel_of(0, false) != &ha8_panels[0] ||
+	    ha8_panel_of(0, true) != &ha8_panels[2]) {
 		fail("panel of ID", 0, 0);
 	}
 }
@@ -336,11 +337,12 @@ main(int argc, char **argv)
 		0x02, 0x31,
 	};
 	uint8_t mtp[HA8_CA];
-	uint32_t random_clamped[2] = { 0, 0 };
-	double worst_white[2] = { 0, 0 }, worst_dip[2] = { 0, 0 };
+	uint32_t random_clamped[3] = { 0, 0, 0 };
+	double worst_white[3] = { 0, 0, 0 }, worst_dip[3] = { 0, 0, 0 };
 
 	if (argc == 4 && strcmp(argv[1], "--rows") == 0) {
-		const struct ha8_panel *panel = &ha8_panels[strcmp(argv[2], "S1") == 0 ? 1 : 0];
+		int panel_index = strcmp(argv[2], "STAR2") == 0 ? 2 : strcmp(argv[2], "S1") == 0 ? 1 : 0;
+		const struct ha8_panel *panel = &ha8_panels[panel_index];
 
 		if (!parse_mtp(argv[3], mtp)) {
 			fprintf(stderr, "want 68 hex digits\n");
@@ -352,7 +354,7 @@ main(int argc, char **argv)
 	}
 	check_tables();
 	check_mtp_decode();
-	for (int k = 0; k < 2; k++) {
+	for (int k = 0; k < 3; k++) {
 		const struct ha8_panel *panel = &ha8_panels[k];
 		struct result res;
 

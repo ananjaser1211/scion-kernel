@@ -35,6 +35,7 @@ media/mfc bsd/dev/hakios.exynos_mfc.c
 media/mfc bsd/dev/hakios.exynos_mfc_test.h
 display/panel bsd/dev/hakios.s6e3ha8.c
 display/panel bsd/dev/hakios.s6e3ha8_gamma.h
+display/panel bsd/dev/hakios.s6e3ha8_star2.h
 display/panel iokit/Kernel/hakios.backlight.cpp
 gpu      iokit/Kernel/hakios.gpu.cpp
 gpu/mali bsd/dev/hakios.mali.c

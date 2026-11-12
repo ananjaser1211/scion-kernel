@@ -87,6 +87,7 @@
  *   panel_gamma=2       gamma and AOR sent (the default)
  *   panel_gamma=1       the panel read and its gamma worked out and logged; the AOR alone sent
  *   panel_gamma=0       the AOR alone, nothing read: the driver as it was
+ *   panel_write=0       read and calculate, but send no brightness packets (diagnostic override; writes default on)
  *   panel_sleep=1       the screen's off and on from iOS sleep and wake the panel (hakios_s6e3ha8_power(), below;
  *                       off by default: the screen is then dark by its brightness alone, as before)
  *   panel_gamma_log=1   all 74 rows in the log, as Android's kernel prints them at start ("gamma[nits] : ...")
@@ -116,6 +117,7 @@
 #include "hakios.s6e3ha8_gamma.h"
 #include <sys/hakios.log.h>
 #include <sys/hakios.xnu.h>
+#include <dev/hakios.drivers.h>
 
 extern int hakios_panel_register(const char *name, int (*set)(int level));     /* hakios.backlight.cpp */
 
@@ -165,7 +167,8 @@ SYSCTL_DECL(_kern_hakios);
 static vm_offset_t dsim;
 static lck_mtx_t *panel_lock;
 static int panel_level = -1;
-static uint32_t panel_failures, read_failures;
+static uint32_t panel_failures, read_failures, panel_id;
+static int panel_write = 1;
 
 /* the gamma, once worked out from the MTP at start (read only after) */
 static struct ha8_work gamma_work;
@@ -377,7 +380,7 @@ panel_gamma_init(uint32_t mode)
 {
 	uint8_t id[3] = { 0 }, mtp[2][HA8_CA], ca[HA8_CA], aor[2];
 	bool have_id, keys, have_mtp = false, have_ca = false, have_aor = false, same = true, repeated = true;
-	uint32_t panel_id, clamped, show_all = 0;
+	uint32_t clamped, show_all = 0;
 	const char *refused = NULL;
 	int match = -1;
 
@@ -393,7 +396,8 @@ panel_gamma_init(uint32_t mode)
 	lck_mtx_unlock(panel_lock);
 
 	panel_id = (uint32_t)id[0] << 16 | (uint32_t)id[1] << 8 | id[2];
-	gamma_panel = ha8_panel_of(panel_id);
+	bool star2 = strcmp(HAKIOS_DEVICE, "star2lte") == 0;
+	gamma_panel = ha8_panel_of(panel_id, star2);
 	say("s6e3ha8: ID %06x%s: Samsung's tables for the %s panel; keys %s; DSIM CONFIG %x (per-frame read %s)\n",
 	    panel_id, have_id ? "" : " (NOT READ)", gamma_panel->name, keys ? "opened and closed" : "NOT ALL SENT",
 	    rd(DSIM_CONFIG), (rd(DSIM_CONFIG) & PER_FRAME_READ) ? "on" : "off");
@@ -465,6 +469,18 @@ panel_set(int level)
 	if (dsim == 0 || level < 0 || level > 255) {
 		return EINVAL;
 	}
+	if (!panel_write) {
+		static uint64_t said_at;
+		uint64_t now = mach_absolute_time(), second;
+
+		panel_level = level;
+		nanoseconds_to_absolutetime(NSEC_PER_SEC, &second);
+		if (said_at == 0 || now - said_at >= second) {
+			say("s6e3ha8: brightness %d requested; panel_write=0, no panel packet sent\n", level);
+			said_at = now;
+		}
+		return 0;
+	}
 	if (gamma_ready) {
 		int row = ha8_row_of_level(level);
 
@@ -531,6 +547,14 @@ panel_sysctl_brightness(__unused struct sysctl_oid *oidp, __unused void *arg1, _
 SYSCTL_PROC(_kern_hakios, OID_AUTO, brightness, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_ANYBODY | CTLFLAG_KERN,
     NULL, 0,
     panel_sysctl_brightness, "I", "the panel's brightness, 0-255 (-1: never set); writing sets it (Galaxy S9, panel=1)");
+SYSCTL_INT(_kern_hakios, OID_AUTO, panel_write, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_ANYBODY | CTLFLAG_KERN,
+    &panel_write, 0, "allow S6E3HA8 brightness packets (defaults on; set 0 for read-only diagnostics)");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, panel_id, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, &panel_id, 0,
+    "S6E3HA8 panel ID read at startup");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, panel_failures, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, &panel_failures, 0,
+    "S6E3HA8 brightness packet failures");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, panel_read_failures, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, &read_failures, 0,
+    "S6E3HA8 read failures");
 
 
 /*
@@ -650,7 +674,7 @@ hakios_s6e3ha8_power(bool on)
 void
 hakios_s6e3ha8_init(void)
 {
-	uint32_t enabled = 0, level = 0, mode = 2;
+	uint32_t enabled = 0, level = 0, mode = 2, write_arg;
 
 	if (!PE_parse_boot_argn("panel", &enabled, sizeof(enabled)) || enabled == 0) {
 		return;
@@ -662,8 +686,12 @@ hakios_s6e3ha8_init(void)
 		return;
 	}
 	(void)PE_parse_boot_argn("panel_gamma", &mode, sizeof(mode));
-	say("s6e3ha8: DSIM0: FIFOCTRL %x, INTSRC %x; panel_gamma=%u; kern.hakios.brightness sets the panel's brightness\n",
-	    rd(DSIM_FIFOCTRL), rd(DSIM_INTSRC), mode);
+	panel_write = 1;
+	if (PE_parse_boot_argn("panel_write", &write_arg, sizeof(write_arg))) {
+		panel_write = write_arg != 0;
+	}
+	say("s6e3ha8: DSIM0: FIFOCTRL %x, INTSRC %x; panel_gamma=%u; panel_write=%d; kern.hakios.brightness sets the panel's brightness\n",
+	    rd(DSIM_FIFOCTRL), rd(DSIM_INTSRC), mode, panel_write);
 	if (mode >= 1) {
 		panel_gamma_init(mode);
 	}

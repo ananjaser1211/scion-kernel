@@ -666,21 +666,27 @@ static const uint16_t ha8_aor_s1[256] = {
 	0x0039, 0x002A, 0x001B, 0x000C, 0x0039, 0x002A, 0x001B, 0x000C, 0x000C
 };
 
+#include "hakios.s6e3ha8_star2.h"
+
 struct ha8_panel {
 	const char *name;
 	const struct ha8_row *rows;
 	const uint16_t *aor;
 };
 
-static const struct ha8_panel ha8_panels[2] = {
+static const struct ha8_panel ha8_panels[3] = {
 	{ "star A3 S0", ha8_rows_s0, ha8_aor_s0 },
 	{ "star A3 S1", ha8_rows_s1, ha8_aor_s1 },
+	{ "star2 A3 S0", ha8_rows_star2, ha8_aor_star2 },
 };
 
 /* the panel's tables by its ID (04's three bytes, the first highest): the device tree's panel-lookup */
 static const struct ha8_panel *
-ha8_panel_of(uint32_t id)
+ha8_panel_of(uint32_t id, bool star2)
 {
+	if (star2) {
+		return &ha8_panels[2];
+	}
 	return &ha8_panels[(id & 0x3F) == 0x04 ? 1 : 0];
 }
 
