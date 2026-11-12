@@ -657,6 +657,25 @@ Version received: Asic 0x3000000F, IFC 132, Radio 0x03"**, then **STATE_REPORT S
   `sec_gps_bcm4753.c` and the DT `gps` node only show gpg0-2). Compare with a stock Android trace if one can be had. Try a
   CONFIG_SET with gpsd's real settings values (MEASUREMENT 5, EXT_OSC 10, ME_OSC_PARAMS 8, RF_PARAMS 7 with RfLoss 5).
 
+**Is the GNSS RF path tied to the AP or the CP?** (offline, Apollo DTs `exynos9810-star2lte_{kor,eur_open}_26.dts`, 23:35)
+- The only GNSS node is `gps` (`samsung,exynos54xx-bcm4753`, pinctrl `ssp-gps-pwr-en` = gpg0-2, output, pull-down, drive 3). KOR and
+  EUR differ only in the pinctrl phandle number.
+- No `tcxo`, `clk_buf`, `rf_sw`, `ant_sel`, `vgps` or GNSS regulator node exists in either DT. The one LNA pin, `fm-lna-en`
+  (gph1-3), belongs to the FM radio.
+- Apollo's `drivers/sensorhub/brcm` (ssp_bbd.c, bbdpl) has nothing about an LNA or TCXO. `drivers/misc/modem_v1` never mentions
+  GPS or GNSS. The 9810 PMU tables' GNSS entries (`CMGP2GNSS`, `MAILBOX_GNSS2CP`) are for the SoC's own GNSS block, which the S9
+  does not use.
+- `init.gps.rc`: `lhd` is `class main`, with no dependency on cbd or ril. So nothing in software ties the BCM4775's RF to the AP or
+  the modem. The external LNA's supply and enable, and the 4775's 26 MHz TCXO, are on the board and driven by the 4775 itself (P17
+  = LNA enable through the pin mux, as lhd does). Whether the TCXO is shared with the CP's RFIC (and so needs the CP up) cannot be
+  seen in the DT. Only the schematic can settle it.
+- No kernel GPIO, regulator or clock work follows from this.
+- Still open for the next agent:
+  - Read gpsd's CONFIG_SET builder for the real values of items 5 (MEASUREMENT), 10 (EXT_OSC: u32 + 8.8 ppm), 8 (ME_OSC_PARAMS)
+    and 7 (RF_PARAMS: RfLoss 5 dB from gps.xml). Send them after RESET, before IDLE.
+  - Try a wider oscillator uncertainty (item 8, 0x0500 = 5 ppm, or more) to rule out a reference offset beyond 2 ppm.
+  - If neither helps, a schematic or hardware check of the GNSS antenna/LNA path is the remaining step.
+
 **Integration, when it works.**
 - **Firmware**: `devices/star2lte/firmware/gnss/` holds a README and SHA256SUMS only. `tools/fetch-firmware.sh`
   extracts the three 4775_B0 segments from the user's own gpsd: `--from DIR`, or the pinned vendor tree if it has
