@@ -466,6 +466,14 @@ big_online_limit(uint32_t online)
 #define OCP_ERRA_BIT    (1ull << 27)
 
 static bool ocp_on;                     /* the PMIC's CPU OCP warning on, as read back */
+/*
+ * cpufreq_ocp_regs=1: also the M3s' own OCP registers (OCPTHROTTCTL, GCUCTL, OCPINTCTL: exynos-ocp.c reads them at EL1
+ * under Linux). Off by default: here the first access never came back (builds 14-19: the governor's thread stopped at
+ * its first rate change, no "ocp: on cpu" line and no summaries after it, the M3s left at their start rate on every
+ * core -- 105 C at boot, and the resets of builds 14-15 with 2704000 on all four). The PMIC's OCP warning alone is
+ * what Samsung's limits with OCP stand on; the registers only took a level off after a hardware throttle.
+ */
+static uint32_t ocp_regs;
 static uint32_t big_oc;                 /* cpufreq_gov_big_oc= (kHz; 0: Samsung's limits) */
 /*
  * The M3s' limit by how many of them are busy (with OCP on): Samsung's hotplug governor takes M3s offline under a light
@@ -537,7 +545,7 @@ ocp_on_m3(struct ocp_m3 *r)
 			break;
 		}
 	}
-	if (cpu < 0 || cpu_to_processor(cpu) == NULL) {
+	if (ocp_regs == 0 || cpu < 0 || cpu_to_processor(cpu) == NULL) {
 		return false;
 	}
 	(void)thread_bind(cpu_to_processor(cpu));
@@ -1439,6 +1447,7 @@ hakios_exynos_cpufreq_gov_start(void)
 		                        .control_mc = 83000, .dt_min = 650000, .dt_max = 2314000, .dt_levels = big_dt,
 		                        .n_dt_levels = sizeof(big_dt) / sizeof(big_dt[0]) };
 	value = 0;
+	(void)PE_parse_boot_argn("cpufreq_ocp_regs", &ocp_regs, sizeof(ocp_regs));
 	if (PE_parse_boot_argn("cpufreq_ocp", &value, sizeof(value)) && value != 0) {
 		ocp_on = ocp_pmic();
 	}
