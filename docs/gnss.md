@@ -364,6 +364,16 @@ clear). Either flag leads to "Exiting Legacy" without `bri_wait4patchload`. Flag
 see what flag 17 means and what path loads the ESW (`bri_wait4patchload`), and whether `esw_ctrl:` (Retain, Load,
 DynPwr) or the baseband's reported status bit decides it.
 
+The ROM's `bri_wait4asic_ready` (0x000b3e24) and the patch's replacement compared: the ROM tests flag 16 or 17. Then,
+**if flag 16 (debugger) is clear and the config allows loading** (`[obj+72]->vfunc(12)` and 0x000d50a0), it goes to the
+patch-load state (`bri_wait4patchload`, 0x000b4059). Otherwise it exits legacy (0x000b625a, state 0x000b4401). **The
+patch's version drops the load branch**: with flag 16 or 17 set, it always exits legacy (ROM 0x000b625b, state
+0x000b4401) and never loads the ESW. So on this firmware the ESW must already be in place ("overlay retained") or come
+some other way. The `esw_ctrl:` string goes in as SW_UPLOAD type 0x8000 (`meif 10 0080 00000000 <text> <pad>`, ACKed,
+logged "MEIF:SwUp(0x8000 0)"). A first try with `lte_band_13:0;esw_ctrl:1,1,0;` before IDLE was cut short: the phone
+dropped off the network during the IDLE that followed. All 256 log facilities were on, so the log flood is a suspect.
+Next time, turn on only the facilities that matter.
+
 ## The tools (kernel and userland)
 
 - `/dev/hakios-gnss` (made at `shub=6`, root only; `drivers/input/ssp/hakios.ssp.c`): every RPC from the hub that is
