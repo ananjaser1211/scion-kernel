@@ -40,6 +40,12 @@ say(const char *fmt, ...)
 	ev.log(line, ev.ctx);
 }
 
+static void
+step(const char *name)
+{
+	if (ev.step) ev.step(name, ev.ctx);
+}
+
 static double
 now(void)
 {
@@ -297,6 +303,13 @@ gc_log_facility(unsigned facility)
 }
 
 static unsigned meif_serial = 1;
+static int esw_blocks = -1;
+
+int
+gc_esw_blocks(void)
+{
+	return esw_blocks;
+}
 
 void
 gc_meif_serial(unsigned next)
@@ -521,6 +534,7 @@ gc_esw_load(const struct gc_segment *seg, int nseg)
 	double t0;
 	int ok = 0;
 
+	esw_blocks = -1;
 	/* RESET, then PASSTHROUGH: the chip forwards MEIF 0x8002 PASS_THRU bytes to the baseband */
 	meif_serial = 1;
 	if (control(GC_RESET) != 0) return -1;
@@ -573,6 +587,7 @@ gc_esw_load(const struct gc_segment *seg, int nseg)
 		}
 	}
 	say("gnss_chip: ESW: %u bytes in %u blocks written and checked, %.1f s", total, blocks, now() - t0);
+	esw_blocks = (int)blocks;
 	bri_rx_bytes = 0;
 	if (bri_send(gool, sizeof(gool)) != 0) return -1;      /* GetOutOfLegacy: the ESW starts */
 	bri_wait(-1, 2, NULL);
@@ -581,28 +596,105 @@ gc_esw_load(const struct gc_segment *seg, int nseg)
 }
 
 int
+gc_peek(uint32_t addr, uint16_t len, uint8_t *out)
+{
+	uint8_t q[10];
+	struct rec *r;
+
+	q[0] = 'S';
+	q[1] = 0xec;            /* the memory reader the kernel adds with shub_peek=1 (docs/gnss.md, "The tools") */
+	q[2] = q[3] = 0;
+	for (int i = 0; i < 4; i++) q[4 + i] = (uint8_t)(addr >> (8 * i));
+	q[8] = (uint8_t)len;
+	q[9] = (uint8_t)(len >> 8);
+	if (put(q, sizeof(q)) != 0) return -1;
+	r = answer('S', 3);
+	if (r == NULL || !r->flags || r->len != len) return -1;
+	memcpy(out, r->data, len);
+	return 0;
+}
+
+/*
+ * The MiniMe's AR table cut (docs/gnss.md, "What gpsd's host engine programs into the radio" and the indoor run after
+ * it): 0xFFFF over the first register number of the hub patch's 104-entry table at 0x008300b0 makes INIT_STAGE B send
+ * no AR writes, as gpsd's host engine does. RPC 0x05 is the ROM's memory write. Written only over the table this hub
+ * patch has (its first entry reads 04 00 00 00 2a 00 00 00), and read back; it lasts until the hub restarts.
+ */
+#define AR_TABLE 0x008300b0u
+
+int
+gc_ar_table_cut(void)
+{
+	static const uint8_t first[8] = { 0x04, 0x00, 0x00, 0x00, 0x2a, 0x00, 0x00, 0x00 };
+	static const uint8_t wr[8] = { 0xb0, 0x00, 0x83, 0x00, 0x02, 0x00, 0xff, 0xff };
+	uint8_t b[8];
+
+	if (gc_peek(AR_TABLE, sizeof(b), b) != 0) {
+		say("gnss_chip: AR table cut skipped: no answer from the peek (boot-arg shub_peek=1?)");
+		return 0;
+	}
+	if (b[0] == 0xff && b[1] == 0xff && memcmp(b + 2, first + 2, 6) == 0) {
+		say("gnss_chip: AR table already cut (since the hub started)");
+		return 1;
+	}
+	if (memcmp(b, first, sizeof(first)) != 0) {
+		say("gnss_chip: AR table cut skipped: 0x%08x holds %02x %02x %02x %02x %02x %02x %02x %02x, not the table",
+		    AR_TABLE, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+		return 0;
+	}
+	if (gc_rpc(0x05, wr, sizeof(wr)) != 0) return -1;
+	if (gc_peek(AR_TABLE, sizeof(b), b) != 0 || b[0] != 0xff || b[1] != 0xff) {
+		say("gnss_chip: AR table cut skipped: the peek does not show it; going on with the table");
+		return 0;
+	}
+	say("gnss_chip: AR table cut (0xffff at 0x%08x, read back)", AR_TABLE);
+	return 1;
+}
+
+int
 gc_engine_on(void)
 {
 	/* "lte_band_13:0;esw_ctrl:1,1,0;": keep (retain) the ESW the baseband has, for the on-chip engine */
 	static const uint8_t esw_ctrl[] = { 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 'l', 't', 'e', '_', 'b', 'a', 'n', 'd', '_',
 		'1', '3', ':', '0', ';', 'e', 's', 'w', '_', 'c', 't', 'r', 'l', ':', '1', ',', '1', ',', '0', ';', 0, 0, 0 };
-	/* CONFIG_SET, the logging sub-block, as gpsd sends it */
-	static const uint8_t logging[] = { 0x01, 0x00, 0x01, 0x80, 0x10, 0x00, 0xff, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
-		0x00, 0x00, 0x00, 0x00 };
+	/*
+	 * CONFIG_SET as gpsd builds it for gps.xml (docs/gnss.md, "gpsd's real CONFIG_SET"), WITHOUT the external
+	 * oscillator: no item 10, and item 5's byte at +8 back to 6, since the 49.152 MHz CNTIN reference comes from the
+	 * modem, which does not run here. Six items: 5 MEASUREMENT, 8 ME_OSC_PARAMS (2 ppm), 0x8002 MISC, 0x8006
+	 * PLATFORM_SPECIFIC, 7 RF_PARAMS (zero), 0x8001 LOGGINGS (on). The bytes of the d8957eb run.
+	 */
+	static const uint8_t config[] = { 0x06, 0x00,
+		0x05, 0x00, 0x10, 0x00, 0xe8, 0x03, 0x01, 0x00, 0x00, 0x03, 0x06, 0x00, 0x0a, 0x00, 0x0a, 0x00,
+		0x08, 0x00, 0x08, 0x00, 0x00, 0x02, 0x01, 0x00,
+		0x02, 0x80, 0x10, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x06, 0x80, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x07, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x01, 0x80, 0x10, 0x00, 0xff, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00 };
+	/* MEIF_EXT_LNA_CONF_SB (25): an external LNA (gps.xml); sent in the open-sky runs and the d8957eb run */
+	static const uint8_t ext_lna[] = { 0x01, 0x00, 0x19, 0x00, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00 };
 
+	/* serials: RESET outside the count, then 1 esw_ctrl, 2 CONFIG_SET, 3 EXT_LNA, 4 IDLE, 5 ON */
+	step("RESET");
 	meif_serial = 99;
 	if (control(GC_RESET) != 0) return -1;
 	gc_poll(2);
 	meif_serial = 1;
+	step("esw_ctrl");
 	if (gc_meif(0x10, esw_ctrl, sizeof(esw_ctrl)) != 0) return -1;
 	gc_poll(1);
-	if (gc_meif(6, logging, sizeof(logging)) != 0) return -1;
+	step("CONFIG_SET");
+	if (gc_meif(6, config, sizeof(config)) != 0) return -1;
 	gc_poll(1);
+	step("EXT_LNA");
+	if (gc_meif(6, ext_lna, sizeof(ext_lna)) != 0) return -1;
+	gc_poll(1);
+	step("IDLE");
 	last_state = -1;
 	if (control(GC_IDLE) != 0 || gc_wait_state(GC_IDLE, 15) != 0) {
 		say("gnss_chip: the engine did not reach IDLE (last state %d)", last_state);
 		return -1;
 	}
+	step("ON");
 	if (control(GC_ON) != 0 || gc_wait_state(GC_ON, 5) != 0) {
 		say("gnss_chip: the engine did not reach ON (last state %d)", last_state);
 		return -1;

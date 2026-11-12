@@ -1,6 +1,6 @@
 /*
  * gnss_chip: the BCM4775's GNSS side through the kernel's /dev/hakios-gnss (drivers/input/ssp/hakios.ssp.c), the
- * sequence docs/gnss.md found: the external LNA's pin mux, GnssPvtDataStart, the ESW through the measurement engine's
+ * sequence docs/gnss.md found: the AR table cut, the external LNA's pin mux, GnssPvtDataStart, the ESW through the measurement engine's
  * PASSTHROUGH and the baseband's boot ROM (bri, every block checked), RESET, esw_ctrl (retain), IDLE, ON, then the
  * on-chip engine's requests (disable_indoor, gnss_start; gnss_stop). The same steps gnsstool takes one at a time.
  *
@@ -27,6 +27,7 @@ struct gc_events {
 	void (*meif)(const uint8_t *msg, unsigned len, void *ctx);      /* any other MEIF message from the chip */
 	void (*chip_assert)(const char *file, unsigned line, void *ctx);/* RPC 0x18: the chip asserted */
 	void (*log)(const char *line, void *ctx);                       /* what the library has to say */
+	void (*step)(const char *name, void *ctx);                      /* gc_engine_on()'s steps, as each starts */
 	void *ctx;
 };
 
@@ -43,7 +44,10 @@ int gc_meif(unsigned id, const uint8_t *payload, unsigned n);   /* one MEIF mess
 void gc_meif_serial(unsigned next);             /* the serial of the next MEIF message */
 int gc_wait_state(unsigned state, double seconds);              /* 0 when a STATE_REPORT to `state` came */
 int gc_esw_load(const struct gc_segment *seg, int n);           /* RESET, PASSTHROUGH, bri, checked blocks, GetOutOfLegacy */
-int gc_engine_on(void);                         /* RESET, esw_ctrl (retain), logging, IDLE, ON */
+int gc_esw_blocks(void);                        /* the blocks the last gc_esw_load() wrote and checked; -1 none */
+int gc_peek(uint32_t addr, uint16_t len, uint8_t *out);         /* the hub's memory (SSP 0xEC, boot-arg shub_peek=1) */
+int gc_ar_table_cut(void);                      /* RPC 0x05: 0xffff over the MiniMe's AR table; 1 cut, 0 skipped, -1 */
+int gc_engine_on(void);                         /* RESET, esw_ctrl (retain), CONFIG_SET (no EXT_OSC), EXT_LNA, IDLE, ON */
 int gc_last_state(void);                        /* the last STATE_REPORT's new state, -1 none */
 void gc_mask_position(char *text);              /* masks what could be a position in a line of the chip's text */
 
