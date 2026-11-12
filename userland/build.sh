@@ -1195,6 +1195,9 @@ if [ -f $DARWIN/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	# where the kernel mounts the Darwin root container off the phone's flash (boot-arg apfs_volume=):
 	# Darwin has no /System/Volumes, and nothing can make a directory in this image once it is built
 	mkdir -p sysroot/System/Volumes/Darwin
+	# which system image this is: on a kept /private/var, init has lsd build its database again when it changes
+	# (src/init.c, forget_launchservices_on_new_image: every image is 20F66, so LaunchServices never sees one change)
+	cat /proc/sys/kernel/random/uuid > sysroot/.scion-system-stamp
 	# the applications Darwin installs on its first boot are system applications here (see select-system.py)
 	if [ -d sysroot/private/var/staged_system_apps ]; then
 		mv sysroot/private/var/staged_system_apps/* sysroot/Applications/
