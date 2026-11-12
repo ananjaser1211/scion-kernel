@@ -467,6 +467,17 @@ big_online_limit(uint32_t online)
 
 static bool ocp_on;                     /* the PMIC's CPU OCP warning on, as read back */
 static uint32_t big_oc;                 /* cpufreq_gov_big_oc= (kHz; 0: Samsung's limits) */
+/*
+ * The M3s' limit by how many of them are busy (with OCP on): Samsung's hotplug governor takes M3s offline under a light
+ * load and allows the CAL's top with one online (exynos-hotplug_governor.c), dual_freq 2314000 with two, triple/quad_freq
+ * 1924000 with three or four (exynos9810-star2lte_kor_26.dts hotplug_governor). Nothing here takes an M3 offline: an
+ * idle M3 is power-gated in WFI, which is what the rule is about, so the count is of the M3s busy in the last window
+ * (BUSY_PCT and over). An M3 that wakes inside the window is caught by the next one (and by the OCP throttle, and the
+ * thermal ceilings, meanwhile). cpufreq_gov_big_single/_dual/_quad=<kHz> (with cpufreq_ocp=1): each count's ceiling,
+ * at most OCP_OC_MOST and the APM's own levels (2704000, 2314000, 2106000 ... in its table, each with its voltage).
+ */
+#define BUSY_PCT        30
+static uint32_t big_single = OCP_OC_MOST, big_dual = 2314000, big_quad = 1924000;
 static uint32_t ocp_clip;               /* kHz: the ceiling after a throttle (0: none) */
 static uint32_t ocp_hits, ocp_irp = ~0u;
 static bool ocp_regs_said;
@@ -484,7 +495,7 @@ ocp_big_limit(uint32_t online)
 	if (big_oc != 0) {
 		return big_oc;
 	}
-	return online <= 2 ? OCP_DUAL_KHZ : OCP_QUAD_KHZ;
+	return online <= 1 ? big_single : online == 2 ? big_dual : big_quad;
 }
 
 /* on an M3, interrupts off: its OCP registers read, the throttle flag taken, the IRP written, as asked */
@@ -612,6 +623,18 @@ temp_fresh(const struct cluster *c)
 	return scion_temp_ok(hakios_exynos_tmu_zone_mc(c->tmu_zone), hakios_exynos_tmu_age_ms());
 }
 
+/* how many M3s were busy (BUSY_PCT and over) in the last window; at least one */
+static uint32_t
+big_busy(const struct cluster *c)
+{
+	uint32_t n = 0;
+
+	for (uint32_t i = 0; i < SCION_BIG_CORES && i < c->online; i++) {
+		n += c->core_load[i] >= BUSY_PCT ? 1 : 0;
+	}
+	return n == 0 ? 1 : n;
+}
+
 static uint32_t
 ceiling_now(struct cluster *c)
 {
@@ -624,14 +647,14 @@ ceiling_now(struct cluster *c)
 			max = scion_limit(&scion_soc, big_cores);
 		}
 	} else if (c == &clusters[1]) {
-		max = MIN(max, ocp_on ? ocp_big_limit(c->online) : big_online_limit(c->online));
+		max = MIN(max, ocp_on ? ocp_big_limit(big_busy(c)) : big_online_limit(c->online));
 		if (c->temp_mc == NOT_READ_MC) {
 			max = MIN(max, NO_TEMP_BIG_MAX);
 		}
 	}
 	if (c == &clusters[1] && ocp_on) {
 		/* (the scion policies too: Samsung's limit for the M3s the scheduler has, and a throttle's level off) */
-		max = MIN(max, ocp_big_limit(MIN(c->online, big_cores)));
+		max = MIN(max, ocp_big_limit(MIN(big_busy(c), big_cores)));
 		if (ocp_clip != 0) {
 			max = MIN(max, ocp_clip);
 		}
@@ -1425,9 +1448,32 @@ hakios_exynos_cpufreq_gov_start(void)
 		clusters[1].dt_max = MAX(clusters[1].dt_max, big_oc);
 		say("cpufreq_gov: cpufreq_gov_big_oc: the M3s up to %u kHz however many run -- past Samsung's limits\n", big_oc);
 	}
+	if (ocp_on) {
+		value = 0;
+		if (PE_parse_boot_argn("cpufreq_gov_big_single", &value, sizeof(value)) && value != 0) {
+			big_single = MIN(value, OCP_OC_MOST);
+		}
+		value = 0;
+		if (PE_parse_boot_argn("cpufreq_gov_big_dual", &value, sizeof(value)) && value != 0) {
+			big_dual = MIN(value, OCP_OC_MOST);
+		}
+		value = 0;
+		if (PE_parse_boot_argn("cpufreq_gov_big_quad", &value, sizeof(value)) && value != 0) {
+			big_quad = MIN(value, OCP_OC_MOST);
+		}
+		clusters[1].dt_max = MAX(clusters[1].dt_max, MAX(big_single, MAX(big_dual, big_quad)));
+		say("cpufreq_gov: the M3s by how many are busy: one %u, two %u, three or four %u kHz%s\n", big_single, big_dual,
+		    big_quad, big_quad > OCP_QUAD_KHZ || big_dual > OCP_DUAL_KHZ ? " -- past Samsung's limits" : "");
+	}
+	/*
+	 * The A55s: the APM's table has 2002000/1118750 uV over Samsung's policy top 1950000 (min-/max-freq in the star2lte
+	 * tree); cpufreq_gov_lit_max=2002000 takes it. The level must be in the APM's table, as every rate here is.
+	 */
+	clusters[0].dt_max = 2002000;
 	cluster_setup(&clusters[0], lit_max, lit_min, 1794000, 1053000);
-	/* (with OCP: Samsung's star2lte policy-max 1924000 by default, or cpufreq_gov_big_oc's) */
-	cluster_setup(&clusters[1], big_max, big_min, !ocp_on ? 1794000 : big_oc != 0 ? big_oc : OCP_QUAD_KHZ, 650000);
+	/* (with OCP: up to the busy-count limits above, or cpufreq_gov_big_oc's) */
+	cluster_setup(&clusters[1], big_max, big_min,
+	    !ocp_on ? 1794000 : big_oc != 0 ? big_oc : MAX(big_single, MAX(big_dual, big_quad)), 650000);
 	if (big_oc != 0 && clusters[1].levels[level_at_most(&clusters[1], big_oc)] != big_oc) {
 		big_oc = clusters[1].levels[level_at_most(&clusters[1], big_oc)];
 	}
