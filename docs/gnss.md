@@ -373,6 +373,28 @@ some other way. The `esw_ctrl:` string goes in as SW_UPLOAD type 0x8000 (`meif 1
 logged "MEIF:SwUp(0x8000 0)"). A first try with `lte_band_13:0;esw_ctrl:1,1,0;` before IDLE was cut short: the phone
 dropped off the network during the IDLE that followed. All 256 log facilities were on, so the log flood is a suspect.
 Next time, turn on only the facilities that matter.
+(Correction: the 21:33 drop was a flash of build 33, not the log.)
+
+Build 33 (the hub now gets AP_STATUS wakeup/resume, thermistor and mag PDC at boot):
+- **Getting the ME's own log.** The GlMe/GlMeSrd lines need the MEIF logging sub-block (CONFIG_SET 0x8001) after
+  RESET, plus RPC 0x2B for the hub's facilities. 0x2B alone gives only the PVT/core lines. Use **one reader** on
+  `/dev/hakios-gnss`: two readers split the byte stream. Each `meif` command's own listen captures the log into a
+  file.
+- **`esw_ctrl:1,1,0;`** (via SW_UPLOAD 0x8000): the log shows it applied ("SetRetainEswEnabled Enabled",
+  "SetLoadEswEnabled Enabled"). The result is the same: "Exiting Legacy", then "no version received from ESW,
+  RetainEsw=1, LoadEsw=1".
+- **gpsd's full CONFIG_SET** (7 sub-blocks), now with the right serials: ACKed. The sub-block ids, as named by the
+  chip's log: 5 = MEASUREMENT_CONF, 10 = EXT_OSC_CONF, 8 = ME_OSC_PARAMS_CONF, 0x8002 = MISC_CONFIG, 0x8006 =
+  PLATFORM_SPECIFIC_CONFIG, 7 = RF_PARAMS_CONF, 0x8001 = LOGGINGS_CONFIG. The chip's config dump: `MeOsc(0 512 1)`,
+  `ExtOsc(0 255996)`, `Int 1000`, `Channel(24 24)`, `RfLoss 6`, `LnaConf 0x0`. IDLE: the same failure.
+- **RPC 0x39 `SetGnssTcxoMode(1)`** before RESET: ACKed, no change.
+- The patch's ESW segment table (`GetPatchSegmentPike` in the patch, 0x0084ab40): the count is BSS at 0x0086fd28
+  (zero after the download), so the only segment it hands out is a 12-byte stub for baseband address 0x0005fff0. **The
+  hub patch carries no ESW image.** The MCU does not load one (the load branch is gone), and the chip's SW_UPLOAD
+  handler can take uploads ("MEIF:SwUp ERR(%lu, %lu, %lu)"), but gpsd sends only config strings. So the baseband must
+  boot an ESW of its own when it leaves legacy (from its ROM, or an overlay that survives from somewhere else), and it
+  does not answer after that.
+- MiniMe banner seen: "Broadcom GLL ver. 68.19.21 282318, Jan 23 2017, pike:glmesrd_build.cpp".
 
 ## The tools (kernel and userland)
 
