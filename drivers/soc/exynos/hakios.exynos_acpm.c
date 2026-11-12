@@ -600,11 +600,16 @@ hakios_acpm_stop(void)
  *   bus_max=1   MIF, INT and DISP to their top at boot, kept there (re-asked every 10 s, cheap)
  *   bus_max=2   MIF, INT and DISP at their top while frames are shown or video decoded (hakios_exynos_bus_busy()), back
  *               to Samsung's boot rates (1794000 / 667000 / 640000) after 5 s of neither
- *   bus_mask=N  which of the pinned domains bus_max moves, a bit per DVFS index (default 0x1a3: MIF 0, INT 1, INTCAM 5,
- *               CAM 7, DISP 8). S-Boot leaves DISP at 400 MHz, INTCAM and CAM at their slowest (630 / 590 MHz) and MIF
+ *   bus_mask=N  which of the pinned domains bus_max moves, a bit per DVFS index (default 0x1a2: INT 1, INTCAM 5, CAM 7,
+ *               DISP 8; MIF is bit 0). S-Boot leaves DISP at 400 MHz, INTCAM and CAM at their slowest (630 / 590 MHz) and MIF
  *               at 1794 MHz; Samsung's devfreq starts them at initial_freq (DISP 640000, INTCAM and CAM 690000 --
  *               star2lte_kor_26.dts devfreq_intcam/_cam freq_info). bus_max=1 with all of them hung the S9+ at once
  *               (build 17, a purple screen, nothing logged): bus_mask=0x1a2 leaves MIF where S-Boot put it.
+ *   bus_mif_delay=S  MIF is moved only S seconds after the others (default 45: the console is up by then, so a hang
+ *               says where), one APM level at a time (2002000, then 2093000), a line and a second between steps.
+ *               It hangs the S9+ at the first step (build 20: green screen right after "asking for 2002000 kHz"): the
+ *               bare request is not enough. Samsung's devfreq first sends the APM the MIF table and its INT min-lock
+ *               pairs from the ECT (exynos9810_mif_constraint_parse: DATA_INIT per level, SET_CONST) -- not done here.
  */
 #define BUS_DOMAINS_MOST        13
 #define BUS_LEVELS_MOST         32
@@ -627,7 +632,8 @@ static const struct bus_pin { uint32_t index, samsung_max, samsung_boot; } bus_p
 };
 #define BUS_PINS        (sizeof(bus_pins) / sizeof(bus_pins[0]))
 static uint32_t bus_top[BUS_DOMAINS_MOST];      /* the APM's fastest level of each domain, kHz (0: not read) */
-static uint32_t bus_max, bus_log = 1, bus_level, bus_mask = 0x1a3;  /* bus_level: 0 not set, 1 the boot rates, 2 the top */
+static uint32_t bus_max, bus_log = 1, bus_level, bus_mask = 0x1a2, bus_mif_delay = 45;
+static bool bus_mif_ready;              /* MIF stepped up already (bus_mif_step()): bus_set() may ask it */  /* bus_level: 0 not set, 1 the boot rates, 2 the top */
 static uint64_t bus_busy_at;
 
 static void
@@ -722,7 +728,7 @@ bus_set(bool top, bool quiet)
 		uint32_t want = b->samsung_boot;
 		int e;
 
-		if ((bus_mask & (1u << b->index)) == 0) {
+		if ((bus_mask & (1u << b->index)) == 0 || (b->index == 0 && !bus_mif_ready)) {
 			continue;
 		}
 		if (top) {
@@ -739,6 +745,28 @@ bus_set(bool top, bool quiet)
 		bus_say("bus: PLL_MIF %u MHz before, %u MHz after (the memory bus at about half)\n", before, bus_mif_pll_mhz());
 	}
 	bus_level = top ? 2 : 1;
+}
+
+/* MIF from where it is to its top a level at a time, each step said before it is asked (a hang names its step) */
+static void
+bus_mif_step(void)
+{
+	static const uint32_t steps[] = { 2002000, 2093000 };
+	uint32_t top = bus_top[0] != 0 && bus_top[0] < bus_pins[0].samsung_max ? bus_top[0] : bus_pins[0].samsung_max;
+
+	for (uint32_t i = 0; i < sizeof(steps) / sizeof(steps[0]) && steps[i] <= top; i++) {
+		int e;
+
+		bus_say("bus: MIF: asking for %u kHz (PLL_MIF %u MHz now)\n", steps[i], bus_mif_pll_mhz());
+		delay(100000);
+		e = hakios_acpm_dvfs_set(0, steps[i]);
+		bus_say("bus: MIF: %u kHz asked: %d; PLL_MIF %u MHz\n", steps[i], e, bus_mif_pll_mhz());
+		if (e != 0) {
+			return;
+		}
+		delay(1000000);
+	}
+	bus_mif_ready = true;
 }
 
 static void
@@ -762,8 +790,16 @@ bus_thread(__unused void *arg, __unused wait_result_t wr)
 	nanoseconds_to_absolutetime((uint64_t)BUS_REASK_MS * NSEC_PER_MSEC, &reask);
 	bus_say("bus: bus_max=%u, bus_mask %#x: the pinned domains (MIF, INT, INTCAM, CAM, DISP) %s\n", bus_max, bus_mask, bus_max == 1 ? "at their top from now on" :
 	    "at their top while frames are shown or video decoded, Samsung's boot rates after 5 s of neither");
+	uint64_t mif_at = mach_absolute_time(), mif_wait;
+
+	nanoseconds_to_absolutetime((uint64_t)bus_mif_delay * NSEC_PER_SEC, &mif_wait);
 	for (;;) {
 		uint64_t now = mach_absolute_time(), busy = __atomic_load_n(&bus_busy_at, __ATOMIC_RELAXED);
+
+		if ((bus_mask & 1u) != 0 && !bus_mif_ready && mif_at != 0 && now - mif_at >= mif_wait) {
+			mif_at = 0;     /* (once: a step refused leaves MIF where it got to) */
+			bus_mif_step();
+		}
 
 		if (bus_max == 1) {
 			if (bus_level == 0 || now - last_ask >= reask) {
@@ -792,6 +828,7 @@ hakios_exynos_bus_start(void)
 	(void)PE_parse_boot_argn("bus_max", &bus_max, sizeof(bus_max));
 	(void)PE_parse_boot_argn("bus_log", &bus_log, sizeof(bus_log));
 	(void)PE_parse_boot_argn("bus_mask", &bus_mask, sizeof(bus_mask));
+	(void)PE_parse_boot_argn("bus_mif_delay", &bus_mif_delay, sizeof(bus_mif_delay));
 	if ((bus_max == 0 && bus_log == 0) || bus_max > 2) {
 		return;
 	}
