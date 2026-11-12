@@ -20,8 +20,8 @@
  *   1. the environment's HAKIOS_VK_ICD, if set;
  *   2. else the first line of HakiosMetal.icd beside the bundle (in the directory that holds HakiosMetal.bundle);
  *   3. else /redwood/lib/libhakios.vk.dylib: gfxstream's guest Vulkan driver for the Pixel (AVF), being built on gpu/gfxstream-vulkan.
- *      Not on the Galaxy S9: Mesa 25.0.7's panvk gives the Mali-G72 (v6) Vulkan 1.0 at most, below the floor named next
- *      (docs/metal-plan.md); the S9's Metal goes through Mesa's panfrost instead (src/hakiosmetal_air.m).
+ *      On the Galaxy S9 the driver is PanVK (METAL_ICD=/redwood/lib/libvulkan_panfrost.dylib, tools/mk-panvk.sh): it gives the
+ *      Mali-G72 (v6) Vulkan 1.0 unless told otherwise, which openDevice() below does for that driver only (docs/metal.md).
  * It has to export vk_icdGetInstanceProcAddr or vkGetInstanceProcAddr, and give a Vulkan 1.2 device with timeline semaphores (the
  * runtime's floor). Without a driver at that path there is no device: init returns nil, which Metal takes as no plug-in, and every
  * program keeps the paths it has without Metal (the window server its OpenGL ES).
@@ -171,6 +171,18 @@ openDevice(unsigned port)
 		if (strcmp(getprogname(), "backboardd") == 0) {
 			setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
 			CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
+		}
+		/*
+		 * PanVK, Mesa's Vulkan driver for the Mali (the Galaxy S9's G72, Bifrost v6; tools/mk-panvk.sh): Mesa refuses a v6 GPU unless
+		 * PAN_I_WANT_A_BROKEN_VULKAN_DRIVER is set, and reports Vulkan 1.0 there, below the runtime's floor of 1.2, although every 1.2
+		 * feature the runtime asks for (timeline semaphores, buffer device addresses) is offered as an extension; Mesa's own
+		 * MESA_VK_VERSION_OVERRIDE raises the number (docs/metal.md). Set only for that driver, only in a process shown the device, and
+		 * never over a value the environment already has.
+		 */
+		const char *base = strrchr(driver, '/');
+		if (strncmp(base != NULL ? base + 1 : driver, "libvulkan_panfrost", 18) == 0) {
+			setenv("PAN_I_WANT_A_BROKEN_VULKAN_DRIVER", "1", 0);
+			setenv("MESA_VK_VERSION_OVERRIDE", "1.2", 0);
 		}
 		@try {
 			device = native_bridge_metal_open(driver, cache, registryID, missing);
