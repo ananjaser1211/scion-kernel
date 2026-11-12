@@ -406,16 +406,31 @@ load_part(volatile uint8_t *cp, uint64_t at, uint64_t from, uint64_t length, con
 		return false;
 	}
 	while (done < length) {
-		uint64_t n = MIN(chunk, length - done), got = 0;
-		int error = hakios_ufs_read_partition("RADIO", from + done, (uint8_t *)(uintptr_t)(cp + at + done), n, &got);
+		uint64_t n = MIN(chunk, length - done);
+		/* 0 is success; the last argument is the partition's size, not a count (hakios.ufs.c; build 38 stopped on that) */
+		int error = hakios_ufs_read_partition("RADIO", from + done, (uint8_t *)(uintptr_t)(cp + at + done), n, NULL);
 
-		if (error != 0 || got != n) {
-			say("shannon: %s: RADIO read at %#llx failed (%d, %llu of %llu)\n", name, from + done, error, got, n);
+		if (error != 0) {
+			say("shannon: %s: RADIO read of %#llx bytes at %#llx failed (%d)\n", name, n, from + done, error);
 			return false;
 		}
 		done += n;
 	}
 	__builtin_arm_dsb(15);
+	{
+		/* the first bytes again, through a kernel buffer, compared with what landed in the CP's memory */
+		uint8_t check[64];
+		uint64_t n = MIN((uint64_t)sizeof(check), length);
+		bool same = hakios_ufs_read_partition("RADIO", from, check, n, NULL) == 0;
+
+		for (uint64_t i = 0; same && i < n; i++) {
+			same = check[i] == cp[at + i];
+		}
+		if (!same) {
+			say("shannon: %s: the first %llu bytes in the CP's memory differ from RADIO's: stopping\n", name, n);
+			return false;
+		}
+	}
 	absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
 	say("shannon: %s: %#llx bytes to +%#llx in %llu ms, crc32 %#x\n", name, length, at, ns / 1000000,
 	    crc32(0, (const void *)(uintptr_t)(cp + at), (size_t)length));
