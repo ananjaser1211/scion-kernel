@@ -50,6 +50,9 @@
  *            (factory/accel_lsm6dsl.c set_accel_cal(): SSP 0xCE, s16 x, y, z). The numbers are the three little-endian
  *            s32 of /efs/FactoryApp/calibration_data, in counts at the 8 g range (4096 = 1 g), in the hub's output axes
  *            (so taken with the right shub_acc_pos). Default: none.
+ *   shub_peek=1          GNSS bring-up: add a memory reader to the hub's firmware as it is loaded (SSP READ of 0xEC,
+ *            data = address: the hub's bytes there; see load_patch() and docs/gnss.md). /dev/hakios-gnss (made at
+ *            shub=6 whatever this says) carries raw RPCs and SSP transactions for user space (userland/src/gnsstool.c).
  *   shub_gyro_cal=X,Y,Z  the same for the gyroscope (gyro_lsm6dsl.c set_gyro_cal(): SSP 0xCD, s32 x, y, z), the three
  *            little-endian s32 of /efs/FactoryApp/gyro_cal_data. Default: none.
  */
@@ -70,6 +73,7 @@
 #include <sys/proc.h>
 #include <sys/systm.h>
 #include <sys/uio.h>
+#include <sys/vnode.h>          /* IO_NDELAY */
 #include <miscfs/devfs/devfs.h>
 #include <sys/hakios.exynos_soc.h>
 #include "hakios.bcm_shub.h"
@@ -883,6 +887,10 @@ send_reliable(const uint8_t *payload, uint16_t size)
 
 static struct shub_ssp_rx ssprx;
 static void ssp_stream(void);
+static void gnss_post(uint8_t kind, uint8_t flags, uint16_t id, const uint8_t *d, uint16_t len);
+#define GNSS_REC_RPC            'R'     /* an RPC from the hub that is not SSP: [id][data] */
+#define GNSS_REC_SSP            'S'     /* the answer to a raw SSP request: id = the command, flags 1 = answered */
+#define GNSS_REC_SENT           'A'     /* a raw RPC sent: id = the RPC, flags 1 = acknowledged (or sent, if plain) */
 
 static void
 text_rpc(const char *what, const uint8_t *d, uint16_t n)
@@ -907,6 +915,9 @@ deliver_rpcs(const uint8_t *p, size_t n)
 
 	while ((r = shub_rpc_next(p, n, &at, &id, &d, &len)) == 1) {
 		tl.rpcs++;
+		if (id != SHUB_RPC_SENSOR_RSP) {
+			gnss_post(GNSS_REC_RPC, 0, id, d, len);  /* everything but SSP, for /dev/hakios-gnss's readers */
+		}
 		switch (id) {
 		case SHUB_RPC_VERSION:
 			if (len >= 12) {
@@ -976,6 +987,64 @@ ask_version(const char *who)
  * before the next. Then RPC 0x2E [u32 PatchAddress] as a plain packet, 40 ms, autobaud and sync again, and the version
  * request again: it now returns the application's.
  */
+/*
+ * shub_peek=1: a memory reader added to the hub's firmware as it is sent, for the GNSS bring-up (docs/gnss.md), which
+ * needs the chip's ROM: the firmware's RPC interfaces for the GNSS engine are decoded by ROM code. SSP command 0xEC
+ * (SH_MSG2SSP_GLASS_TYPE, which nothing here sends) is pointed at 22 bytes of our own Thumb code, put over that
+ * command's own log text (printed only by the handler it no longer reaches):
+ *     push {r4, lr}; mov r3, r1; ldr.w r1, [r0, #5]; ldrh.w r2, [r0, #1]; mov r0, r3; bl memcpy; movs r0, #1; pop {r4, pc}
+ * so an SSP READ of 0xEC with data = an address and length = n answers with the hub's n bytes there. The handler
+ * table's entry is { u32 0xEC, u32 handler } at 0x0082681c (the hub's SSP dispatcher at 0x008263f2 calls
+ * handler(msg, buffer, ...); msg is [cmd][u16 length][u16 options][u32 data]); memcpy is the firmware's veneer at
+ * 0x008062dc. Applied only if the bytes it replaces are exactly the expected ones (this build of bcm_sensorhub_a1).
+ */
+struct hub_fix {
+	uint32_t addr;
+	uint16_t n;
+	const uint8_t *was, *now;
+};
+static const char peek_code_was[] = "[SSP] %s (%d) SH_MSG2S";        /* 22 bytes and its NUL, not compared */
+static const uint8_t peek_code_now[22] = {
+	0x10, 0xb5, 0x0b, 0x46, 0xd0, 0xf8, 0x05, 0x10, 0xb0, 0xf8, 0x01, 0x20, 0x18, 0x46, 0xdf, 0xf7, 0x7b, 0xfe,
+	0x01, 0x20, 0x10, 0xbd
+};
+static const uint8_t peek_entry_was[4] = { 0xa1, 0x5e, 0x82, 0x00 };   /* 0x00825ea1, the AP-write handler */
+static const uint8_t peek_entry_now[4] = { 0xd5, 0x65, 0x82, 0x00 };   /* 0x008265d4 | 1 (Thumb) */
+static const struct hub_fix peek_fixes[] = {
+	{ 0x008265d4, sizeof(peek_code_now), (const uint8_t *)peek_code_was, peek_code_now },
+	{ 0x00826820, sizeof(peek_entry_now), peek_entry_was, peek_entry_now },
+};
+static uint32_t peek;                   /* shub_peek= */
+
+/*
+ * For one patch record [addr, addr + n) of `data`: count the bytes of the fixes it holds that match `was`, and if `out`
+ * (a copy of the record) is given, put `now` there.
+ */
+static uint32_t
+hub_fixes(uint32_t addr, const uint8_t *data, uint16_t n, uint8_t *out)
+{
+	uint32_t matched = 0;
+
+	for (unsigned f = 0; f < sizeof(peek_fixes) / sizeof(peek_fixes[0]); f++) {
+		const struct hub_fix *x = &peek_fixes[f];
+
+		for (uint16_t i = 0; i < x->n; i++) {
+			uint32_t a = x->addr + i;
+
+			if (a < addr || a >= addr + n) {
+				continue;
+			}
+			if (data[a - addr] == x->was[i]) {
+				matched++;
+			}
+			if (out != NULL) {
+				out[a - addr] = x->now[i];
+			}
+		}
+	}
+	return matched;
+}
+
 static bool
 load_patch(void)
 {
@@ -1005,6 +1074,22 @@ load_patch(void)
 	}
 	say("shub: 4: fw/%s: %u writes, %u bytes, %08x-%08x; sending\n", PATCH_FILE, info.records, info.bytes, info.lo,
 	    info.hi);
+	if (peek) {
+		uint32_t matched = 0, want = 0;
+
+		for (unsigned f = 0; f < sizeof(peek_fixes) / sizeof(peek_fixes[0]); f++) {
+			want += peek_fixes[f].n;
+		}
+		while (shub_patch_next(patch, (size_t)size, &at, &addr, &data, &n) == 1) {
+			matched += hub_fixes(addr, data, n, NULL);
+		}
+		at = 0;
+		if (matched != want) {
+			peek = 0;
+		}
+		say("shub: 4: shub_peek: the memory reader (SSP 0xEC) %s (%u of %u bytes as expected)\n",
+		    peek ? "added" : "NOT added: another build of the firmware", matched, want);
+	}
 	state = "loading";
 	while (shub_patch_next(patch, (size_t)size, &at, &addr, &data, &n) == 1) {
 		uint8_t body[4 + 2 + SHUB_PATCH_MAX_RECORD];
@@ -1014,6 +1099,9 @@ load_patch(void)
 		body[4] = (uint8_t)n;
 		body[5] = (uint8_t)(n >> 8);
 		memcpy(body + 6, data, n);
+		if (peek) {
+			(void)hub_fixes(addr, data, n, body + 6);
+		}
 		k = shub_rpc_put(pay, SHUB_RPC_WRITE_MEM, body, (uint16_t)(6 + n));
 		if (!send_reliable(pay, (uint16_t)k)) {
 			say("shub: 4: write %u of %u (%08x, %u bytes) not acknowledged; stopping\n", sent + 1, info.records, addr,
@@ -1051,7 +1139,7 @@ static struct {
 	uint32_t init_done, frames, frame_errors, unexpected;
 	bool answered;
 	uint16_t answer_opts;
-	uint8_t answer[16];
+	uint8_t answer[2048];           /* large for /dev/hakios-gnss's raw reads (shub_peek) */
 	uint16_t answer_len;
 	uint64_t found;                 /* SENSOR_SCANNING's bitmap */
 	uint32_t fw_rev;
@@ -1507,6 +1595,211 @@ make_device(void)
 	say("shub: /dev/%s made\n", HAKIOS_SENSORS_NAME);
 }
 
+/*
+ * /dev/hakios-gnss: the hub's link for user space, for the GNSS bring-up (docs/gnss.md; the reader and prober is
+ * userland/src/gnsstool.c). Root only. Made at shub=6; requests are carried out by the hub thread between its reads.
+ *
+ * write(): one request per call, little-endian:
+ *   'R' [u16 id][data]       an RPC to the hub in a reliable packet (data up to 1000 bytes); answered by an 'A' record
+ *   'P' [u16 id][data]       the same in a plain packet
+ *   'S' [u8 cmd][u16 options][u32 arg][u16 len][data]   one SSP transaction (ssp_cmd): options 0 READs len bytes
+ *                            (up to 2000) and answers with an 'S' record of them; 1 WRITEs data (up to 64 bytes)
+ *   A write while a request is outstanding fails with EBUSY.
+ * read(): a stream of records [u8 kind][u8 flags][u16 id][u16 len][len bytes]: 'R' every RPC from the hub except SSP's
+ * (0x21) as it arrives, 'A' and 'S' the outcome of requests. Records that do not fit the 64 KB ring are dropped.
+ */
+#define GNSS_DEV_NAME           "hakios-gnss"
+#define GNSS_RING               (64 * 1024)
+#define GNSS_REQ_MAX            (1 + 2 + 1000)
+static uint8_t gnss_ring[GNSS_RING];
+static uint32_t gnss_head, gnss_tail, gnss_lost;
+static int gnss_readers;
+static bool gnss_waiting;
+static uint8_t gnss_req[GNSS_REQ_MAX];
+static uint16_t gnss_req_len;
+static volatile bool gnss_req_pending;  /* written, for the hub thread */
+static volatile bool gnss_req_busy;     /* from a write's start to the hub thread's end of it */
+static volatile bool gnss_live;         /* the hub thread is in run(), where requests are taken */
+
+static void
+gnss_post(uint8_t kind, uint8_t flags, uint16_t id, const uint8_t *d, uint16_t len)
+{
+	uint8_t h[6] = { kind, flags, (uint8_t)id, (uint8_t)(id >> 8), (uint8_t)len, (uint8_t)(len >> 8) };
+
+	lck_mtx_lock(&shub_lock);
+	if (gnss_readers > 0) {
+		if (GNSS_RING - (gnss_head - gnss_tail) < sizeof(h) + len) {
+			gnss_lost++;
+		} else {
+			for (unsigned i = 0; i < sizeof(h); i++) {
+				gnss_ring[gnss_head++ % GNSS_RING] = h[i];
+			}
+			for (uint16_t i = 0; i < len; i++) {
+				gnss_ring[gnss_head++ % GNSS_RING] = d[i];
+			}
+			if (gnss_waiting) {
+				gnss_waiting = false;
+				wakeup(&gnss_head);
+			}
+		}
+	}
+	lck_mtx_unlock(&shub_lock);
+}
+
+static bool
+gnss_pending(void)
+{
+	return gnss_req_pending;
+}
+
+/* On the hub thread: carry out the request user space wrote */
+static void
+gnss_do(void)
+{
+	static uint8_t pay[SHUB_TL_MAX];
+	const uint8_t *r = gnss_req;
+	uint16_t n = gnss_req_len;
+
+	if (n >= 3 && (r[0] == 'R' || r[0] == 'P')) {
+		uint16_t id = (uint16_t)(r[1] | r[2] << 8);
+		size_t k = shub_rpc_put(pay, id, r + 3, (uint16_t)(n - 3));
+		bool ok = r[0] == 'R' ? send_reliable(pay, (uint16_t)k) : send_packet(0, pay, (uint16_t)k, false);
+
+		gnss_post(GNSS_REC_SENT, ok, id, NULL, 0);
+	} else if (n >= 10 && r[0] == 'S') {
+		uint8_t cmd = r[1];
+		uint16_t opts = (uint16_t)(r[2] | r[3] << 8), len = (uint16_t)(r[8] | r[9] << 8);
+		uint32_t arg = shub_le32(r + 4);
+		static uint8_t buf[2048];
+		bool ok;
+
+		if (SSP_TYPE(opts) == SSP_AP2HUB_READ) {
+			len = len > 2000 ? 2000 : len;
+			memset(buf, 0, len);
+			ok = ssp_cmd(cmd, opts, arg, buf, len);
+			gnss_post(GNSS_REC_SSP, ok, cmd, buf, ok ? len : 0);
+		} else {
+			len = len > 64 ? 64 : len;
+			len = len > n - 10 ? (uint16_t)(n - 10) : len;
+			memcpy(buf, r + 10, len);
+			ok = ssp_cmd(cmd, opts, arg, buf, len);
+			gnss_post(GNSS_REC_SSP, ok, cmd, NULL, 0);
+		}
+	} else {
+		gnss_post(GNSS_REC_SENT, 0, 0xffff, NULL, 0);
+	}
+	gnss_req_pending = false;
+	gnss_req_busy = false;
+}
+
+static int
+gnss_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
+{
+	lck_mtx_lock(&shub_lock);
+	gnss_readers++;
+	lck_mtx_unlock(&shub_lock);
+	return 0;
+}
+
+static int
+gnss_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
+{
+	lck_mtx_lock(&shub_lock);
+	if (gnss_readers > 0 && --gnss_readers == 0) {
+		gnss_tail = gnss_head;
+	}
+	lck_mtx_unlock(&shub_lock);
+	return 0;
+}
+
+static int
+gnss_read(__unused dev_t dev, struct uio *uio, int ioflag)
+{
+	uint8_t chunk[512];
+	int error = 0;
+
+	lck_mtx_lock(&shub_lock);
+	while (gnss_head == gnss_tail) {
+		if (ioflag & IO_NDELAY) {
+			lck_mtx_unlock(&shub_lock);
+			return EWOULDBLOCK;
+		}
+		gnss_waiting = true;
+		error = msleep(&gnss_head, &shub_lock, PZERO | PCATCH, GNSS_DEV_NAME, NULL);
+		if (error != 0) {
+			lck_mtx_unlock(&shub_lock);
+			return error;
+		}
+	}
+	while (gnss_head != gnss_tail && uio_resid(uio) > 0) {
+		uint32_t k = 0;
+
+		while (k < sizeof(chunk) && gnss_head != gnss_tail && (user_ssize_t)k < uio_resid(uio)) {
+			chunk[k++] = gnss_ring[gnss_tail++ % GNSS_RING];
+		}
+		lck_mtx_unlock(&shub_lock);
+		error = uiomove((caddr_t)chunk, (int)k, uio);
+		lck_mtx_lock(&shub_lock);
+		if (error != 0) {
+			break;
+		}
+	}
+	lck_mtx_unlock(&shub_lock);
+	return error;
+}
+
+static int
+gnss_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+{
+	user_ssize_t n = uio_resid(uio);
+	int error;
+
+	if (n < 1 || n > GNSS_REQ_MAX) {
+		return EINVAL;
+	}
+	lck_mtx_lock(&shub_lock);
+	if (gnss_req_busy || !gnss_live) {
+		lck_mtx_unlock(&shub_lock);
+		return EBUSY;
+	}
+	gnss_req_busy = true;
+	lck_mtx_unlock(&shub_lock);
+	error = uiomove((caddr_t)gnss_req, (int)n, uio);
+	if (error == 0) {
+		gnss_req_len = (uint16_t)n;
+		gnss_req_pending = true;
+	} else {
+		gnss_req_busy = false;
+	}
+	return error;
+}
+
+static const struct cdevsw gnss_cdevsw = {
+	.d_open = gnss_open,
+	.d_close = gnss_close,
+	.d_read = gnss_read,
+	.d_write = gnss_write,
+	.d_ioctl = eno_ioctl,
+	.d_stop = eno_stop,
+	.d_reset = eno_reset,
+	.d_select = eno_select,
+	.d_mmap = eno_mmap,
+	.d_strategy = eno_strat,
+	.d_type = 0,
+};
+
+static void
+make_gnss_device(void)
+{
+	int major = cdevsw_add(-1, &gnss_cdevsw);
+
+	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, GNSS_DEV_NAME) == NULL) {
+		say("shub: /dev/%s could not be made\n", GNSS_DEV_NAME);
+		return;
+	}
+	say("shub: /dev/%s made\n", GNSS_DEV_NAME);
+}
+
 static volatile uint64_t console_want_on, console_want_off;
 static volatile bool console_cmd_pending;
 static char console_cmd[64];
@@ -1535,6 +1828,7 @@ run(void)
 	}
 	state = "running";
 	idle_us = 4000;
+	gnss_live = true;
 	for (;;) {
 		uint64_t on = console_want_on, off = console_want_off;
 
@@ -1556,7 +1850,10 @@ run(void)
 		if (console_cmd_pending) {
 			console_do();
 		}
-		pump(100, NULL);
+		if (gnss_req_pending) {
+			gnss_do();
+		}
+		pump(100, gnss_pending);
 		if (ssp.frames - frames_at_time >= 3000) {
 			frames_at_time = ssp.frames;
 			send_time();
@@ -1833,6 +2130,7 @@ hakios_ssp_init(void)
 	PE_parse_boot_argn("shub_ms", &period_ms, sizeof(period_ms));
 	PE_parse_boot_argn("shub_req_rpc", &req_rpc, sizeof(req_rpc));
 	PE_parse_boot_argn("shub_req_len", &req_len, sizeof(req_len));
+	PE_parse_boot_argn("shub_peek", &peek, sizeof(peek));
 	acc_position = strcmp(HAKIOS_DEVICE, "star2lte") == 0 ? ACC_POSITION_S9PLUS : ACC_POSITION_S9;
 	PE_parse_boot_argn("shub_acc_pos", &acc_position, sizeof(acc_position));
 	{
@@ -1861,6 +2159,7 @@ hakios_ssp_init(void)
 	}
 	if (n >= 6) {
 		make_device();          /* before the hub thread starts, so backboardd finds it at launch */
+		make_gnss_device();
 	}
 	if (kernel_thread_start(shub_thread, (void *)(uintptr_t)n, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
