@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Settings > Privacy > Location Services on, as the setup assistant (which never runs here) leaves it when
+	     one says yes. Off, locationd answers every client kCLErrorDenied. With it on, locationd locates the phone
+	     by the Wi-Fi networks it hears (wifid's scans, Apple's location service): a fix of 50-80 m. -->
+	<key>LocationServicesEnabledIn8.0</key>
+	<true/>
+</dict>
+</plist>

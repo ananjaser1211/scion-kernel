@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- locationd's list of its clients, with what each may have: Weather "always" (its widget, which cannot
+	     ask, locates too) and Maps "while in use" (Authorization 4 and 2; CLAuthorizationStatus 3 and 4), so
+	     that both show where the phone is from the first boot. Every other application asks as on an iPhone.
+	     locationd adds the rest of each entry, and every other client, itself. -->
+	<key>com.apple.Maps</key>
+	<dict>
+		<key>Authorization</key>
+		<integer>2</integer>
+		<key>BundleId</key>
+		<string>com.apple.Maps</string>
+		<key>BundlePath</key>
+		<string>/Applications/Maps.app</string>
+		<key>SupportedAuthorizationMask</key>
+		<integer>3</integer>
+	</dict>
+	<key>com.apple.weather</key>
+	<dict>
+		<key>Authorization</key>
+		<integer>4</integer>
+		<key>BundleId</key>
+		<string>com.apple.weather</string>
+		<key>BundlePath</key>
+		<string>/Applications/Weather.app</string>
+		<key>SupportedAuthorizationMask</key>
+		<integer>7</integer>
+	</dict>
+</dict>
+</plist>

@@ -776,6 +776,9 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 		VARSRC=obj/varplus
 	fi
 	cp -r $VARSRC root/var
+	# locationd's own directory, before the list of its clients that goes in it (var/root/Library/Caches/locationd)
+	printf 'd	700	0	0	/private/var/root/Library/Caches/locationd
+' >> root/etc/var.skel
 	(cd $VARSRC && find . -type f | sed 's|^\./||' | sort) | while read -r f; do
 		case $f in mobile/*) owner=501 ;; *) owner=0 ;; esac
 		printf 'f\t644\t%s\t%s\t/private/var/%s\t/var/%s\n' $owner $owner "$f" "$f"
