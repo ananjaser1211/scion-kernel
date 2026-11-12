@@ -407,6 +407,16 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 			-o obj/HakiosTriangle src/triangle_app.m &&
 			{ ${LDID:-ldid} -Ssrc/triangle_app.entitlements obj/HakiosTriangle 2>/dev/null ||
 			  echo "build.sh: no ldid: HakiosTriangle is unsigned, which still runs (AMFI here accepts everything) but holds no entitlements"; }
+		# The GNSS receiver's live status for a person walking about with the phone: state and fix,
+		# a sky plot, C/N0 per satellite, position and accuracy, Start / Pause (src/gps_app.m).
+		# It reads gnssd's status file and posts gnssd's notifications, nothing else. ARC; the
+		# bundle is assembled beside HakiosTriangle's below. Signed like the triangle (and with
+		# tools/machosign.py where ldid is missing, as gnssd is) for an application's entitlements.
+		$DYN -fobjc-arc -framework Foundation -framework UIKit -framework CoreGraphics \
+			-o obj/HakiosGPS src/gps_app.m &&
+			{ ${LDID:-ldid} -Ssrc/gps_app.entitlements obj/HakiosGPS 2>/dev/null ||
+			  python3 ../tools/machosign.py obj/HakiosGPS src/gps_app.entitlements com.hakios.gps ||
+			  echo "build.sh: no ldid: HakiosGPS is unsigned, which still runs but holds no entitlements"; }
 		# what the device ANSWERS when an application asks what it supports
 		# (src/metal_caps.m). It takes the device from MTLCreateSystemDefaultDevice() so
 		# that the ivars behind Apple's inherited answers are filled by the registration
@@ -711,6 +721,44 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 		# config_enforce_signed_code. What a signature would still buy is entitlements,
 		# and this application asks the system for nothing that needs one.
 		echo "  HakiosTriangle.app: $(du -sk obj/HakiosTriangle.app | cut -f1) KB for /Applications"
+	fi
+	# HakiosGPS.app (src/gps_app.m), the same way. Its icon is a small sky plot: two elevation
+	# rings and three satellites on a night-blue square, no alpha.
+	if [ -f obj/HakiosGPS ]; then
+		rm -rf obj/HakiosGPS.app
+		mkdir -p obj/HakiosGPS.app
+		cp obj/HakiosGPS obj/HakiosGPS.app/
+		cp src/gps_app.plist obj/HakiosGPS.app/Info.plist
+		printf 'APPL????' > obj/HakiosGPS.app/PkgInfo
+		python3 - obj/HakiosGPS.app <<-'PY'
+		import math, struct, sys, zlib
+		out = sys.argv[1]
+		dots = ((0.30, 0.32, (77, 163, 255)), (0.70, 0.40, (52, 199, 89)), (0.58, 0.74, (255, 165, 61)))
+		for size, scale in ((120, 2), (180, 3)):
+		    rows = bytearray()
+		    for y in range(size):
+		        rows.append(0)
+		        for x in range(size):
+		            u, v = (x + 0.5) / size, (y + 0.5) / size
+		            r = math.hypot(u - 0.5, v - 0.5)
+		            px = (16, 26, 46)
+		            if abs(r - 0.40) < 0.018 or abs(r - 0.20) < 0.012:
+		                px = (150, 170, 200)
+		            elif r < 0.40 and (abs(u - 0.5) < 0.006 or abs(v - 0.5) < 0.006):
+		                px = (70, 85, 110)
+		            for du, dv, c in dots:
+		                if math.hypot(u - du, v - dv) < 0.07:
+		                    px = c
+		            rows += bytes(px)
+		    def chunk(kind, body):
+		        return (struct.pack('>I', len(body)) + kind + body +
+		                struct.pack('>I', zlib.crc32(kind + body)))
+		    png = (b'\x89PNG\r\n\x1a\n' +
+		           chunk(b'IHDR', struct.pack('>IIBBBBB', size, size, 8, 2, 0, 0, 0)) +
+		           chunk(b'IDAT', zlib.compress(bytes(rows), 9)) + chunk(b'IEND', b''))
+		    open('%s/AppIcon60x60@%dx.png' % (out, scale), 'wb').write(png)
+		PY
+		echo "  HakiosGPS.app: $(du -sk obj/HakiosGPS.app | cut -f1) KB for /Applications"
 	fi
 	# /dev and /private/var exist so that this image can also be the root on its own:
 	# devfs is mounted on /dev, and init puts a ramfs on /private/var
@@ -1178,6 +1226,10 @@ if [ -f $DARWIN/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	if [ -d obj/HakiosTriangle.app ]; then
 		cp -a obj/HakiosTriangle.app sysroot/Applications/
 		echo "  HakiosTriangle.app in /Applications (com.hakios.triangle, scheme hakiostriangle:)"
+	fi
+	if [ -d obj/HakiosGPS.app ]; then
+		cp -a obj/HakiosGPS.app sysroot/Applications/
+		echo "  HakiosGPS.app in /Applications (com.hakios.gps, scheme hakiosgps:)"
 	fi
 	# Applications from outside this tree: every .app in ../apps, which is kept out of the
 	# repository the way ../fw-* and ../jb are, so that nothing of somebody else's package can
