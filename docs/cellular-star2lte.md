@@ -83,7 +83,8 @@ Sources: Apollo (`/home/aj1211/Kernels/Apollo`). Samsung's closed `cbd` daemon d
 - **The CP's own memory map**, read from RADIO's BOOT image at `+0xa0` ("MEM0"), agrees: DRAM `0x7900000`, VSS at
   `+0x7900000` (`0x700000`), IPC at `+0x8000000` (`0x500000`), ZMC at `+0x8500000` (`0xb00000`), VPA at `+0x9000000`
   (`0x200000`). That ends exactly at `0x9200000`. Apollo's `shm_ipc.c` reads this table at **base + 0x200 + 0xa0**, with
-  the comment "0x200: TOC". So the region starts with the TOC, followed by BOOT.
+  the comment "0x200: TOC". That is a warm-reboot layout check. cbd itself loads BOOT at +0 and never sends the TOC
+  (see "What cbd does" below), so on a cold boot that probe finds nothing and the device tree's sizes apply.
 
 ### RADIO (`backup/2026-11-12-pre-hfs/RADIO.img`, headers only)
 
@@ -133,10 +134,104 @@ From `link_device_shmem.c`, `modem_ctrl_ss310ap.c`, `pmu-cp.c`, `cal-if/pmucal_c
 Everything the kernel needs is MMIO (PMU, mailbox, AP2CP_CFG), memory it already keeps out, and SiP SMCs. None of it
 depends on Linux. **Unknowns that only the phone can settle:**
 
-- whether `bl_size` counts the TOC (`shannon_blsize=` is there to try both: EL3 says `CP_WRONG_BL_SIZE` if not);
+- the boot-loader size is settled by cbd: BOOT's TOC size (0x1e40), with BOOT at +0 (see below);
 - whether S-Boot leaves anything in the region (`shannon_peek=1`);
 - the `sys_rev` value Samsung reads from eight GPIOs (`shannon_sysrev=`);
 - whether the CP boots with an empty NV (`CMD_NV_REBUILDING` exists for that case).
+
+### What cbd does, instruction by instruction (FloydROM T, `vendor/bin/cbd`)
+
+The kernel side above is half of the story; the other half is Samsung's closed boot daemon. These notes come from an
+annotated disassembly of `vendor/bin/cbd` (FloydROM_T_Exynos9810_Build-22, BuildID 23d6c677…). The binary and the
+disassembly stay outside the repository, in `~/scion/cell-work`. The function names are the `__func__` strings each
+function logs with.
+
+**The service** (`vendor/etc/init/init.baseband.rc`):
+`cbd -d -tss310 -bm -mm -P platform/11120000.ufs/by-name/RADIO -n /mnt/vendor/efs`, as root, `seclabel u:r:cbd:s0`.
+- `-tss310` selects the modem type.
+- `-bm -mm` select SHMEM as both the boot link and the main link.
+- `-P` is the RADIO partition, also symlinked to `/dev/mbin0`.
+- `-n` is the NV directory.
+- The same rc writes `ro.multisim.simslotcount` to `modem_ctrl_ss310ap/parameters/ds_detect`. A single SIM gives
+  `ds_det` 0 in the AP status word.
+
+**`start_shannon310_boot`, in order:**
+
+1. **Waits for NV to be checked.** It polls `vendor.cbd.rfs_check_done` with `usleep`, then logs "NV validation done"
+   or "TIMEOUT". The RFS side of the RIL (libsec-ril) sets that property after it has checked
+   `nv_data.bin` against its `.bak` and md5 copies. cbd has no RFS server of its own: the strings for `umts_rfs0`
+   are in the RIL.
+2. **`prepare_boot_args` ("Prepare arguments, read TOC, check NV").**
+   - Opens RADIO, reads 0x200 bytes and checks for "TOC".
+   - Takes the number of stages from the TOC entry's own id field (5): stages 1..4 when an NV directory is given
+     (`-n`), which means BOOT, MAIN, VSS and NV. OFFSET and TOC are never sent.
+   - For each stage it keeps the file offset, `m_offset = address & 0x3fffffff`, the size, the crc, and whether the
+     stage is VSS. The NV stage reads from the NV file instead of RADIO.
+   - Opens `/mnt/vendor/efs/nv_data.bin`. If it is missing, `create_empty_nv` writes it **0xFF-filled, the NV entry's
+     size (0x100000)**, with fsync.
+3. **`IOCTL_MODEM_STATUS` (0x6f27), then `std_boot_modem_reset` = `IOCTL_MODEM_RESET` (0x6f21).** The reset is a no-op
+   while the CP is offline (`ss310ap_reset`).
+4. **"Request Security : non-secure mode"** = `std_security_req(2, 0, 0)` → `IOCTL_SECURITY_REQ` (0x6f53).
+   - The struct is `{mode, size_boot, size_main, 0}`.
+   - Around the ioctl, cbd **clears CPU 0 from its affinity** and restores it afterwards. The SMC is never made from
+     CPU 0.
+   - For mode 2, a return of 0xb (`CP_NOT_WORKING`) counts as success.
+   - In the kernel this is the first call, so `cal_cp_init` runs here, before any image is loaded.
+5. **"Send BIN"** (`shannon310_boot_xmit`). For stages 1..4: `lseek(b_off)`, then reads of **0xf800 bytes** at a time.
+   Each chunk goes through `IOCTL_MODEM_XMIT_BOOT` (0x6f40) with
+   `struct modem_firmware {u64 binary; u32 size, m_offset, b_offset, mode = 0, len}`, `m_offset` advancing chunk by
+   chunk. VSS is sent only once per Android boot (`vendor.cbd.first_xmit_done`).
+6. **"Request Security : secure mode"** = `std_security_req(0, BOOT.size, MAIN.size)`, i.e. (0, 0x1e40, 0x24075c0),
+   again off CPU 0. The kernel ORs the region's base into the mode only if `shm_probe` found a CP memory map at boot.
+   On a cold boot BOOT sits at +0 and the probe looks at +0x2a0, so it finds none: **x1 = 0**.
+7. **`get_factory_prop`** reads `/efs/factory.prop` (SIM count) and echoes it to `…/mif_pdata/sim/ds_detect`.
+8. **"MODEM ON : pda_active 1, cp power on"** = `IOCTL_MODEM_ON` (0x6f19, `ss310ap_on`).
+9. **"BOOT ON : change modem state, irq, wait cp state"** = `IOCTL_MODEM_BOOT_ON` (0x6f22). It waits for the CP status
+   word.
+10. **"BOOT START : reset ipcmap, set magic code"** = `IOCTL_MODEM_DL_START` (0x6f28, `shmem_start_download`).
+    - Resets the legacy IPC map at the IPC region (`0xF8000000`), the 4 MB `shmem_4mb_phys_map`:
+      - header words: `magic`, `access`, FMT tx/rx head/tail, RAW tx/rx head/tail;
+      - 4056 reserved bytes;
+      - buffers: FMT tx/rx 4 KB each, RAW tx 2084864 bytes, RAW rx 2 MB.
+    - Writes `magic = 0x424F4F54` ("BOOT"), because link attrs 0x7c9 include DPRAM_MAGIC, MEM_BOOT and BOOT_ALIGNED.
+    - Then `modem_boot_confirm` sets the AP status to 1.
+11. **"HANDSHAKE COMMAND : send & recv boot_done, fin message"** (`std_boot_finish_handshake`).
+    - `std_udl_stage_done(0)`: writes the 4-byte word **0x900d** to `umts_boot0`, polls up to 30 s, reads 4 bytes and
+      expects **0xa00d**.
+    - Then `std_udl_stage_start(0xf)`: writes **0x9f00**, expects **0xaf00**.
+    - `umts_boot0` has iod attrs 0x2 (SIPC5), so each word goes out as a SIPC5 frame on channel 215. It goes through
+      `xmit_udl` into the map's RAW tx queue, followed by a mailbox interrupt. The answer comes back through the RAW rx
+      queue.
+12. **"BOOT OFF : wait completion, irq"** = `IOCTL_MODEM_BOOT_OFF` (0x6f23). It waits for `init_cmpl`, which completes
+    once the CP has sent PHONE_START and INIT_START and the SBD link is up. Then `IOCTL_MODEM_GET_CP_BOOTLOG` (0x6f47)
+    and "Boot up process done!!!" (`vendor.cbd.boot_done`).
+
+**What the driver does with this:**
+- `shannon=2` (fbd8bcb) is cbd's steps 4-6 as the kernel carries them out: `cal_cp_init`, SMC(2, 0, 0), the four
+  stages at `address & 0x3fffffff` with NV 0xFF unless `shannon_nv=1`, then SMC(0, 0x1e40, 0x24075c0). Both SMCs are
+  made from a core whose MPIDR is not 0.
+- `shannon=3` adds steps 8-9 and listens. Steps 10-12 (the IPC map, the magic, the UDL words over SIPC5, then the SBD
+  link) are the next piece of work. They need the SIPC5 framing written for the boot channel and the RAW queues
+  served, which a polled kernel loop can do without the RIL.
+
+**Step 1 on the phone (build 36, kernel 540c944):**
+- **CP_CTRL_NS = 0x2016a0.** That is CP_ACTIVE_REQ_EN, CP_RESET_REQ_EN, MASK_CP_PWRDN_DONE, RTC_OUT_EN,
+  SET_SW_MIF_REQ and WDT_FLAG_CLR_EN. PWRON (bit 1) and RESET_SET (bit 2) are clear.
+- **CP_CTRL_S = 0**, so CP_START is clear.
+- **CP_STAT = 1** (CP_PWRDN_DONE). CENTRAL_SEQ_CP_STATUS is 0 and RESET_SEQUENCER_STATUS is 0, so the CP has never
+  been initialised. The mailbox is quiet.
+
+This is the cold state Android's first `IOCTL_SECURITY_REQ` finds, so `shannon=2` takes the `cal_cp_init` path. The
+RADIO TOC and the CP memory map read on the phone match the backup and the device tree:
+- DRAM 0x7900000;
+- VSS/IPC/ZMC/VPA at +0x7900000/+0x8000000/+0x8500000/+0x9000000;
+- LOG at +0x9200000 (0x2000000) = `cp_ram_logging`.
+
+The "more" size, 0x1900000, is the sum of VSS, IPC, ZMC and VPA, and DRAM plus that is 0x9200000, the `modem_if`
+size. Everything sits inside the loader's keep-out (0xF0000000-0xFB1FFFFF).
+
+**The boot-loader size:** cbd passes BOOT's TOC size (0x1e40), with BOOT itself at +0, not after the TOC. That is the
+driver's default now. `shannon_toc=1` and `shannon_blsize=` remain only for experiments.
 
 ## 4. Talking to the CP
 
@@ -209,10 +304,11 @@ in `hakios.stubs.c`. It needs UFS (`ufs=2`).
 | `shannon=1` | Read only, each MMIO read logged before it is made: CP_CTRL_NS/S via SMC READ_CTRL, PMU CP_STAT, CENTRAL_SEQ conf/status, RESET_SEQUENCER_STATUS (what Samsung reads at any time), mailbox INTMR0 (read by Linux at boot), then RADIO TOC and MEM map. **Not** AP2CP_CFG: build 35 showed that reading it with the CP never initialised is a synchronous external abort (panic in `log_cp_registers`). It is touched only in step 3, once RESET_SEQUENCER_STATUS is 5 and the verify call passed, as `ss310ap_on` does |
 | `shannon_regs=1` | Also the CP SYS_PWR_REGs and the other mailbox words (INTSR0/INTMR1/INTSR1, words 0-3) |
 | `shannon_peek=1` | Also logs a few words of the first page at `0xF0000000` (what the boot loader left; Linux reads the same page at probe time) |
-| `shannon=2` | Then loads TOC+BOOT, MAIN and VSS from RADIO into `0xF0000000` (logging crc32s), zeroes NV, runs `cal_cp_init` if needed, makes the verify SMC and logs its answer by name. Does not start the CP |
-| `shannon_nv=1` | With 2-3: NV from `EFS:/nv_data.bin` (size logged, never contents) |
-| `shannon_toc=0` | BOOT at `+0` instead of TOC then BOOT |
-| `shannon_blsize=N` | The boot-loader size given to the SMC (default: BOOT's TOC size) |
+| `shannon=2` | cbd's order: `cal_cp_init` if the CP was never initialised, SMC(2, 0, 0) (0 or CP_NOT_WORKING accepted), then BOOT/MAIN/VSS/NV at `address & 0x3fffffff` (BOOT +0, MAIN +0x10000, VSS +0x7900000, NV +0x4900000; crc32s logged), then SMC(0, BOOT size, MAIN size). Both SMCs are made off CPU 0, as cbd makes them. Does not start the CP |
+| `shannon_nv=1` | With 2-3: NV from `EFS:/nv_data.bin` if it is exactly the NV entry's size (size logged, never contents). Without it NV is 0xFF, what cbd's `create_empty_nv` writes |
+| `shannon_toc=1` | Experiment only: TOC at +0 and BOOT after it (the layout of `shm_ipc.c`'s memory-map probe), not cbd's |
+| `shannon_base=1` | Experiment only: the region's base ORed into the secure request's mode (Linux does so only after a warm boot) |
+| `shannon_blsize=N` | The boot-loader size for the secure request (default BOOT's TOC size, as cbd) |
 | `shannon=3` | Then the AP status word, AP2CP_CFG = 1, waits up to 2 s for the CP's status, then logs every CP mailbox message (PHONE_START, INIT_START, …) and status change for 60 s. Answers nothing yet |
 | `shannon_sysrev=N` | The board revision in the AP status word (default 0) |
 
