@@ -38,6 +38,20 @@ struct hakios_sensor_sample {
 	int32_t v[4];
 };
 
+/*
+ * write(): the rate a sensor is to be read at from now on, one record per sensor (since 13 November; a kernel before
+ * that refuses the write). HAKIOS_SENSOR_RATE_BOOT is the boot's rate (shub_ms, 200 ms for light, proximity and
+ * pressure), HAKIOS_SENSOR_RATE_OFF turns the sensor off at the hub, anything else is a period of 5 to 1000 ms. When
+ * the last reader closes the device every sensor goes back to the boot's rate. The reader in backboardd
+ * (userland/src/inject.c) asks for what the event server's clients want ("ReportInterval").
+ */
+struct hakios_sensor_rate {
+	uint32_t type;                  /* HAKIOS_SENSOR_* */
+	uint32_t period_ms;
+};
+#define HAKIOS_SENSOR_RATE_OFF  0
+#define HAKIOS_SENSOR_RATE_BOOT 0xffffffffu
+
 #ifdef KERNEL
 void hakios_ssp_init(void);             /* boot-arg shub=N on the Galaxy S9: its sensor hub (also in sys/hakios.input.h) */
 void hakios_ssp_console(const char *arg); /* the USB console's "sensors" (hakios.dwc3.c) */
