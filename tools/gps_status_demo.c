@@ -4,10 +4,14 @@
  *
  * It writes /var/mobile/Library/Caches/com.hakios.gnssd/status.plist once a second, the way
  * gnssd does (a temporary file, then rename), and posts com.hakios.gnssd.status after each
- * write. The satellites are invented (nine, over all five constellations, drifting slowly so
+ * write, with demo = true in it, which makes the application show a big "DEMO DATA, not the
+ * receiver" banner. The satellites are invented (nine, over all five constellations, drifting slowly so
  * that the plot moves) and the fix is at 0.0, 0.0 -- Null Island, in the Gulf of Guinea, so
  * nothing on the screen can be taken for a real position. It touches nothing else: not
  * locationd, not /dev/hakios-gnss, not gnssd.
+ *
+ * It refuses to start while the file is fresh and not its own (gnssd is writing it): the
+ * two would overwrite each other and the screen would mix real and fake.
  *
  * It answers the two commands the application sends: com.hakios.gnssd.pause turns it "off",
  * com.hakios.gnssd.start walks starting -> loading_esw -> engine_on -> searching -> 2D -> 3D.
@@ -93,6 +97,7 @@ write_status(void)
 	int visible = state == S_SEARCH || state == S_FIX2 || state == S_FIX3;
 	CFMutableDictionaryRef d = CFDictionaryCreateMutable(NULL, 0,
 	    &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	put(d, "demo", CFRetain(kCFBooleanTrue));     /* the application's DEMO DATA banner */
 	put(d, "state", str(names[state]));
 	if (state == S_ERROR)
 		put(d, "error", str("DEMO: esw load timed out"));
@@ -198,6 +203,25 @@ main(int argc, char **argv)
 usage:
 			fprintf(stderr, "usage: gps_status_demo [-s off|searching|fix2|fix|error] [-t secs] [-k]\n");
 			return 2;
+		}
+	}
+	{
+		struct stat st;
+		if (stat(FILE_PATH, &st) == 0 && time(NULL) - st.st_mtime < 10) {
+			CFURLRef u = CFURLCreateFromFileSystemRepresentation(NULL,
+			    (const UInt8 *)FILE_PATH, strlen(FILE_PATH), false);
+			CFReadStreamRef rs = CFReadStreamCreateWithFile(NULL, u);
+			CFPropertyListRef pl = NULL;
+			if (rs && CFReadStreamOpen(rs))
+				pl = CFPropertyListCreateWithStream(NULL, rs, 0, 0, NULL, NULL);
+			CFTypeRef dv = pl && CFGetTypeID(pl) == CFDictionaryGetTypeID() ?
+			    CFDictionaryGetValue(pl, CFSTR("demo")) : NULL;
+			if (dv != kCFBooleanTrue) {
+				fprintf(stderr, "gps_status_demo: %s was written %lds ago and is not a demo "
+				    "file: gnssd is running, so this will not overwrite it\n", FILE_PATH,
+				    (long)(time(NULL) - st.st_mtime));
+				return 1;
+			}
 		}
 	}
 	if (mkdir(DIR_PATH, 0755) == 0) {

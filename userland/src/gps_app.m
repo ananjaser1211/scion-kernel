@@ -24,6 +24,10 @@
  *   latitude, longitude     double, only with fixType >= 2
  *   altitude float m, speed float m/s, course float deg, utc string
  *   ttffSeconds  float (optional), receiverOnSeconds float
+ *   demo         bool (optional): true when the file is made up (tools/gps_status_demo.c).
+ *                The application then puts a big "DEMO DATA, not the receiver" banner
+ *                above everything and prefixes the badge with DEMO, so a fake fix cannot
+ *                be taken for a real one.
  *   updated      date    when gnssd wrote it
  *
  * A file that is missing, unreadable, or older than 5 s (by `updated`, or by its mtime
@@ -370,7 +374,7 @@ gps_text(NSString *s, CGPoint centre, UIFont *font, UIColor *color)
 @implementation GPSController {
 	UIScrollView *_scroll;
 	UIStackView *_stack;
-	UILabel *_badge, *_subtitle, *_counts;
+	UILabel *_badge, *_subtitle, *_counts, *_demoBanner;
 	UIView *_staleCard;
 	UILabel *_staleText;
 	NSArray *_dataViews;
@@ -519,6 +523,19 @@ gps_text(NSString *s, CGPoint centre, UIFont *font, UIColor *color)
 	_staleText = [self label:16 weight:UIFontWeightRegular color:[UIColor labelColor]];
 	_staleCard = [self card:@"No status from gnssd" content:_staleText];
 
+	/* a file that says demo = true: shouted, on top, so a made-up fix is never read as real */
+	_demoBanner = [self label:24 weight:UIFontWeightBlack color:[UIColor blackColor]];
+	_demoBanner.text = @"DEMO DATA\nnot the receiver";
+	_demoBanner.textAlignment = NSTextAlignmentCenter;
+	_demoBanner.numberOfLines = 2;
+	_demoBanner.backgroundColor = gps_rgb(0xffd60a);
+	_demoBanner.layer.borderColor = gps_rgb(0xff3b30).CGColor;
+	_demoBanner.layer.borderWidth = 6;
+	_demoBanner.layer.cornerRadius = 14;
+	_demoBanner.layer.masksToBounds = YES;
+	[_demoBanner.heightAnchor constraintGreaterThanOrEqualToConstant:84].active = YES;
+	_demoBanner.hidden = YES;
+
 	_sky = [[GPSSkyView alloc] init];
 	[_sky.heightAnchor constraintEqualToAnchor:_sky.widthAnchor].active = YES;
 	_legend = [self label:12 weight:UIFontWeightRegular color:[UIColor secondaryLabelColor]];
@@ -536,7 +553,7 @@ gps_text(NSString *s, CGPoint centre, UIFont *font, UIColor *color)
 	UIView *detailsCard = [self card:@"Position" content:[self detailsGrid]];
 	_dataViews = @[ skyCard, barsCard, detailsCard ];
 
-	_stack = [[UIStackView alloc] initWithArrangedSubviews:@[ _badge, _subtitle, _counts,
+	_stack = [[UIStackView alloc] initWithArrangedSubviews:@[ _demoBanner, _badge, _subtitle, _counts,
 	    _staleCard, skyCard, barsCard, detailsCard ]];
 	_stack.axis = UILayoutConstraintAxisVertical;
 	_stack.spacing = 12;
@@ -743,6 +760,10 @@ gps_fmt(NSNumber *n, NSString *fmt)
 		counts = [NSString stringWithFormat:@"%@ used / %@ in view",
 		    gps_num(d, @"satsUsed") ?: @"—", gps_num(d, @"satsInView") ?: @"—"];
 	}
+	BOOL demo = fresh && [gps_num(d, @"demo") boolValue];
+	_demoBanner.hidden = !demo;
+	if (demo)
+		badge = [@"DEMO " stringByAppendingString:badge];
 	_badge.text = badge;
 	_badge.backgroundColor = gps_rgb(colour);
 	_subtitle.text = sub;
