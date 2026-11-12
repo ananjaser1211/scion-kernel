@@ -611,6 +611,16 @@ Version received: Asic 0x3000000F, IFC 132, Radio 0x03"**, then **STATE_REPORT S
   LNA), sent while the search ran, changed nothing.
 - The chip's RF defaults match gps.xml: `SetRfType(35)` = GL_RF_4755_BRCM_EXT_LNA, LNA mask 1 (L1_EXT_ON). The one difference is
   `SetPikeRfMode(3)` = L1_LP where gps.xml has L1 (1). The chip's ONCHIP_CONFIG parser knows only `indoor_logic:` and `lte_filter:`.
+- **The RF settings already match gps.xml.** The ME picks the RF mode from the baseband's version word (hub 0x008572b6:
+  0x3000000F or 0x3300000F gives mode 1; 0x34/0x35/0x3700000F give 3). After INIT_STAGE A it logs "Update PikeRfMode(1)" (L1, as in
+  gps.xml) and "Update PikeLnaMask(0x1)" (L1_EXT_ON). The `SetPikeRfMode(3)` at load is only the default before that. Sending
+  ONCHIP_CONFIG (0x17) with `rf_mode` would do nothing, because the chip parses only `indoor_logic:` and `lte_filter:`.
+- **The pin mux takes effect.** RPC 0x34 reaches the ROM's global request server (object 0x0091c548, server vtable 0x000fb0c0,
+  slot 10 = 0x00021726). That calls 0x000120c6(pin, mode), which writes a 4-bit field taken from the table at 0x00012178. Pin 17 is
+  bits 4-7 of 0x40410408 (pin 7 is bits 28-31 of 0x40410400). A peek after `rpc 34 1101` reads 0x40410408 = 0x00000010, so P17
+  is in mode 1. Whether mode 1 really routes the baseband's LNA enable to the external LNA cannot be read in software.
+- MicroNav also logs "PowerMode EnableLowPower T m_bPowerSaveIsOn T" (gps.xml's EnableLowPowerPmm) and "SetPeMeas 0 PeMeas, 0
+  MeMeas" every second: no measurements at all.
 - gnsstool now masks every text record (hub log lines included): numbers with four or more decimals, and the latitude and
   longitude fields of GGA/RMC/GLL/GNS. The engine's noise statistics are the one exception (they carry no position).
 - Next: the same test outdoors or at an open window, on a cold chip, with the pin mux sent before the ESW load, and with
