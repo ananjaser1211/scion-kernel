@@ -224,6 +224,17 @@ import sys
 # 43 bluetoothd's, the rest from 17 more clients (corespeechd, suggestd, WiFiCloudAssets, kbd, triald,
 # mediaserverd, ...); 382 in build26b, 123 in build27. It needs no hardware: it answers from its catalogue
 # on /private/var/MobileAsset and downloads over nsurlsessiond.
+# duetexpertd is IN, on demand, measured on the phone (12 November, loaded by hand into a running build29):
+# no crash and no restart in fifteen minutes, 29% of a core while it starts and below cputop's floor from
+# a minute later. It is the proactive suggestions engine, and without it chronod asks for
+# com.apple.proactive.infoSuggestion.xpc for ever -- 23 to 96 failed lookups a session (build27, build25),
+# 28 in build29's first six minutes and none after it was there -- and Spotlight's "Siri Suggestions" row
+# (apps, and the query completions under the search field) had nothing behind it.
+# atc (AirTraffic, a computer's sync of music and books) is OUT. Nothing had ever started it until the first
+# session with duetexpertd, where it came up a second after it and then asked for com.apple.backupd (denied)
+# about once a second for as long as it lived -- 178 failed lookups in two minutes, 67 more in the next two.
+# The second session, without it, missed it nowhere (no lookup of com.apple.atc at all), and this phone is
+# never synced to a computer.
 DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'softwareupdate',
         'datamigrator', 'backupd', 'thermalmonitord', 'keybagd', 'nfcd', 'biometrickitd', 'pearld',
         'obliterat', 'storage_mounter', 'com.apple.fud', 'sepd', 'seputil', 'camera', 'ReportCrash',
@@ -233,7 +244,8 @@ DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'soft
         # these start, crash and are asked for again, over and over. (aggregated, which was among them, is where
         # Darwin userland 16 keeps its power log -- com.apple.powerlog.plxpclogger.xpc and the rest -- that Settings > Battery
         # waits for; it now runs through a session.)
-        'homed', 'routined', 'duetexpertd', 'com.apple.dmd', 'syncdefaultsd', 'photoanalysisd', 'avconferenced')
+        'homed', 'routined', 'com.apple.dmd', 'syncdefaultsd', 'photoanalysisd', 'avconferenced',
+        'com.apple.atc')
 
 # ALLOW="word ..." in the environment lets jobs through that DENY would stop: for trying one out
 DENY = tuple(word for word in DENY if word not in os.environ.get('ALLOW', '').split())
