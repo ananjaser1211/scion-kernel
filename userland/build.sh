@@ -1297,6 +1297,11 @@ if [ -f $DARWIN/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 		echo "${app##*/}" >> sysroot/Applications/.extra-apps
 		echo "  ${app##*/} in /Applications ($(du -sm "$app" | cut -f1) MB from ../apps)"
 	done
+	# ... and the port's own applications put there above: LaunchServices does not walk /Applications again on a kept
+	# /private/var, so a new one (or a new build of one) is registered by jb_seed the same way
+	for app in HakiosTriangle.app HakiosGPS.app MetalTri.app; do
+		[ -d "sysroot/Applications/$app" ] && echo "$app" >> sysroot/Applications/.extra-apps
+	done
 	# our audio device, where the audio server looks for such plug-ins (and for no others: Apple's are left out)
 	mkdir -p sysroot/System/Library/Audio/Plug-Ins/HAL
 	ln -s /redwood/lib/HakiosAudio.driver sysroot/System/Library/Audio/Plug-Ins/HAL/HakiosAudio.driver
