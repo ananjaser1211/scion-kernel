@@ -978,6 +978,105 @@ show_kept_volume(void)
 	printf("  %d entries in %s from the runs before\n", count, reports);
 }
 
+/*
+ * A new system image on a kept /private/var: LaunchServices' database is forgotten, so that lsd builds it again.
+ *
+ * lsd keeps its database in its own container on the data volume and rebuilds it only when the system's version
+ * changes -- which here it never does: every image is 16.5 (20F66), SystemImageID and all. So a bundle the image
+ * gains stays registered as it was at the first boot. Build 42 was the proof: the image put back the executables
+ * of FileProvider's LocalStorageFileProvider and of the Files picker's extensions, and Files still had no "On My
+ * iPhone", because the record of that extension had been made when it had no executable, hence no entitlements,
+ * hence no group container (group.com.apple.FileProvider.LocalStorage) -- which fileproviderd needs for its domain.
+ * With the database gone, lsd asks installd to register every system bundle afresh, and installd makes the group
+ * containers their entitlements name (tried on the phone: the container appeared, fileproviderd found 8 providers
+ * where it had 7). Nothing of the user's is in those files: the applications' containers, the default-app choices
+ * (com.apple.LaunchServices.SettingsStore.sql) and everything else stay.
+ *
+ * Which image this is: /.scion-system-stamp, written by build.sh into every system image it makes; the one last
+ * seen is kept in /private/var/db/scion-system-stamp. No stamp (a small image as the root, the Darwin volume as
+ * the root): nothing is done.
+ */
+/* lsd's database: com.apple.LaunchServices-NNNN-v2.csstore and its SystemDataOnly- twin */
+static int
+launchservices_store(const char *name)
+{
+	static const char what[] = "com.apple.LaunchServices-", twin[] = "SystemDataOnly-", tail[] = ".csstore";
+	size_t len = strlen(name);
+
+	if (strncmp(name, twin, sizeof(twin) - 1) == 0) {
+		name += sizeof(twin) - 1;
+		len -= sizeof(twin) - 1;
+	}
+	return strncmp(name, what, sizeof(what) - 1) == 0 && len > sizeof(tail) - 1 &&
+	    strcmp(name + len - (sizeof(tail) - 1), tail) == 0;
+}
+
+static void
+forget_launchservices_on_new_image(void)
+{
+	static const char kept[] = "/private/var/db/scion-system-stamp",
+	    daemons[] = "/private/var/mobile/Containers/Data/InternalDaemon";
+	char want[128], have[128] = "", buf[4096], names[4096], path[512], victim[800];
+	off_t position = 0, inner;
+	ssize_t n, m;
+	int fd, cd, removed = 0;
+
+	if (read_whole("/.scion-system-stamp", want, sizeof(want)) <= 0) {
+		return;
+	}
+	if (read_whole(kept, have, sizeof(have)) > 0 && strcmp(want, have) == 0) {
+		return;
+	}
+	/* lsd's container is one of the internal daemons' (its UUID is the volume's own): each one's Library/Caches */
+	fd = open(daemons, O_RDONLY | O_DIRECTORY, 0);
+	while (fd >= 0 && (n = getdirentries(fd, buf, sizeof(buf), &position)) > 0) {
+		for (ssize_t at = 0; at < n; at += ((struct dirent *)(buf + at))->d_reclen) {
+			const char *name = ((struct dirent *)(buf + at))->d_name;
+
+			if (name[0] == '.' || sizeof(daemons) + strlen(name) + 16 > sizeof(path)) {
+				continue;
+			}
+			strcpy(path, daemons);
+			strcpy(path + strlen(path), "/");
+			strcpy(path + strlen(path), name);
+			strcpy(path + strlen(path), "/Library/Caches");
+			cd = open(path, O_RDONLY | O_DIRECTORY, 0);
+			inner = 0;
+			while (cd >= 0 && (m = getdirentries(cd, names, sizeof(names), &inner)) > 0) {
+				for (ssize_t i = 0; i < m; i += ((struct dirent *)(names + i))->d_reclen) {
+					const char *file = ((struct dirent *)(names + i))->d_name;
+
+					if (!launchservices_store(file) || strlen(path) + strlen(file) + 2 > sizeof(victim)) {
+						continue;
+					}
+					strcpy(victim, path);
+					strcpy(victim + strlen(victim), "/");
+					strcpy(victim + strlen(victim), file);
+					if (unlink(victim) == 0) {
+						removed++;
+					} else {
+						printf("  %s: %s\n", victim, strerror(errno));
+					}
+				}
+			}
+			if (cd >= 0) {
+				close(cd);
+			}
+		}
+	}
+	if (fd >= 0) {
+		close(fd);
+	}
+	fd = open(kept, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd >= 0) {
+		dprintf(fd, "%s", want);
+		fsync(fd);
+		close(fd);
+	}
+	printf("  a new system image (%.36s): %d LaunchServices database files removed, lsd registers every bundle again\n",
+	    want, removed);
+}
+
 static void
 mount_writable(void)
 {
@@ -1061,6 +1160,7 @@ mount_writable(void)
 	check(ok && made > 50, "create the directories of the data volume");
 	if (var_kept) {
 		show_kept_volume();
+		forget_launchservices_on_new_image();
 	}
 
 	/*
