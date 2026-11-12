@@ -96,6 +96,7 @@ BT_VENDOR_PART	arg	bt_vendor_part	User space	k	hakios.bcm4361_bt.c	the partition
 BUS_LOG	arg	bus_log	User space	k	hakios.exynos_acpm.c	do not log the APM's tables at boot (default: one line per domain, read only)
 BUS_MASK	arg	bus_mask	User space	k	hakios.exynos_acpm.c	
 BUS_MAX	arg	bus_max	User space	k	hakios.exynos_acpm.c	MIF, INT and DISP to their top at boot, kept there (re-asked every 10 s, cheap)
+BUS_MIF_DELAY	arg	bus_mif_delay	User space	k	hakios.exynos_acpm.c	
 BUTTONS	arg	buttons	Touch and buttons	k	hakios.buttons.c	
 BUTTONS_STEPS	arg	buttons_steps	Touch and buttons	k	hakios.buttons.c	
 CA_METALLIB	arg	ca_metallib	User space	u	inject.c	
@@ -159,6 +160,7 @@ CPUFREQ_GOV_LIT_MIN	arg	cpufreq_gov_lit_min	User space	k	hakios.exynos_cpufreq.c
 CPUFREQ_GOV_LOG	arg	cpufreq_gov_log	User space	k	hakios.exynos_cpufreq.c	a summary line this often (0: none; 1)
 CPUFREQ_GOV_MS	arg	cpufreq_gov_ms	User space	k	hakios.exynos_cpufreq.c	the load window (20 to 200; 40)
 CPUFREQ_OCP	arg	cpufreq_ocp	User space	k	hakios.exynos_cpufreq.c	the PMIC's CPU over-current warning on, and with it Samsung's star2lte limits for the M3s: 1924000 with three or four online, 2314000 with one or two
+CPUFREQ_OCP_REGS	arg	cpufreq_ocp_regs	User space	k	hakios.exynos_cpufreq.c	
 CPULOAD	arg	cpuload	CPU, memory and boot	k	hakios.cpufreq.c	every MS milliseconds, how busy each of our cores was meanwhile, in percent, to the loader's log (tools/frames.py shows it per gesture)
 CPUMASK	arg	cpumask	Loader	l	loader.c	
 CS47L93	arg	cs47l93	Audio and battery	k	hakios.cs47l93.c	the first N steps (1 looks, 2 powers the codec and reads its ID, 6 makes the microphone ready)

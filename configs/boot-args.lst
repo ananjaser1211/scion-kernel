@@ -101,6 +101,7 @@ bt_vendor_part	k
 bus_log	k
 bus_mask	k
 bus_max	k
+bus_mif_delay	k
 buttons	k
 buttons_steps	k
 ca_metallib	u
@@ -170,6 +171,7 @@ cpufreq_gov_lit_min	k
 cpufreq_gov_log	k
 cpufreq_gov_ms	k
 cpufreq_ocp	k
+cpufreq_ocp_regs	k
 cpuload	k
 cpumask	l
 cpus	l
