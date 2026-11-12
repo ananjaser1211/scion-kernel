@@ -12,7 +12,8 @@ Not part of this and never will be: FairPlay decryption, decrypted-IPA stores, c
 borrowed, Widevine or attestation spoofing.
 
 What is verified in this page and what is not: a line with a commit or a command was read or run on 7 November 2026; "(guess)" is
-what I expect and have not seen. Nothing on this page has run on a phone.
+what I expect and have not seen. Nothing on this page had run on a phone until the [Linux pilot](#the-linux-pilot-into-the-sileo-repository)
+of 12 November, which did.
 
 ## 1. Web apps (web clips)
 
@@ -57,7 +58,7 @@ and hoping the code does not call newer APIs (that is what the pilot below tries
 
 | App | Licence | Min iOS | Build | Signing on Scion | The service's terms for a third-party client | Push | Verdict for the S9 (16.5) |
 |---|---|---|---|---|---|---|---|
-| **Organic Maps** | Apache-2.0 for the code; map data under a separate licence (`DATA_LICENSE.txt`); the About screen must carry the notice | 16.2 | Xcode project + CMake and git submodules (`configure.sh`) | none to start | no account; maps are downloaded from the project's servers: read their terms before a fork uses them (not read) | no | **First native candidate**: runs on 16.5, works offline (the phone has no cellular), no account. Location needs a GPS the port does not list (guess: browsing only) |
+| **Organic Maps** | Apache-2.0 for the code; map data under a separate licence (`DATA_LICENSE.txt`); the About screen must carry the notice | 16.2 | Xcode project + CMake and git submodules (`configure.sh`) | none to start | no account; maps are downloaded from the project's servers: read their terms before a fork uses them (not read) | no | **First native candidate, on a Mac** (Swift and XIBs: not a Linux build, see [the Linux pilot](#the-linux-pilot-into-the-sileo-repository)): runs on 16.5, works offline (the phone has no cellular), no account. Location needs a GPS the port does not list (guess: browsing only) |
 | **VLC for iOS** | GPL-2.0-or-later and MPL-2.0 (bi-licensed, `COPYING`) | 15.0 (some targets 17.0) | CocoaPods + VLCKit, which compiles libvlc from source (hours) or takes a binary pod | none to start | none; the name VLC and the cone are VideoLAN's: a modified build is renamed (not read) | no | Feasible, size M. Interesting for the hardware decoder work (the MFC driver in `drivers/media/mfc`) |
 | **Telegram-iOS** | GPL (v2 or later, per telegram.org/apps; the repository has no LICENSE file at its top, which is worth fixing upstream) | 15.0 | Bazel (`build-system/Make/Make.py`), pins an Xcode version (`--overrideXcodeVersion`), `--disableProvisioningProfiles` exists | none to start | **Allowed and asked for**: your own `api_id`, do not use the name Telegram or the paper-plane logo, publish your source. A marked unofficial client is the stated route | APNs only (see step 3); without it, messages arrive when the app is open | Feasible, size M to L: Bazel's cache is tens of GB, a first build hours; not tried, Xcode 27.2 against a pinned Xcode is the first risk |
 | **Signal-iOS** | AGPL-3.0 | 15.0 | Xcode + CocoaPods + SwiftPM, `make dependencies` | entitlements: keychain, app groups | **Unclear, and the owner of the account is the one who can say**: the terms bar using the service "in unauthorized manners"; the project has a history of asking that unofficial builds not use its servers (2016). Nothing on its site invites a third-party build | APNs only | **Do not ship until Signal agrees in writing.** Buildable for oneself |
@@ -100,6 +101,32 @@ run. A lower deployment target is not a switch you can flip; this is the same fo
 
 The second build is the same command with the project's own deployment target (17.6), to find out whether the unsigned build path works at all, which is what
 the phones with iOS 26 need. Its result is in the report that came with this change; a build that finishes is not an app that runs, and none of it has been on a phone.
+
+### The Linux pilot, into the Sileo repository
+
+12 November 2026, on the S9+ (star2lte, 16.5). The question: can an app go from its source to a Sileo install with no Mac at all.
+
+- **Organic Maps is not a Linux build.** Read at `79674626` (blobless clone): the deployment target is 16.2, which fits, but `iphone/`
+  is 410 Swift files, 68 XIBs plus storyboards and asset catalogs. Theos's Linux toolchain (clang 11, cctools, `ldid`) has no
+  `swiftc`, `ibtool` or `actool`, and the build host has no macOS reachable (the Mac mini of the pilot above is not reachable from
+  the WSL host). It stays the first candidate for a Mac build; `"host": "macos"` in a recipe is how it would go in (build there,
+  package with `mkapps.py --no-build`).
+- **What was built instead: Simon Tatham's Portable Puzzle Collection**, Greg Hewgill's iOS port
+  ([ghewgill/puzzles](https://github.com/ghewgill/puzzles) at `01c3e382`, MIT): Objective-C and C with its UI in code, deployment target 9.0,
+  so the only Xcode-only parts are the launch screen storyboard and the icon catalog, both replaced in Info.plist
+  (`UILaunchScreen`, loose `AppIcon60x60` files). No source file changed. Theos clang with the iPhoneOS 16.5 SDK compiles the
+  67 files of the project's Sources phase in about 7 s; `ldid -S` for an ad-hoc signature (no entitlements).
+- **On the phone**: scion-installer's repository (`repo/build.sh` with `APPS_WORK`, `repo/mkapps.py`, recipe `repo/apps/puzzles`)
+  served from WSL, added as an apt source; `apt-get install com.scion.app.puzzles` unpacked it into `/var/jb/Applications`, the postinst's
+  `uicache -p` registered it, the icon is on the home screen, and `uiopen --bundleid com.scion.oss.puzzles` opens it to its list of
+  39 games, full screen. Sileo lists it under the repository's name with its description. Removal (`prerm`: `uicache -u`) takes the
+  icon away. **So: no signature, no entitlements and no Apple account were needed for a UIKit app.** Not tried: opening a game (there
+  is no touch injection in the tools); an app that needs the keychain or app groups.
+- **Serving it on the LAN**: WSL2 with mirrored networking does not take inbound connections from the LAN by default (Hyper-V
+  firewall); the test used a reverse tunnel over the phone's SSH. Publishing is the owner's decision; nothing is hosted.
+
+The next ones that fit 16.5 and Linux are the same shape (Objective-C or C, UI in code). Swift apps (most of the table above) need
+the Mac, or a Swift toolchain for Theos on Linux plus no XIBs, which none of the table's apps is.
 
 ## 3. Push without Apple's push service
 
