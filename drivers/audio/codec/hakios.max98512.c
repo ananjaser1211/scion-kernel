@@ -165,6 +165,7 @@
 #define BOOST_BYPASS_2          0x87
 #define BOOST_BYPASS_3          0x88
 #define GLOBAL_SHDN             0x400
+#define GLOBAL_EN_US            50000   /* how long GLOBAL_SHDN [0] may take to read 1 after it is written */
 #define SOFT_RESET              0x401
 #define REV_ID                  0x402
 #define REV_ID_B                0x600   /* a B's REV_ID, where it is in the chip */
@@ -381,6 +382,31 @@ write_checked(const struct amp *a, uint16_t reg, uint8_t value, uint8_t check, b
 	}
 	if (error == 0) {
 		error = raw_read(a, at, &back);
+	}
+	/*
+	 * GLOBAL_SHDN [0] reads 1 only once the amplifier is on, which it is when its clock monitor has taken BCLK and LRCLK
+	 * (just started by ABOX): a moment after the write, not at once. Android never reads it back. Builds 21-22 read 0
+	 * straight after it and ended the speaker for the run (Safari's videos, ringtones: silence). So it is read again for
+	 * up to GLOBAL_EN_US; still off is no fault of the bus: start() fails, and the next start() tries again.
+	 */
+	/* (and the read itself may fail while it powers up: build 23, bus error 0x400 right after the write) */
+	if (reg == GLOBAL_SHDN && (value & 0x01) != 0 && (error != 0 || (back & 0x01) == 0)) {
+		uint32_t first = error;
+
+		for (uint64_t deadline = deadline_us(GLOBAL_EN_US); (error != 0 || (back & 0x01) == 0) &&
+		    mach_absolute_time() < deadline;) {
+			hakios_hsi2c_reset(&bus);
+			error = raw_read(a, at, &back);
+		}
+		if (first != 0) {
+			say("max98512: %s (%#x): the global enable's read failed at first (bus %#x), then %s\n", a->name,
+			    a->addr, first, error == 0 ? "read" : "failed for the whole wait");
+		}
+		if (error == 0 && (back & 0x01) == 0) {
+			say("max98512: %s (%#x): the global enable still reads 0 %u ms after it was written (the clocks not taken?): "
+			    "this start fails, the next one tries again\n", a->name, a->addr, GLOBAL_EN_US / 1000);
+			return false;
+		}
 	}
 	if (error != 0 || ((back ^ value) & check & r->check) != 0) {
 		say("max98512: %s (%#x): register %#x (%#x in the chip): wrote %#x, read back %#x (bus %#x): no more writing "

@@ -357,6 +357,7 @@ static bool area_kept;                  /* RDMA0 did not say it stopped: the mem
 
 static const struct hakios_abox_amp *volatile amp_hook;
 static const struct hakios_abox_amp *amp_running;      /* the one started, which is the one stopped */
+static unsigned amp_failures;           /* starts that failed this run (amps_start) */
 static bool amp_given_up, amp_none_said;
 
 void
@@ -387,8 +388,11 @@ amps_start(void)
 	    HAKIOS_ABOX_SLOT_BITS, HAKIOS_ABOX_CHANNELS);
 	error = amp->start(HAKIOS_ABOX_RATE, HAKIOS_ABOX_SLOT_BITS, HAKIOS_ABOX_CHANNELS);
 	if (error != 0) {
-		say("abox: %u: %s did not start (%d): not asked again in this run\n", step, amp->name, error);
-		amp_given_up = true;
+		/* (an amplifier that did not come on may the next time: three tries in a run, then no more) */
+		amp_failures++;
+		amp_given_up = amp_failures >= 3;
+		say("abox: %u: %s did not start (%d): %s\n", step, amp->name, error,
+		    amp_given_up ? "the third time: not asked again in this run" : "asked again at the next sound");
 		return;
 	}
 	amp_running = amp;
