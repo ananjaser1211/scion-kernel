@@ -127,6 +127,19 @@ KEEP_MODELS = tuple(f'System/Library/PrivateFrameworks/SpotlightServices.framewo
 # userland/mkjobs.py runs them on demand like the rest (their jobs carry no DENY word).
 KEEP_DAEMONS = ('System/Library/PrivateFrameworks/PassKitCore.framework/passd',
                 'System/Library/PrivateFrameworks/IDS.framework/identityservicesd.app/identityservicesd')
+# ... and the executables of the app extensions that frameworks carry in their PlugIns, whatever their size: an
+# extension is a program of its own (its code is not in the dyld shared cache), and one whose bundle is in the image
+# without its executable is registered with LaunchServices and found by PlugInKit, then cannot be started. Five were
+# over SMALL and missing, and with them the Files app and the document picker:
+#   FileProvider's LocalStorageFileProvider (9.0 MB), the "On My iPhone" provider: fileproviderd had no domain, Files
+#     showed only Recently Deleted, and Safari's download service died on "domain identifier must not be nil";
+#   DocumentManagerUICore's SaveToFiles (5.6 MB), the share sheet's "Save to Files" ("Internal error: the requested
+#     app extension could not be found"), com.apple.DocumentManager.Service (5.6 MB), the out-of-process document
+#     picker of UIDocumentPickerViewController, and RecentsAvocado / RecentsAppPopover (5.6 and 5.5 MB), Files'
+#     widget and its popover.
+# 31 MB together; the 32 MB bound is the one the XPC services have.
+MAX_PLUGIN = 32 << 20
+PLUGIN_EXECUTABLE = re.compile(r'/PlugIns/([^/]+)\.appex/\1$')
 # ... and '.dat' and '.bin' are also what these keep the tables in that the user interface is made with:
 # the layouts of the on-screen keyboard, the emoji, the list of public domain suffixes
 DATA_FRAMEWORKS = tuple(f'System/Library/{name}.framework/' for name in (
@@ -230,6 +243,8 @@ def wanted_file(path, size):
             return True
         if path.startswith(KEEP_MODELS) or path in KEEP_DAEMONS:
             return True
+        if PLUGIN_EXECUTABLE.search(path):
+            return size <= MAX_PLUGIN
         if re.search(r'/(XPCServices|Support|Helpers)/', path):
             return size <= 32 << 20 and not path.lower().endswith(('.png', '.car', '.loctable', '.caml'))
         if path.endswith('.car'):
