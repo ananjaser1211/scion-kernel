@@ -435,6 +435,33 @@ So a fix has two possible routes:
 Route (1) needs the bri message formats. The ROM implements the same `GlMeSrdAsicinit` (0x000b3670 onwards), so they
 can be read from either side.
 
+**The bri (boot ROM interface) messages, first pass** (gpsd `GlMeSrdAsicinit::Bri_*`; `[obj+152]->[8]` is the ASIC
+mode, with 2-3 for one layout and 1 for the other). A message is a short byte string sent with `Bri_SendAsicData`. It
+starts `ff`/`fe` `00` `fd` `<cmd>`, carries its arguments, and ends in `fc`:
+- GetOutOfLegacy: `ff 00 fd 05 55 aa 00 ff fc` (mode 2-3), or `fe 00 fd 00 00 55 aa 00 ff fc` (mode 1).
+- RequestHwVersion: `ff 00 fd 09 00 00 00 c0 fc` (mode 2-3), or `ff 00 fd 00 00 fc fd 00` (mode 1, as stored).
+- In gpsd's rodata next to them: `fe 01 fd 43 30 01 00 c0 01 00 80 80 ... fc`, `fe 00 fd 43 6c 00 00 c0 07 00 00 00 fc`,
+  `ff 00 fd 09 6c 00 00 c0 fc`, `ff 00 fd 09 68 00 00 c0 fc`. These read like register writes (`fd 43 <addr LE>
+  <data>`) and reads (`fd 09 <addr LE>`) at 0xc000xxxx.
+- ESW block load (`Bri_EswLoadBlockAndRequestCrc`, at most 1020 bytes per block, data in chunks of up to 2048): a header
+  `fe <n> fd 4c <addr bytes>` (mode 2-3; `fd 62 ... c0` in mode 1), the data, `fc`, then a CRC request. The CRC
+  answer is checked in `bri_wait4patchblockload`.
+
+Still to read before a phone test: the exact header byte order, the CRC algorithm and its request/answer, the replies
+`bri_wait4*` expect (in `Bri_CheckForReceivedPacket_*`), the ASIC mode the 4775 uses, and how the bytes travel inside
+PASS_THRU (raw, or framed by `GlMeSrdPacketManager`).
+
+**Integration, when it works.**
+- **Firmware**: `devices/star2lte/firmware/gnss/` holds a README and SHA256SUMS only. `tools/fetch-firmware.sh`
+  extracts the three 4775_B0 segments from the user's own gpsd: `--from DIR`, or the pinned vendor tree if it has
+  gpsd. It takes them by the `a4775_B0_ImageSegments` table (MiniDebugInfo symbols), or by hash-checked offsets.
+  build.sh installs them in root/fw.
+- **Loader and engine**: a **userland daemon** (a minimal lhd). It loads the ESW through PASSTHROUGH at start, switches
+  to the on-chip ME with retain on, runs RESET/CONFIG/IDLE/ON, and feeds locationd. It talks to `/dev/hakios-gnss`
+  only. Reasons not to put this in the kernel: the bri state machine and the ESW image are large and need retries and
+  timers; the ESW file belongs in the userland firmware path; and a daemon can be restarted without a reboot. The
+  kernel keeps the transport, the 0x1E/0x1F records and the 0x19 log routing, as now.
+
 ## The tools (kernel and userland)
 
 - `/dev/hakios-gnss` (made at `shub=6`, root only; `drivers/input/ssp/hakios.ssp.c`): every RPC from the hub that is
