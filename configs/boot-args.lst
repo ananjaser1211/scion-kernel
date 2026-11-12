@@ -469,6 +469,7 @@ shub_hello	k
 shub_keep	k
 shub_log	k
 shub_ms	k
+shub_peek	k
 shub_req_len	k
 shub_req_rpc	k
 shub_sensors	k
@@ -633,6 +634,7 @@ wifi_quiet	k
 wifi_radio_read	k
 wifi_ready	k
 wifi_return	k
+wifi_rssi_probe	k
 wifi_scan	k
 wifi_smmu	k
 wifi_ssid	k

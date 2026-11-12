@@ -443,6 +443,7 @@ SHUB_HELLO	arg	shub_hello	Sensors	k	hakios.ssp.c	wait for MCU_RESP before every 
 SHUB_KEEP	arg	shub_keep	Sensors	k	hakios.ssp.c	power the hub off again (NSTDBY low) when the steps end or one fails
 SHUB_LOG	arg	shub_log	Sensors	k	hakios.ssp.c	log the first bytes of every SPI frame (very loud)
 SHUB_MS	arg	shub_ms	Sensors	k	hakios.ssp.c	sample period in ms (default 20; light, proximity and pressure use 200)
+SHUB_PEEK	arg	shub_peek	Sensors	k	hakios.ssp.c	a memory reader added to the hub's firmware as it is sent, for the GNSS bring-up (docs/gnss.md), which
 SHUB_REQ_LEN	arg	shub_req_len	Sensors	k	hakios.ssp.c	
 SHUB_REQ_RPC	arg	shub_req_rpc	Sensors	k	hakios.ssp.c	RPC that carries SSP to the hub
 SHUB_SENSORS	arg	shub_sensors	Sensors	k	hakios.ssp.c	
@@ -594,6 +595,7 @@ WIFI_QUIET	arg	wifi_quiet	Wi-Fi	k	lx_bus.c
 WIFI_RADIO_READ	arg	wifi_radio_read	Wi-Fi	k	hakios.wifi.c	step 16 does read (2: whatever mode the firmware is in)
 WIFI_READY	arg	wifi_ready	Wi-Fi	k	hakios.wlfw.c	
 WIFI_RETURN	arg	wifi_return	Wi-Fi	k	hakios.wifi.c	when all is over, go back to the loader instead of starting the system
+WIFI_RSSI_PROBE	arg	wifi_rssi_probe	Wi-Fi	k	hakios.apple80211.c	
 WIFI_SCAN	arg	wifi_scan	Wi-Fi	k	lx_bus.c	
 WIFI_SMMU	arg	wifi_smmu	Wi-Fi	k	hakios.wifi.c	before any step: read what the boot chain has set up in the SMMU for the radio's stream (smmu_look() below; nothing is written)
 WIFI_SSID	arg	wifi_ssid	Wi-Fi	k	hakios.brcmfmac.c	brcmfmac=8 without fw/network: the network's name, a byte as %XX (a space is %20)
