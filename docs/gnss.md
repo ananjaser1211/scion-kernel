@@ -266,6 +266,32 @@ did not come out by any route: not as MEIF DEBUG/LOGGING, not in the hub's log R
 0x00900000-0x0091fd00, which was dumped with peek. CORE_ON in Samsung's `ssp_bbd.c` only sets `IsGpsWorking`. The only
 supply Samsung's kernel switches is vdd_mcu_1p8 (LDO37); the baseband's power is the chip's own business.
 
+Correction and further reading (restart at 21:05, build 32). The sequence was pin mux, `1c 01`, logging CONFIG_SET
+(ACK), then RESET (ACK, RESET -> SETUP), then IDLE straight away **with no REQ_CURRENT: NACK all the same.** CONFIG_GET
+is NACKed after RESET too, although it worked before RESET. So the REQ_CURRENT theory above is wrong. What the code says:
+- gpsd sends REQ_CURRENT itself after a RESET -> SETUP report (its state-report jump table, 0x00154cb6: SETUP from
+  RESET goes to `control(11)`). It sends CONFIG_GET / CONFIG_SET / the strings / IDLE only after the SETUP -> SETUP
+  answer.
+- The hub's packet gate (0x0081147e-0x008115d8) does four things:
+  - It checks the MEIF serials: each one must be the last plus 1. The first message after a reset sets the start.
+  - It lets RESET and REQ_CURRENT through at any time.
+  - It treats a repeated serial as a retransmission.
+  - While `[ME+8]` is non-zero, it refuses everything else ("SetPe2MeData IGNORED as ME is reseting").
+- So after RESET the ME stays "resetting". It accepts only RESET and REQ_CURRENT. Most likely it is waiting for the
+  baseband, as the pre-RESET IDLE reported in so many words ("GPS BB not responding").
+- The GNSS core is opened by `AcquireGnssCore` (0x00809754: create MicroNav, `GnssCoreHal::Open`, register the
+  core's data). Its caller is `PvtEngineCb::OnResource` (0x0080f384, resources 8 and 16), i.e. the on-chip PVT engine
+  claims the core. `gnss_start` (RPC 0x401) before RESET, which got the usual `$pglirm` answer, did not change the
+  NACK. `gnss_stop` was sent afterwards.
+- No log from the chip by any route. RPC 0x2B `SetLoggingConfig([u8 on][u8 level][u32 facilities])`, which lhd sends
+  after the transport syncs (facilities 0xffffdfff by default), was sent as `01 07 ffdfffff`. It was acknowledged, but
+  nothing new came.
+
+Where this leaves route (a): the ME and its MEIF are answered and understood, but the ME never gets its baseband. What
+Android does that we do not is not known yet. The likeliest candidates are something in lhd's start that is not an RPC
+we have seen, and the order of `gnss_start` / the 0x38 `$pglirm` handshake (lhd forwards `$pglirm` to gpsd and repeats
+it until gpsd acks).
+
 ## The tools (kernel and userland)
 
 - `/dev/hakios-gnss` (made at `shub=6`, root only; `drivers/input/ssp/hakios.ssp.c`): every RPC from the hub that is
