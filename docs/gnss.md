@@ -839,6 +839,29 @@ the hub log that INIT_STAGE B is ACKed and that the decoded `hs Q` message has n
 indoors, and the detections outdoors. Record `MEIF:OSC GetOscOffset` / `SetCntinMeas` at the first IDLE -> ON (now
 unmasked).
 
+**Indoor run of that test** (build 36, cold boot at 01:05 by the TWRP path, gnssd booted out, started at 4 min uptime).
+- **RPC 0x05 works at run time.** `rpc 05 b00083000200ffff` was acknowledged. `peek 8300b0` read `04 00 ... 2a` before
+  and `ff ff ... 2a` after. So the hub patch's RAM can be changed from user space without a kernel change. The change
+  lasts until the hub is restarted.
+- The sequence ran as before. The CONFIG_SET had no EXT_OSC (6 items, item 5's byte back to 6) and was ACKed, then
+  SETUP -> IDLE and IDLE -> ON.
+- **INIT_STAGE B now matches gpsd's for the analog part.** The message is 102 bytes instead of 1045: the RF init block
+  and **no AR writes at all** (not even 0xEF). INIT_STAGE B was ACKed and INIT_STAGE C completed. The DR message from
+  `patch_ProgramDrRegs` is unchanged. Word 7 is still the ROM's 0x15dcbf8a.
+- The receiver ran for about 2 min indoors, with indoor detection off:
+  - GPS 0 detections in 64 attempts, GLONASS 0 attempts, Sats(0) throughout.
+  - Measured noise GPS_GAL u 3.776 / 3.621 (table 3.825), GLNS 3.589 (3.581).
+  - AGC: GPS_GAL AAGC 20.04 dB (17.54 at first), GLO 21.98 / 18.46, BDS 32.08-34.58. These are the same as with the
+    104-register table (the earlier open-sky runs gave 17.54-21.62 dB), so the table does not change the analog gain.
+- **Oscillator:** `MEIF:OSC GetOscOffset(0.000000e+000, 3.000000e-005)` at the first IDLE -> ON. That is no stored
+  offset and a 30 ppm uncertainty, because the chip's NV is blank on a cold start. With no external oscillator
+  configured, no CNTIN measurement was made (`IsExtOscAvailable` and nothing after it), as expected. `RfLoss` is now 0
+  (item 7 of the CONFIG_SET, as gpsd sends it).
+- Indoors, zero detections is not conclusive: every indoor run so far found nothing. The test only shows that the
+  radio still comes up without the MiniMe's AR table. Whether it changes anything needs open sky.
+- Next: the same at open sky (about 2 minutes). If there are still no satellites, word 7 of the RF init block is the
+  remaining difference from gpsd.
+
 ## The tools (kernel and userland)
 
 - `/dev/hakios-gnss` (made at `shub=6`, root only; `drivers/input/ssp/hakios.ssp.c`): every RPC from the hub that is
