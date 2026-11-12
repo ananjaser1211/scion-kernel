@@ -356,6 +356,8 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 		$DYN -o obj/cputop src/cputop.c
 		# the kept data volume to the flash every few seconds: the phone is reset, never shut down (src/var_sync.c)
 		$DYN -o obj/var_sync src/var_sync.c
+		# the device's name as the computer name, which lockdownd would write: bluetoothd's name, Bonjour's (src/devname.c)
+		$DYN -framework CoreFoundation -framework SystemConfiguration -lMobileGestalt -o obj/devname src/devname.c
 		# the wallpaper's second chance on a phone too slow for launchd's 5 s check-in (src/poster_retry.c; rc.jobs)
 		$DYN -o obj/poster_retry src/poster_retry.c
 		$DYN -framework CoreFoundation -framework IOSurface -o obj/cow_test src/cow_test.c
@@ -614,6 +616,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	[ -f obj/passcoded ] && cp obj/passcoded root/bin/
 	[ -f obj/cputop ] && cp obj/cputop root/bin/
 	[ -f obj/var_sync ] && cp obj/var_sync root/bin/
+	[ -f obj/devname ] && cp obj/devname root/bin/
 	[ -f obj/poster_retry ] && cp obj/poster_retry root/bin/
 	[ -f obj/cow_test ] && cp obj/cow_test root/bin/
 	[ -f obj/cg_test ] && cp obj/cg_test root/bin/
