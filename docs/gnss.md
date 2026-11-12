@@ -233,6 +233,24 @@ Which of them mattered is not known. After that:
   `[u16 n][string][zero pad to 4]`), and SW_UPLOAD (0x10) is `[u16 type][u32 arg][data][1-4 zero bytes]`, type 0x8000
   for `lte_band_13:%d;%s`.
 
+Offline, before the next try:
+- **The ME's log** is a CONFIG_SET sub-block, 0x8001 (`MEIF_LOGGINGS_CONFIG_SB`). gpsd's `ConfigureMeLogging` sends
+  exactly `[6][len 24][serial][count 1][01 80 10 00][u16 priority][0000][u32 facility mask][00000000]`; the chip logs it
+  as "MEIF:Logging(%x, %lx)". The text then comes back as MEIF DEBUG (0xD) or LOGGING (0x8000), which gnsstool now prints
+  with numbers of four or more decimals masked. The CONFIG_SET sent earlier carried 0x8001 with zeros, i.e. logging off.
+- **The CONFIG_SET handler** (around 0x0081cbc0-0x0081d5xx) walks the sub-blocks, checks each length ("has wrong
+  length"), and NACKs a bad one. The chip's sub-block names: CHANNEL, DATA, EXT_LNA, EXT_OSC, EXT_OSC_REQ, FAR_START,
+  HOST_REQ, IO_PIN, LOGGINGS, LOW_SIG_MODE, MEASUREMENT, ME_OSC_MODEL, ME_OSC_PARAMS, MISC, ONE_PPS,
+  PLATFORM_SPECIFIC, POWER_SAVE(_INTEGRATION_TIME), RF_PARAMS, RTC_OSC_PARAMS, SENSOR_MEASUREMENT, SIM_MODE,
+  TIME_STAMP(_OSC_CAL), TX_BLANK, USER_DYNAMICS, BLANKING_MISC, COUNT_IN_OFFSET. Their numbers are not mapped yet.
+- **`esw_ctrl:R,L,D;`** (0x008592ec): three flags, Retain ESW, Load ESW, ESW dynamic power control, separated by `,` and
+  ended by `;`. The chip also knows `dc_ctrl:`, `dbg_ctrl:`, `lte_band_13:`, `forced_dc:`, `sniff_ctrl:`, `mi_ctrl:`,
+  `asic_version_ctrl:`. gpsd parses the same keys for its host-ME mode, but its strings do not set `esw_ctrl` here, so on
+  Android the chip's defaults apply.
+- **Next sequence** (cold-started chip): `rpc 34 1101`; `rpc 1c 01`; logging on
+  (`meif 6 0100 01801000 ff000000 ffffffff 00000000`); REQ_CURRENT; RESET; read the log and the state; then IDLE. If the log
+  shows the ESW not loading, add `esw_ctrl:` by SW_UPLOAD 0x8000.
+
 ## The tools (kernel and userland)
 
 - `/dev/hakios-gnss` (made at `shub=6`, root only; `drivers/input/ssp/hakios.ssp.c`): every RPC from the hub that is
