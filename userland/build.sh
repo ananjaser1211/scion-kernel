@@ -810,6 +810,8 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	# fairplayd among them).
 	cp com.hakios.demo.plist com.hakios.wifi.plist com.hakios.thermald.plist com.hakios.passcoded.plist root/LaunchDaemons/
 	[ ! -f root/bin/jb_seed ] || cp com.hakios.jbseed.plist root/LaunchDaemons/
+	# sshd from the prefix, when there is a key of ours to let in (com.hakios.sshd.plist; SHARE=1: never)
+	if [ -z "$SHARE" ] && [ -f ../ssh/authorized_keys ]; then cp com.hakios.sshd.plist root/LaunchDaemons/; else rm -f root/LaunchDaemons/com.hakios.sshd.plist; fi
 	[ ! -f root/bin/selftest ] || cp com.hakios.selftest.plist root/LaunchDaemons/
 	[ -z "$JB_KEPT_ONLY" ] || : > root/etc/jb.kept-only     # init: no graft on a memory filesystem (src/init.c)
 	VOLUME=""
@@ -1111,6 +1113,8 @@ if [ -f $DARWIN/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	if [ -d ../jb/root/var/jb ]; then
 		rm -rf sysroot/jb
 		cp -a ../jb/root/var/jb sysroot/jb
+		# which bootstrap this is: jb_seed seeds a kept /private/var again when the copy's stamp differs
+		[ -f ../jb/.stamp ] && cp ../jb/.stamp sysroot/jb/.scion-stamp
 		# the applications of the prefix are system applications here: LaunchServices builds its
 		# database afresh at every boot by walking /Applications, which is how their icons appear
 		# (JB_KEPT_ONLY=1, the installer's: not those. The image is shared by phones that may have no kept

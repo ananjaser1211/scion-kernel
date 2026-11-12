@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.hakios.sshd</string>
+	<!-- OpenSSH from the package manager's prefix (tools/mk-jb.sh), root by key only: ../ssh/authorized_keys and the
+	     host key, which build.sh puts on the data volume (never in the repository; SHARE=1 leaves them out). The
+	     prefix is there only once jb_seed has copied it: until then sshd cannot start, and launchd tries again
+	     every 30 s (KeepAlive, ThrottleInterval). PAM off: the prefix has no pam.d for sshd. -->
+	<key>ProgramArguments</key>
+	<array>
+		<string>/var/jb/usr/sbin/sshd</string>
+		<string>-D</string>
+		<string>-e</string>
+		<string>-h</string>
+		<string>/var/root/.ssh/ssh_host_ed25519_key</string>
+		<string>-o</string>
+		<string>UsePAM=no</string>
+		<string>-o</string>
+		<string>PasswordAuthentication=no</string>
+		<string>-o</string>
+		<string>PermitRootLogin=prohibit-password</string>
+		<string>-o</string>
+		<string>AuthorizedKeysFile=/var/root/.ssh/authorized_keys</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<key>StandardOutPath</key>
+	<string>/dev/console</string>
+	<key>StandardErrorPath</key>
+	<string>/dev/console</string>
+</dict>
+</plist>
