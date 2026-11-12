@@ -441,6 +441,13 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 		$DYN -framework CoreFoundation -framework Security -o obj/wifipw_test src/wifipw_test.c &&
 			{ ${LDID:-ldid} -Ssrc/wifipw_test.entitlements obj/wifipw_test 2>/dev/null ||
 			  echo "build.sh: no ldid: wifipw_test is unsigned, and the keychain will refuse it (-34018)"; }
+		# Location Services from the command line: the switch, an application's authorization, a fix (its accuracy,
+		# never where), a simulated position (src/loctool.m). locationd answers it only for its entitlements: by
+		# ldid, or by ../tools/machosign.py where there is no ldid
+		$DYN -fobjc-arc -framework Foundation -framework CoreLocation -o obj/loctool src/loctool.m &&
+			{ ${LDID:-ldid} -Ssrc/loctool.entitlements obj/loctool 2>/dev/null ||
+			  python3 ../tools/machosign.py obj/loctool src/loctool.entitlements com.hakios.loctool ||
+			  echo "build.sh: no ldid: loctool is unsigned, and locationd will refuse it"; }
 		# our library for inside stock Darwin programs (the jobs in INJECT are started with it)
 		$DYN -dynamiclib -install_name /redwood/lib/libhakios.dylib -framework CoreFoundation -framework IOKit -lobjc \
 			-o obj/libhakios.dylib src/inject.c
@@ -626,6 +633,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	[ -f obj/battery_test ] && cp obj/battery_test root/bin/
 	[ -f obj/keychain_test ] && cp obj/keychain_test root/bin/
 	[ -f obj/wifipw_test ] && cp obj/wifipw_test root/bin/
+	[ -f obj/loctool ] && cp obj/loctool root/bin/
 	[ -f obj/aes_test ] && cp obj/aes_test root/bin/
 	[ -f obj/sound_test ] && cp obj/sound_test root/bin/
 	[ -f obj/torch_test ] && cp obj/torch_test root/bin/
