@@ -450,6 +450,9 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 			{ ${LDID:-ldid} -Ssrc/loctool.entitlements obj/loctool 2>/dev/null ||
 			  python3 ../tools/machosign.py obj/loctool src/loctool.entitlements com.hakios.loctool ||
 			  echo "build.sh: no ldid: loctool is unsigned, and locationd will refuse it"; }
+		# the GNSS bring-up's raw RPCs, SSP transactions and hub memory reads through /dev/hakios-gnss
+		# (src/gnsstool.c, docs/gnss.md)
+		$DYN -o obj/gnsstool src/gnsstool.c
 		# our library for inside stock Darwin programs (the jobs in INJECT are started with it)
 		$DYN -dynamiclib -install_name /redwood/lib/libhakios.dylib -framework CoreFoundation -framework IOKit -lobjc \
 			-o obj/libhakios.dylib src/inject.c
@@ -637,6 +640,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	[ -f obj/keychain_test ] && cp obj/keychain_test root/bin/
 	[ -f obj/wifipw_test ] && cp obj/wifipw_test root/bin/
 	[ -f obj/loctool ] && cp obj/loctool root/bin/
+	[ -f obj/gnsstool ] && cp obj/gnsstool root/bin/
 	[ -f obj/aes_test ] && cp obj/aes_test root/bin/
 	[ -f obj/sound_test ] && cp obj/sound_test root/bin/
 	[ -f obj/torch_test ] && cp obj/torch_test root/bin/
