@@ -111,6 +111,7 @@ CAM_S9	arg	cam_s9	Cameras	k	hakios.exynos_camera.c,hakios.exynos_iris.c,hakios.s
 CAM_S9_ADDR	hex	cam_s9_addr	Cameras	k	hakios.exynos_camera.c	the sensor's 7-bit I2C address, if not 0x35 (the device tree's) and not found by the scan
 CAM_S9_AE	arg	cam_s9_ae	Cameras	k	hakios.exynos_camera.c	no auto-exposure: the frames as cam_s9_exp and cam_s9_gain have them (default 1: on)
 CAM_S9_AE_FRAMES	arg	cam_s9_ae_frames	Cameras	k	hakios.exynos_camera.c	
+CAM_S9_AF	arg	cam_s9_af	Cameras	k	hakios.exynos_camera.c	no focus (the lens left where its spring holds it)
 CAM_S9_ALWAYS	arg	cam_s9_always	Cameras	k	hakios.exynos_camera.c	with 7: the stream from the boot to the run's end, wanted or not (the old behaviour, for debugging)
 CAM_S9_BAYER	arg	cam_s9_bayer	Cameras	k	hakios.exynos_camera.c	camshot's Bayer order: 0 RGGB, 1 GRBG (the default, the sensor's), 2 GBRG, 3 BGGR
 CAM_S9_DGAIN	arg	cam_s9_dgain	Cameras	k	hakios.exynos_camera.c	the most digital gain the auto-exposure may use, 0x100 being 1x (default 0x400, at most 0x1000)
@@ -121,8 +122,17 @@ CAM_S9_ISPDIV	arg	cam_s9_ispdiv	Cameras	k	hakios.exynos_camera.c	CLKCMU_ISPPRE_B
 CAM_S9_MMU_PROBE	arg	cam_s9_mmu_probe	Cameras	k	hakios.exynos_camera.c	
 CAM_S9_PACK12	arg	cam_s9_pack12	Cameras	k	hakios.exynos_camera.c	the WDMA's PACK12 layout rather than RAW10 as it comes (the BSP sets PACK12 for its V4L2 SBGGR10 buffers)
 CAM_S9_PROBE	arg	cam_s9_probe	Cameras	k	hakios.exynos_camera.c	the risky reads too, for the log: CMU_ISPPRE's whole Q-channel sweep with each DBG_NFO (+0x4000)
+CAM_S9_REAR_BAYER	arg	cam_s9_rear_bayer	Cameras	k	hakios.exynos_camera.c	the rear frames' Bayer order (default 1, GRBG: fimc-is-cis-2l3.c's GR_BG with 0x0101 = 3)
+CAM_S9_REAR_EXP	arg	cam_s9_rear_exp	Cameras	k	hakios.exynos_camera.c	the rear stream's first exposure in lines of 815 ns (default 30000, about 24 ms; its gain starts at 4x)
+CAM_S9_REAR_ISPDIV	arg	cam_s9_rear_ispdiv	Cameras	k	hakios.exynos_camera.c	the ISPPRE bus clock for the rear stream, 466 MHz / (D + 1); default 0, Android's rate
+CAM_S9_REAR_TP	arg	cam_s9_rear_tp	Cameras	k	hakios.exynos_camera.c	the rear sensor's MIPI CCS test pattern (0x0600: 1 solid colour, 2 colour bars) for its picture
+CAM_S9_REAR_TURN	arg	cam_s9_rear_turn	Cameras	k	hakios.exynos_camera.c	the rear frames turned half round for user space (default 0: the sensor flips itself)
 CAM_S9_SAT	arg	cam_s9_sat	Cameras	k	hakios.exynos_camera.c	camshot's colour saturation in per cent (default 140; 100: none; at most 300)
 CAM_S9_STRIDE	arg	cam_s9_stride	Cameras	k	hakios.exynos_camera.c	camshot's bytes a line of the frame (default 3264: the WDMA's RAW10 is a pixel in 16 bits)
+CAM_S9_TELE_BAYER	arg	cam_s9_tele_bayer	Cameras	k	hakios.exynos_camera.c	the tele frames' Bayer order (default 1, GRBG: fimc-is-cis-3m3.c's GR_BG)
+CAM_S9_TELE_EXP	arg	cam_s9_tele_exp	Cameras	k	hakios.exynos_camera.c	the tele stream's first exposure in lines of 20.3 us (default 1000; its gain starts at 4x)
+CAM_S9_TELE_TP	arg	cam_s9_tele_tp	Cameras	k	hakios.exynos_camera.c	the tele sensor's MIPI CCS test pattern (0x0600: 1 solid colour, 2 colour bars) for its picture
+CAM_S9_TELE_TURN	arg	cam_s9_tele_turn	Cameras	k	hakios.exynos_camera.c	the tele frames turned half round for user space (default 0, as Apollo streams it: no flip)
 CAM_SENSOR	arg	cam_sensor	Cameras	k	hakios.camera.c	
 CAM_SETTLE	arg	cam_settle	Cameras	k	hakios.camera.c	
 CAM_SHUTTER	arg	cam_shutter	Cameras	k	hakios.camera.c	
@@ -137,10 +147,12 @@ CORE1	arg	core1	Loader	l	loader.c	core 1, which S-Boot uses for its own display 
 CPUFREQ_GOV	arg	cpufreq_gov	User space	k	hakios.exynos_cpufreq.c	run it (0, or none: the fixed rates of cpufreq_lit= and cpufreq_big=)
 CPUFREQ_GOV_BIG_MAX	arg	cpufreq_gov_big_max	User space	k	hakios.exynos_cpufreq.c	
 CPUFREQ_GOV_BIG_MIN	arg	cpufreq_gov_big_min	User space	k	hakios.exynos_cpufreq.c	
+CPUFREQ_GOV_BIG_OC	arg	cpufreq_gov_big_oc	User space	k	hakios.exynos_cpufreq.c	
 CPUFREQ_GOV_LIT_MAX	arg	cpufreq_gov_lit_max	User space	k	hakios.exynos_cpufreq.c	
 CPUFREQ_GOV_LIT_MIN	arg	cpufreq_gov_lit_min	User space	k	hakios.exynos_cpufreq.c	
 CPUFREQ_GOV_LOG	arg	cpufreq_gov_log	User space	k	hakios.exynos_cpufreq.c	a summary line this often (0: none; 1)
 CPUFREQ_GOV_MS	arg	cpufreq_gov_ms	User space	k	hakios.exynos_cpufreq.c	the load window (20 to 200; 40)
+CPUFREQ_OCP	arg	cpufreq_ocp	User space	k	hakios.exynos_cpufreq.c	the PMIC's CPU over-current warning on, and with it Samsung's star2lte limits for the M3s: 1924000 with three or four online, 2314000 with one or two
 CPULOAD	arg	cpuload	CPU, memory and boot	k	hakios.cpufreq.c	every MS milliseconds, how busy each of our cores was meanwhile, in percent, to the loader's log (tools/frames.py shows it per gesture)
 CPUMASK	arg	cpumask	Loader	l	loader.c	
 CS47L93	arg	cs47l93	Audio and battery	k	hakios.cs47l93.c	the first N steps (1 looks, 2 powers the codec and reads its ID, 6 makes the microphone ready)
@@ -362,6 +374,7 @@ PANEL_BRIGHTNESS	arg	panel_brightness	GPU and display	k	hakios.s6e3ha8.c	a brigh
 PANEL_GAMMA	arg	panel_gamma	GPU and display	k	hakios.s6e3ha8.c	gamma and AOR sent (the default)
 PANEL_GAMMA_LOG	arg	panel_gamma_log	GPU and display	k	hakios.s6e3ha8.c	all 74 rows in the log, as Android's kernel prints them at start ("gamma[nits] : ...") to set beside Android's log of the same phone
 PANEL_SLEEP	arg	panel_sleep	GPU and display	k	GenericARMPE.cpp,hakios.s6e3ha8.c	
+PANEL_WRITE	arg	panel_write	GPU and display	k	hakios.s6e3ha8.c	read and calculate, but send no brightness packets (diagnostic override; writes default on)
 PASSCODE_DEBUG	arg	passcode_debug	User space	u	passcoded.m	
 PASSCODE_RESET	arg	passcode_reset	User space	k	MiniAppleKeyStore.cpp	
 PASSCODE_SELFTEST	arg	passcode_selftest	User space	k	MiniAppleKeyStore.cpp	
@@ -409,8 +422,11 @@ SCSND_SIZE	arg	scsnd.size	User space	k	hakios.scsnd.c
 SECURITY	arg	security	Security stand-ins	k	kern_minimac.c	
 SERIAL	arg	serial	Loader	l	loader.c	
 SHUB	arg	shub	Sensors	k	hakios.ssp.c	
+SHUB_ACC_CAL	arg	shub_acc_cal	Sensors	k	hakios.ssp.c	the accelerometer's factory offsets, sent to the hub before the sensors go on, as Samsung does
+SHUB_ACC_POS	arg	shub_acc_pos	Sensors	k	hakios.ssp.c	the accelerometer's (and gyroscope's) position in the formation of step 5
 SHUB_CHUB_ON	arg	shub_chub_on	Sensors	k	hakios.ssp.c	at step 2, power the CHUB domain on if step 1 found it off, using the PMU's chub_on sequence
 SHUB_DIV	arg	shub_div	Sensors	k	hakios.ssp.c	
+SHUB_GYRO_CAL	arg	shub_gyro_cal	Sensors	k	hakios.ssp.c	the same for the gyroscope (gyro_lsm6dsl.c set_gyro_cal(): SSP 0xCD, s32 x, y, z), the three
 SHUB_HELLO	arg	shub_hello	Sensors	k	hakios.ssp.c	wait for MCU_RESP before every exchange, as Samsung's driver does
 SHUB_KEEP	arg	shub_keep	Sensors	k	hakios.ssp.c	power the hub off again (NSTDBY low) when the steps end or one fails
 SHUB_LOG	arg	shub_log	Sensors	k	hakios.ssp.c	log the first bytes of every SPI frame (very loud)
@@ -464,6 +480,7 @@ TMU_POLL	arg	tmu_poll	Chip, thermal and PMIC	k	hakios.exynos_tmu.c	how often to 
 TMU_STOP	arg	tmu_stop	Chip, thermal and PMIC	k	hakios.exynos_tmu.c	step 3's limit for the SoC's zones (40 to 115; 110)
 TMU_UNGATE	arg	tmu_ungate	Chip, thermal and PMIC	k	hakios.exynos_tmu.c	open the TMU's PCLK gate if the boot left it forced shut
 TORCH	arg	torch	Haptics and torch	kl	hakios.exynos_iris.c,hakios.s2mpb02_torch.c,hakios.sccam_torch.c,hakios.torch.c,loader.c	a look, reading only: the bus as found, the chip's ID, the flash block's registers, the two pins
+TORCH_CODE_MAX	arg	torch_code_max	Haptics and torch	k	hakios.s2mpb02_torch.c	the torch current code iOS's full level maps to (1-9, default 3: the S9's 60 mA)
 TORCH_MAX_S	arg	torch_max_s	Haptics and torch	k	hakios.s2mpb02_torch.c,hakios.torch.c	
 TORCH_SECS	arg	torch_secs	Haptics and torch	k	hakios.s2mpb02_torch.c,hakios.torch.c	
 TOUCH_COALESCE	arg	touch_coalesce	Touch and buttons	k	hakios.input.c	a reader that falls behind gets the newest pending MOVE of a finger, never a lost DOWN/UP. Off by default

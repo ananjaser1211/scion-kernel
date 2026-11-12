@@ -125,6 +125,9 @@
  *   gov_wake=1               a finger coming down asks for the GPU's frame floor at once, before the first frame needs it (off)
  *   gov_policy=<n>           1 the policy above; 3 the scion governor; 2 scion without parking; 4 that with frame pacing (1 for now)
  *   gov_stat=<n>             the line of numbers to compare by (1; 0: none)
+ *   cpufreq_ocp=1            the PMIC's CPU over-current warning on, and with it Samsung's star2lte limits for the M3s:
+ *                            1924000 with three or four online, 2314000 with one or two (see big_online_limit()'s OCP note)
+ *   cpufreq_gov_big_oc=<kHz> with cpufreq_ocp=1: the M3s' ceiling whatever the number online, past Samsung (at most 2704000)
  *
  * Sources (Samsung's kernel for the S9, Scion-Project/android_kernel_samsung_exynos9810, lineage-24.0 at e5906667068e,
  * and Silicium's Resources/DTBs/starlte.dts, the phone's own tree): arch/arm64/boot/dts/exynos/
@@ -429,6 +432,155 @@ big_online_limit(uint32_t online)
 	return online <= 2 ? 2314000 : 1794000;
 }
 
+/*
+ * OCP (cpufreq_ocp=1; off by default). Samsung's kernel lets the M3s past 1794000 only while its OCP driver runs
+ * (drivers/soc/samsung/exynos-ocp.c of Samsung's S9 kernel; read in the Apollo tree): the S2MPS18's over-current warning
+ * for the CPU rail enabled (drivers/regulator/s2mps18.c: OCP_WARN1, 0xD3, = en << 7 | reset << 6 | level, from the PMIC
+ * node's cpu_ocp_warn_en 1, cpu_ocp_warn_reset 0, cpu_ocp_warn_lv 0: 0x80), on which the M3s throttle themselves in
+ * hardware when the rail's current nears its limit; the OCP controller told the DVFS level before each change (OCPINTCTL,
+ * S3_0_C15_C12_5, [9:4] IRP = 2 x rate / min-freq - 2: exynos_ocp_irq_work()); and a throttle seen (OCPTHROTTCTL,
+ * S3_0_C15_C12_7, bit 27 OCPTHROTTERRA) taking a level off the M3s' ceiling (down-step 1) until it is released. Without it,
+ * control_ocp_operation(false) clips the M3s to max-freq-wo-ocp, 1794000 (exynos9810-star2lte_kor_26.dts, exynos-ocp node):
+ * the ceiling this file has always kept. With it, the star2lte's own limits from the same tree: hotplug_governor dual_freq
+ * 0x234f10 = 2314000 for one or two M3s, triple_freq and quad_freq 0x1d5ba0 = 1924000 for three or four; cpufreq domain@1
+ * max-freq and policy-max 0x1d5ba0 = 1924000 (the eur_open tree has the same).
+ * The flag is polled once a second, and the IRP written before a change of the M3s' rate that changes it, on an M3: the
+ * thread bound to one as measure_mhz() does, interrupts off. The registers are the M3's own (an A55 has none: an undefined
+ * instruction), so MIDR_EL1's implementer is checked first (0x53, Samsung). A throttle lowers the ceiling one level under
+ * the rate; it is released after a second without one (Samsung: release-duration 15 ms, once the cluster's load is under
+ * release-threshold 50%; polled here, so longer).
+ * cpufreq_gov_big_oc=<kHz> (only with the OCP warning on): past Samsung's limits -- that ceiling whatever the number of M3s
+ * online, at most 2704000 (the S9's advertised top: Samsung's for a single M3; 2704000/1156250 uV in the APM's table). The
+ * thermal ceilings, the 96 C cut and the OCP throttle still apply. The user's choice, not Samsung's.
+ */
+#define OCP_PMIC_WARN1  0xD3            /* S2MPS18_PMIC_REG_OCP_WARN1 (CPU) */
+#define OCP_PMIC_WARN2  0xD4            /* S2MPS18_PMIC_REG_OCP_WARN2 (GPU; read and logged only) */
+#define OCP_WARN_CPU    0x80            /* en 1 << 7, reset 0 << 6, level 0 (the star2lte's PMIC node) */
+#define OCP_WO_KHZ      1794000         /* max-freq-wo-ocp */
+#define OCP_DUAL_KHZ    2314000         /* hotplug_governor dual_freq */
+#define OCP_QUAD_KHZ    1924000         /* triple_freq, quad_freq, domain@1 max-freq/policy-max */
+#define OCP_OC_MOST     2704000
+#define OCP_MIN_KHZ     650000          /* domain@1 min-freq 0x9eb10: exynos_ocp_irq_work()'s min_freq */
+#define OCP_IRP_MASK    0x3full
+#define OCP_IRP_SHIFT   4
+#define OCP_ERRA_BIT    (1ull << 27)
+
+static bool ocp_on;                     /* the PMIC's CPU OCP warning on, as read back */
+static uint32_t big_oc;                 /* cpufreq_gov_big_oc= (kHz; 0: Samsung's limits) */
+static uint32_t ocp_clip;               /* kHz: the ceiling after a throttle (0: none) */
+static uint32_t ocp_hits, ocp_irp = ~0u;
+static bool ocp_regs_said;
+
+struct ocp_m3 {
+	uint64_t midr, thrott, gcu, intctl;
+	uint32_t irp;
+	bool write_irp, take_hit, hit, m3;
+};
+
+/* the M3s' ceiling with the OCP warning on, for this many M3s (see above) */
+static uint32_t
+ocp_big_limit(uint32_t online)
+{
+	if (big_oc != 0) {
+		return big_oc;
+	}
+	return online <= 2 ? OCP_DUAL_KHZ : OCP_QUAD_KHZ;
+}
+
+/* on an M3, interrupts off: its OCP registers read, the throttle flag taken, the IRP written, as asked */
+static void
+ocp_m3_regs(struct ocp_m3 *r)
+{
+	uint64_t v;
+
+	__asm__ volatile ("mrs %0, MIDR_EL1" : "=r" (r->midr));
+	r->m3 = ((r->midr >> 24) & 0xff) == 0x53;
+	if (!r->m3) {
+		return;
+	}
+	__asm__ volatile ("mrs %0, S3_0_C15_C12_7" : "=r" (r->thrott));
+	__asm__ volatile ("mrs %0, S3_1_C15_C11_0" : "=r" (r->gcu));
+	__asm__ volatile ("mrs %0, S3_0_C15_C12_5" : "=r" (r->intctl));
+	r->hit = (r->thrott & OCP_ERRA_BIT) != 0;
+	if (r->take_hit && r->hit) {
+		v = r->thrott & ~OCP_ERRA_BIT;
+		__asm__ volatile ("msr S3_0_C15_C12_7, %0\n isb" : : "r" (v) : "memory");
+	}
+	if (r->write_irp) {
+		v = (r->intctl & ~(OCP_IRP_MASK << OCP_IRP_SHIFT)) | ((uint64_t)r->irp << OCP_IRP_SHIFT);
+		__asm__ volatile ("msr S3_0_C15_C12_5, %0\n isb" : : "r" (v) : "memory");
+	}
+}
+
+/* ocp_m3_regs() on the first M3 the scheduler has (measure_mhz()'s way); false when there is none or it is no M3 */
+static bool
+ocp_on_m3(struct ocp_m3 *r)
+{
+	const ml_topology_info_t *topology = ml_get_topology_info();
+	boolean_t enabled;
+	int cpu = -1;
+
+	for (unsigned int i = 0; i < topology->num_cpus && i < MAX_CPUS; i++) {
+		if (((topology->cpus[i].phys_id >> 8) & 0xff) == clusters[1].affinity && ever_idle_cpu(i)) {
+			cpu = (int)topology->cpus[i].cpu_id;
+			break;
+		}
+	}
+	if (cpu < 0 || cpu_to_processor(cpu) == NULL) {
+		return false;
+	}
+	(void)thread_bind(cpu_to_processor(cpu));
+	(void)thread_block(NULL);
+	enabled = ml_set_interrupts_enabled(FALSE);
+	ocp_m3_regs(r);
+	(void)ml_set_interrupts_enabled(enabled);
+	(void)thread_bind(NULL);
+	if (r->m3 && !ocp_regs_said) {
+		ocp_regs_said = true;
+		say("cpufreq_gov: ocp: on cpu %d (MIDR %#llx): OCPTHROTTCTL %#llx, GCUCTL %#llx, OCPINTCTL %#llx (IRP %llu)\n", cpu,
+		    r->midr, r->thrott, r->gcu, r->intctl, (r->intctl >> OCP_IRP_SHIFT) & OCP_IRP_MASK);
+	} else if (!r->m3 && !ocp_regs_said) {
+		ocp_regs_said = true;
+		say("cpufreq_gov: ocp: cpu %d is no M3 (MIDR %#llx): its registers left alone\n", cpu, r->midr);
+	}
+	return r->m3;
+}
+
+/* before the M3s go to khz: the OCP controller told the level (exynos_ocp_irq_work()), when it changes */
+static void
+ocp_level(uint32_t khz)
+{
+	uint32_t irp = khz * 2 / OCP_MIN_KHZ;
+	struct ocp_m3 r = { .write_irp = true };
+
+	irp = irp >= 2 ? irp - 2 : 0;
+	irp = MIN(irp, (uint32_t)OCP_IRP_MASK);
+	if (!ocp_on || irp == ocp_irp) {
+		return;
+	}
+	r.irp = irp;
+	if (ocp_on_m3(&r)) {
+		ocp_irp = irp;
+	}
+}
+
+/* the PMIC's CPU OCP warning on (cpufreq_ocp=1): true when it reads back on */
+static bool
+ocp_pmic(void)
+{
+	uint8_t cpu = 0, gpu = 0, back = 0;
+	int e1 = hakios_acpm_pmic_read(HAKIOS_ACPM_PMIC_PMIC, OCP_PMIC_WARN1, &cpu);
+	int e2 = hakios_acpm_pmic_read(HAKIOS_ACPM_PMIC_PMIC, OCP_PMIC_WARN2, &gpu);
+	int e3 = hakios_acpm_pmic_write(HAKIOS_ACPM_PMIC_PMIC, OCP_PMIC_WARN1, OCP_WARN_CPU);
+	int e4 = hakios_acpm_pmic_read(HAKIOS_ACPM_PMIC_PMIC, OCP_PMIC_WARN1, &back);
+	bool on = e3 == 0 && e4 == 0 && (back & OCP_WARN_CPU) != 0;
+
+	say("cpufreq_gov: ocp: the S2MPS18's OCP_WARN1 (CPU) %#x (%d), OCP_WARN2 (GPU) %#x (%d) as found; OCP_WARN1 = %#x (%d), "
+	    "read back %#x (%d): %s\n", cpu, e1, gpu, e2, OCP_WARN_CPU, e3, back, e4,
+	    on ? "the M3s' limits are Samsung's with OCP" : "not on: the M3s stay at 1794000 at most");
+	return on;
+}
+
 /* the slowest level at or above khz (the fastest when none is) */
 static uint32_t
 level_at_least(const struct cluster *c, uint64_t khz)
@@ -472,9 +624,16 @@ ceiling_now(struct cluster *c)
 			max = scion_limit(&scion_soc, big_cores);
 		}
 	} else if (c == &clusters[1]) {
-		max = MIN(max, big_online_limit(c->online));
+		max = MIN(max, ocp_on ? ocp_big_limit(c->online) : big_online_limit(c->online));
 		if (c->temp_mc == NOT_READ_MC) {
 			max = MIN(max, NO_TEMP_BIG_MAX);
+		}
+	}
+	if (c == &clusters[1] && ocp_on) {
+		/* (the scion policies too: Samsung's limit for the M3s the scheduler has, and a throttle's level off) */
+		max = MIN(max, ocp_big_limit(MIN(c->online, big_cores)));
+		if (ocp_clip != 0) {
+			max = MIN(max, ocp_clip);
 		}
 	}
 	if (c->thermal > 0) {
@@ -679,8 +838,14 @@ static void
 set_rate(struct cluster *c, uint32_t khz, uint32_t max)
 {
 	uint32_t answer[4];
-	uint64_t began = mach_absolute_time(), took, bounce;
-	int e = dvfs_request(c->index, khz, answer);
+	uint64_t began, took, bounce;
+	int e;
+
+	if (c == &clusters[1]) {
+		ocp_level(khz);         /* (cpufreq_ocp=1 only: before the change, as exynos-ocp's PRECHANGE notifier) */
+	}
+	began = mach_absolute_time();
+	e = dvfs_request(c->index, khz, answer);
 
 	residency(c, began);
 	nanoseconds_to_absolutetime((uint64_t)BOUNCE_MS * NSEC_PER_MSEC, &bounce);
@@ -909,6 +1074,29 @@ decide(struct cluster *c, uint64_t now, uint32_t window)
 	}
 }
 
+/* once a second with cpufreq_ocp=1: a hardware throttle since the last look takes a level off the M3s' ceiling */
+static void
+ocp_poll(void)
+{
+	struct cluster *b = &clusters[1];
+	struct ocp_m3 r = { .take_hit = true };
+
+	if (!ocp_on || !ocp_on_m3(&r)) {
+		return;
+	}
+	if (r.hit) {
+		uint32_t from = level_at_most(b, MIN(b->cur, ceiling_now(b)));
+
+		ocp_hits++;
+		ocp_clip = b->levels[MIN(from + 1, b->lowest)];
+		say("cpufreq_gov: ocp: the M3s throttled for current (%u so far): their ceiling %u kHz for a second at least\n",
+		    ocp_hits, ocp_clip);
+	} else if (ocp_clip != 0) {
+		ocp_clip = 0;
+		say("cpufreq_gov: ocp: no throttle for a second: the M3s' ceiling back to %u kHz\n", ceiling_now(b));
+	}
+}
+
 /* the zone's temperature, from the TMU driver itself; the first time also what its sysctl says, for the log */
 static int32_t
 read_temp(struct cluster *c)
@@ -1118,6 +1306,7 @@ gov_thread(void *arg __unused, wait_result_t wr __unused)
 			last_second = now;
 			cool(&clusters[0]);
 			cool(&clusters[1]);
+			ocp_poll();
 		}
 		decide(&clusters[0], now, (uint32_t)span_ms);
 		decide(&clusters[1], now, (uint32_t)span_ms);
@@ -1226,8 +1415,22 @@ hakios_exynos_cpufreq_gov_start(void)
 	clusters[1] = (struct cluster){ .name = "big", .zone = "kern.hakios.temp.big_mc", .tmu_zone = 0, .index = 3, .affinity = 1,
 		                        .control_mc = 83000, .dt_min = 650000, .dt_max = 2314000, .dt_levels = big_dt,
 		                        .n_dt_levels = sizeof(big_dt) / sizeof(big_dt[0]) };
+	value = 0;
+	if (PE_parse_boot_argn("cpufreq_ocp", &value, sizeof(value)) && value != 0) {
+		ocp_on = ocp_pmic();
+	}
+	value = 0;
+	if (ocp_on && PE_parse_boot_argn("cpufreq_gov_big_oc", &value, sizeof(value)) && value > OCP_QUAD_KHZ) {
+		big_oc = MIN(value, OCP_OC_MOST);
+		clusters[1].dt_max = MAX(clusters[1].dt_max, big_oc);
+		say("cpufreq_gov: cpufreq_gov_big_oc: the M3s up to %u kHz however many run -- past Samsung's limits\n", big_oc);
+	}
 	cluster_setup(&clusters[0], lit_max, lit_min, 1794000, 1053000);
-	cluster_setup(&clusters[1], big_max, big_min, 1794000, 650000);
+	/* (with OCP: Samsung's star2lte policy-max 1924000 by default, or cpufreq_gov_big_oc's) */
+	cluster_setup(&clusters[1], big_max, big_min, !ocp_on ? 1794000 : big_oc != 0 ? big_oc : OCP_QUAD_KHZ, 650000);
+	if (big_oc != 0 && clusters[1].levels[level_at_most(&clusters[1], big_oc)] != big_oc) {
+		big_oc = clusters[1].levels[level_at_most(&clusters[1], big_oc)];
+	}
 	clusters[0].touch_khz = touch_lit;
 	clusters[1].touch_khz = touch_big;
 	clusters[1].frame_khz = frame_big;
@@ -1248,7 +1451,9 @@ hakios_exynos_cpufreq_gov_start(void)
 
 		c->cur = e == 0 ? found : 0;
 		say("cpufreq_gov: %s (DVFS %u): %u to %u kHz, now %u kHz (%d)%s\n", c->name, c->index, c->floor, c->ceiling,
-		    c->cur, e, i == 1 ? "; and by M3s online: 1-2 2314000, 3-4 1794000; 1794000 without temperatures" : "");
+		    c->cur, e, i != 1 ? "" : big_oc != 0 ? "; OCP on, past Samsung: any number of M3s online; 1794000 without temperatures" :
+		    ocp_on ? "; OCP on: by M3s online 1-2 2314000, 3-4 1924000 (star2lte); 1794000 without temperatures" :
+		    "; and by M3s online: 1-2 2314000, 3-4 1794000; 1794000 without temperatures");
 		if (c->cur == 0) {
 			/* (not said: the ceiling is asked for, and from then on the rate is the one asked for) */
 			set_rate(c, c->levels[level_at_most(c, c->ceiling)], c->ceiling);
