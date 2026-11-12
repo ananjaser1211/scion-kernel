@@ -718,8 +718,7 @@ lx_os_station_lost(int error)
 __attribute__((weak)) int
 lx_start(void)
 {
-	say("lx: THE DRIVER IS NOT BUILT IN: its object was not there when this kernel was built (tools/mk-ath11k.sh, then "
-	    "build the kernel again)\n");
+	say("lx: THE DRIVER IS NOT BUILT IN: the selected external Wi-Fi object was missing when this kernel was built\n");
 	return ENXIO;
 }
 

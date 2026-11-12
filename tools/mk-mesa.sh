@@ -87,7 +87,7 @@ export PATH=$B/venv/bin:$PATH
 cat > cross.ini <<INI
 [binaries]
 c = ['$CC', '-arch', 'arm64', '-isysroot', '$SDK']
-cpp = ['$CC++', '-arch', 'arm64', '-isysroot', '$SDK', '-fuse-cxa-atexit']
+cpp = ['$CC++', '-arch', 'arm64', '-isysroot', '$SDK', '-fuse-cxa-atexit', '-stdlib=libc++']
 objc = ['$CC', '-arch', 'arm64', '-isysroot', '$SDK']
 ar = 'llvm-ar'
 ranlib = 'llvm-ranlib'
@@ -103,6 +103,10 @@ endian = 'little'
 
 [properties]
 needs_exe_wrapper = true
+
+[built-in options]
+c_link_args = ['-lz']
+cpp_link_args = ['-lz']
 INI
 DRIVERS=${DRIVERS:-softpipe,freedreno,panfrost}
 BUILD=build-${DRIVERS//,/-}
@@ -110,7 +114,7 @@ BUILD=build-${DRIVERS//,/-}
 	--prefix=/redwood --libdir=lib --buildtype=release -Db_ndebug=true \
 	-Dplatforms= -Dgallium-drivers="$DRIVERS" -Dfreedreno-kmds=msm -Dvulkan-drivers= -Dglx=disabled -Degl=disabled -Dgbm=disabled \
 	-Dosmesa=true -Dllvm=disabled -Dshared-glapi=enabled -Dgles1=disabled -Dgles2=enabled -Dopengl=true \
-	-Dzstd=disabled -Dxmlconfig=disabled -Dexpat=disabled -Dshader-cache=disabled -Dvalgrind=disabled \
+	-Dzlib=disabled -Dzstd=disabled -Dxmlconfig=disabled -Dexpat=disabled -Dshader-cache=disabled -Dvalgrind=disabled \
 	-Dlibunwind=disabled -Dglvnd=disabled -Dvideo-codecs= -Dtools= -Dgallium-vdpau=disabled -Dgallium-va=disabled \
 	-Dgallium-xa=disabled -Dlmsensors=disabled -Dbuild-tests=false > meson-setup.log
 ninja -C $BUILD > ninja.log

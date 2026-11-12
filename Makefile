@@ -83,7 +83,7 @@ DXB_BUILDER = [ "$$(OS_PROFILE_QUIET=1 python3 tools/os-profile.py get builder 2
 
 kernel:
 	$(DXB_BUILDER) || [ -d "$$(OS_PROFILE_QUIET=1 python3 tools/os-profile.py get src)" ] || xnu/apply.sh
-	$(DXB_BUILDER) || { [ -e xnu-deps/host/bin/ld64 ] && [ -f xnu-deps/sdk/iPhoneOS$$(OS_PROFILE_QUIET=1 python3 tools/os-profile.py get sdk).xnu.sdk/usr/local/lib/kernel/libfirehose_kernel.a; } || \
+	$(DXB_BUILDER) || { [ -e xnu-deps/host/bin/ld64 ] && [ -f xnu-deps/sdk/iPhoneOS$$(OS_PROFILE_QUIET=1 python3 tools/os-profile.py get sdk).xnu.sdk/usr/local/lib/kernel/libfirehose_kernel.a ]; } || \
 		xnu-deps/setup.sh
 	tools/make-kernel.sh -j$(JOBS)
 

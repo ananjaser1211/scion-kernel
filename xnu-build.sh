@@ -1,6 +1,7 @@
 #!/bin/bash
 # Build XNU for redwood on Linux. Extra make args are passed through.
 source "$(dirname "${BASH_SOURCE[0]}")/xnu-env.sh"
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cd "$XNU_SRC" || exit 1
 # The Wi-Fi driver's object is linked into the kernel when it is there; make does not see it
 # change, so the linked kernel is thrown away when it has. Which object is the radio driver's:
@@ -8,11 +9,22 @@ cd "$XNU_SRC" || exit 1
 # (tools/mk-brcmfmac.sh) for the Galaxy S9's BCM4361 (CONFIG_HAKIOS_BRCMFMAC); none for a kernel
 # with neither. The object's calls are answered by hakios.lx.c.
 LX=$XNUDEPS/build/ath11k/out/ath11k.o
+LX_BUILD=$ROOT/tools/mk-ath11k.sh
 if [ -f config/MASTER.hakios ] && ! grep -q '^#  HAKIOS_DRIVERS = \[.* hakios_wifi ' config/MASTER.hakios; then
 	LX=/nonexistent
+	LX_BUILD=
 	if grep -q '^#  HAKIOS_DRIVERS = \[.* hakios_brcmfmac ' config/MASTER.hakios; then
 		LX=$XNUDEPS/build/brcmfmac/out/brcmfmac.o
+		LX_BUILD=$ROOT/tools/mk-brcmfmac.sh
 	fi
+fi
+if [ -n "$LX_BUILD" ] && [ ! -f "$LX" ]; then
+	echo "xnu-build: building required external Wi-Fi object: $LX"
+	"$LX_BUILD" || exit 1
+fi
+if [ -n "$LX_BUILD" ] && [ ! -f "$LX" ]; then
+	echo "xnu-build: required Wi-Fi object was not produced: $LX" >&2
+	exit 1
 fi
 STAMP=BUILD/obj/hakios-objects
 # (macOS: its own stat, not tools/macos-bin/stat, which is GNU stat for the scripts written for it and may be absent)
