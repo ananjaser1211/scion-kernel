@@ -143,7 +143,7 @@ mask_position(char *t)
 {
 	size_t k = strlen(t);
 	/* the measurement engine's noise and gain statistics are not positions, and they say whether the RF path works */
-	int stats = (strstr(t, "NoiseStats") != NULL || strstr(t, "DagcStats") != NULL) && strchr(t, '$') == NULL &&
+	int stats = (strstr(t, "NoiseStats") != NULL || strstr(t, "DagcStats") != NULL) && strstr(t, "$G") == NULL &&
 	    strstr(t, "Lat") == NULL && strstr(t, "Lon") == NULL && strstr(t, "LLA") == NULL && strstr(t, "NMEA") == NULL;
 
 	for (size_t i = 0; i < k && !stats; i++) {
