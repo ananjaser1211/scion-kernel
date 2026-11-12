@@ -12,7 +12,13 @@
  *
  * Boot-args:
  *   mali=N              run the first N steps (9: all, then serve). 0 or unset: the GPU is left alone.
- *   mali_mhz=MHZ        GPU clock: 260 (default), 455 or 572.
+ *   mali_mhz=MHZ        GPU clock: 260 (default), 455 or 572 (or mali_max's level).
+ *   mali_max=MHZ        a level above 572 MHz, only if the APM's own G3D table (DVFS 4) has one at or below MHZ with a
+ *                       voltage BUCK6 can give (950 mV at most): added as the top level, its M/P/S solved for PLL_1018X.
+ *                       Samsung's star2 tree stops at 572 (gpu_max_clock_limit); this is beyond it. Default: none.
+ *   mali_dvs=1          with mali_gov=1: BUCK6 follows the level, at the APM's voltage for it + mali_dvs_margin (uV,
+ *                       default 25000), never below mali_dvs_floor (uV, default 800000: gpu_default_voltage) nor above
+ *                       950 mV; raised before a switch up, lowered after a switch down. Default 0: 950 mV throughout.
  *   mali_pll=0          leave PLL_G3D as the boot set it; the step stops if it is not running.
  *   mali_acpm=0         do not raise the rail. The GPU is then touched at the boot's voltage, which hung the S9+ (test only).
  *   mali_fastmap=0      walk the page tables through the GPU's caches; each buffer entered is then an MMU update of AS 0.
@@ -51,6 +57,7 @@ extern vm_offset_t phystokv(uint64_t pa);
 extern boolean_t pmap_valid_address(uint64_t addr);             /* memory the kernel manages */
 extern int hakios_mfc_carved(uint64_t phys);                    /* the video decoder's (hakios.exynos_mfc.c, mfc_zc; stubs.c) */
 extern int hakios_scanout_carved(uint64_t phys);                /* the DPU's pool (hakios.exynos_dpu.c; stubs.c) */
+extern void hakios_exynos_bus_busy(void);                      /* drivers/soc/exynos/hakios.exynos_acpm.c */
 extern void HakiosMaliStart(void);                              /* drivers/gpu/mali/hakios.mali.cpp */
 extern uint32_t gMaliClients, gMaliBuffers, gMaliSubmits, gMaliFailed, gMaliShown;   /* hakios.mali.cpp */
 extern struct mali_made { uint64_t address, size; uint32_t asked, flags; } gMaliMade[32];
@@ -110,11 +117,14 @@ static const struct { uint32_t at, mask, value; const char *name; } g3d_lpm[] = 
  * (26 / P from 2 to 8 MHz, 26 x M / P from 600 to 1200 MHz; Samsung's pll_spec.c). The S9+ port's own values for 455
  * and 572 MHz put the VCO below 600 MHz, and 455's reference at 1 MHz, below 2. These differ for the same rates.
  */
-static const struct g3d_rate { uint32_t mhz, m, p, s; } g3d_rates[] = {
-	{ 260, 160, 4, 2 },                     /* S-Boot's own: the VCO at 1040 MHz */
-	{ 455, 140, 4, 1 },                     /* 910 */
-	{ 572, 176, 4, 1 },                     /* 1144 */
+#define G3D_RATES_MOST          4
+static struct g3d_rate { uint32_t mhz, m, p, s, uv; } g3d_rates[G3D_RATES_MOST] = {   /* uv: the APM's, 0 unknown */
+	{ 260, 160, 4, 2, 0 },                  /* S-Boot's own: the VCO at 1040 MHz */
+	{ 455, 140, 4, 1, 0 },                  /* 910 */
+	{ 572, 176, 4, 1, 0 },                  /* 1144 */
 };
+static unsigned g3d_nrates = 3;                 /* a fourth only with mali_max (g3d_apm_levels()) */
+static uint32_t mali_max, mali_dvs, mali_dvs_margin = 25000, mali_dvs_floor = 800000;
 static uint32_t mali_mhz = 260;
 static bool pll_quiet;                          /* the governor's switches: a line only when one fails */
 static uint32_t mali_pll = 1;                   /* mali_pll=0: PLL_G3D as the boot left it */
@@ -919,6 +929,95 @@ step_look(void)
 	return true;
 }
 
+/*
+ * The APM's own G3D levels (fvmap, DVFS index 4: Apollo cal-if/exynos9810/acpm_dvfs_exynos9810.h:7, the mali node's
+ * g3d_cmu_cal_id 0xb040004 at star2lte_kor_26.dts:5323): read once, said, each of our rates given the voltage the APM
+ * applies with it (or with the slowest of its levels at least as fast), and with mali_max a level above 572 MHz added
+ * when the APM has one. Samsung's star2 tree: gpu_dvfs_table 572/546/455/338/299/260 MHz, gpu_max_clock_limit 572000
+ * (dts:5330, :5336), gpu_default_voltage 800000 (:5340); BUCK6 (vdd_g3d) regulator-max-microvolt 950000 (:9055).
+ */
+#define G3D_DVFS                4
+#define G3D_SAMSUNG_MAX_MHZ     572
+#define G3D_UV_MOST             950000u
+#define G3D_APM_LEVELS          24
+
+/* M, P, S for `mhz` on PLL_1018X (Apollo pll_spec.c:169-178: 26 / P 2..8 MHz, M 64..1023, S 0..6, VCO 600..1200 MHz) */
+static bool
+g3d_mps(uint32_t mhz, struct g3d_rate *r)
+{
+	for (int s = 6; s >= 0; s--) {                  /* the highest VCO that fits first */
+		uint64_t vco = (uint64_t)mhz * 1000 << s;       /* kHz */
+
+		if (vco < 600000 || vco > 1200000) {
+			continue;
+		}
+		for (uint32_t p = 4; p <= 13; p++) {
+			if ((vco * p) % 26000 == 0 && vco * p / 26000 >= 64 && vco * p / 26000 <= 1023) {
+				r->mhz = mhz;
+				r->m = (uint32_t)(vco * p / 26000);
+				r->p = p;
+				r->s = (uint32_t)s;
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+static void
+g3d_apm_levels(void)
+{
+	static bool done;
+	uint32_t khz[G3D_APM_LEVELS], uv[G3D_APM_LEVELS], n, len = 0;
+	char line[400];
+
+	if (done || !acpm_ok) {
+		return;
+	}
+	done = true;
+	line[0] = 0;
+	n = hakios_acpm_dvfs_table(G3D_DVFS, khz, uv, G3D_APM_LEVELS, say);
+	if (n == 0) {
+		say("mali: 2: the APM's G3D table (DVFS %u) was not read: the three rates, BUCK6 at 950 mV\n", G3D_DVFS);
+		return;
+	}
+	for (uint32_t l = 0; l < n && len < sizeof(line) - 24; l++) {
+		len += (uint32_t)snprintf(line + len, sizeof(line) - len, " %u/%u", khz[l], uv[l]);
+	}
+	say("mali: 2: the APM's G3D table (DVFS %u), kHz/uV:%s; its fastest %u MHz (Samsung's limit %u MHz)\n", G3D_DVFS,
+	    line, khz[0] / 1000, G3D_SAMSUNG_MAX_MHZ);
+	for (unsigned i = 0; i < g3d_nrates; i++) {
+		for (uint32_t l = 0; l < n && khz[l] >= g3d_rates[i].mhz * 1000; l++) {
+			g3d_rates[i].uv = uv[l];        /* the fastest first: the last that is fast enough */
+		}
+	}
+	if (mali_max > G3D_SAMSUNG_MAX_MHZ && g3d_nrates < G3D_RATES_MOST) {
+		struct g3d_rate r = { 0 };
+		uint32_t l = 0;
+
+		while (l < n && khz[l] > mali_max * 1000) {
+			l++;
+		}
+		if (l >= n || khz[l] <= G3D_SAMSUNG_MAX_MHZ * 1000) {
+			say("mali: 2: mali_max=%u: the APM has no G3D level above %u MHz up to it: nothing added\n", mali_max,
+			    G3D_SAMSUNG_MAX_MHZ);
+		} else if (uv[l] > G3D_UV_MOST) {
+			say("mali: 2: mali_max=%u: the APM's %u kHz wants %u uV, above BUCK6's 950 mV: not added\n", mali_max,
+			    khz[l], uv[l]);
+		} else if (khz[l] % 1000 != 0 || !g3d_mps(khz[l] / 1000, &r)) {
+			say("mali: 2: mali_max=%u: no PLL_1018X M/P/S gives %u kHz exactly: not added\n", mali_max, khz[l]);
+		} else {
+			r.uv = uv[l];
+			g3d_rates[g3d_nrates++] = r;
+			say("mali: 2: mali_max=%u: %u MHz added above Samsung's 572 (M %u, P %u, S %u: the VCO at %u MHz; the APM's "
+			    "voltage %u uV)\n", mali_max, r.mhz, r.m, r.p, r.s, r.mhz << r.s, r.uv);
+		}
+	}
+	for (unsigned i = 0; i < g3d_nrates; i++) {
+		say("mali: 2: %u MHz: the APM's voltage %u uV\n", g3d_rates[i].mhz, g3d_rates[i].uv);
+	}
+}
+
 /* 2: the supply, the clock, power. */
 static bool
 step_power(void)
@@ -956,13 +1055,14 @@ step_power(void)
 		(void)rail_read("now", &now);
 	}
 	/* the clock: PLL_G3D at the rate asked for */
-	for (unsigned i = 0; i < sizeof(g3d_rates) / sizeof(g3d_rates[0]); i++) {
+	g3d_apm_levels();
+	for (unsigned i = 0; i < g3d_nrates; i++) {
 		if (g3d_rates[i].mhz == mali_mhz) {
 			rate = &g3d_rates[i];
 		}
 	}
 	if (rate == NULL) {
-		say("mali: 2: mali_mhz=%u is not one of 260, 455, 572: 260\n", mali_mhz);
+		say("mali: 2: mali_mhz=%u is not one of the rates (260, 455, 572, or mali_max's): 260\n", mali_mhz);
 		rate = &g3d_rates[0];
 	}
 	if (pll_is(rate)) {
@@ -1608,7 +1708,7 @@ pll_mhz(void)
 #define GOV_CAP2_MC     95000           /* 260 MHz from here */
 #define GOV_HYST_MC     5000
 #define GOV_NOT_READ_MC (-273000)
-#define GOV_LEVELS      ((unsigned)(sizeof(g3d_rates) / sizeof(g3d_rates[0])))
+#define GOV_LEVELS      g3d_nrates
 extern int32_t hakios_exynos_tmu_zone_mc(unsigned zone);       /* 2: the G3D's (hakios.exynos_tmu.c; stubs.c) */
 static uint32_t mali_gov;
 /*
@@ -1629,9 +1729,22 @@ void
 hakios_mali_frame(void)
 {
 	__atomic_store_n(&gov_frame_last, mach_absolute_time(), __ATOMIC_RELAXED);
+	hakios_exynos_bus_busy();       /* bus_max=2: the memory bus at its top while frames come (hakios.exynos_acpm.c) */
 }
 static bool gov_on;
-static unsigned gov_level, gov_cap = GOV_LEVELS - 1, gov_down, gov_failed;
+static unsigned gov_level, gov_cap = G3D_RATES_MOST - 1, gov_down, gov_failed;
+static bool gov_dvs;                    /* mali_dvs=1 and every level's voltage known: BUCK6 follows the level */
+
+/* B6OUT for a level under mali_dvs: the APM's voltage + the margin, rounded up, between the floor and 950 mV */
+static uint8_t
+gov_vsel(unsigned level)
+{
+	uint32_t uv = g3d_rates[level].uv + mali_dvs_margin, vsel;
+
+	uv = uv < mali_dvs_floor ? mali_dvs_floor : uv;
+	vsel = uv <= 300000 ? 0 : (uv - 300000 + 6249) / 6250;
+	return (uint8_t)(vsel > B6OUT_MOST ? B6OUT_MOST : vsel);
+}
 static uint64_t gov_since, gov_busy;
 static uint32_t gov_switches, gov_ups, gov_downs, gov_capped;
 
@@ -1658,7 +1771,29 @@ gov_start(void)
 		    mali_pll, mali_acpm, acpm_ok ? "answers" : "does not answer", gov_level < GOV_LEVELS ? "at" : "NOT at");
 		return;
 	}
-	(void)PE_parse_boot_argn("mali_gov_frame", &gov_frame_mhz, sizeof(gov_frame_mhz));
+	if (!PE_parse_boot_argn("mali_gov_frame", &gov_frame_mhz, sizeof(gov_frame_mhz)) && g3d_nrates > 3) {
+		gov_frame_mhz = g3d_rates[g3d_nrates - 1].mhz;  /* mali_max: frames at the top */
+	}
+	gov_cap = GOV_LEVELS - 1;
+	if (mali_dvs) {
+		gov_dvs = true;
+		for (unsigned i = 0; i < GOV_LEVELS; i++) {
+			gov_dvs = gov_dvs && g3d_rates[i].uv != 0;
+		}
+		if (!gov_dvs) {
+			say("mali: mali_dvs=1: not every level has the APM's voltage: BUCK6 stays at 950 mV\n");
+		} else if (!rail_set(gov_vsel(gov_level))) {
+			gov_dvs = false;
+			(void)rail_set(B6OUT_950MV);
+			say("mali: mali_dvs=1: BUCK6 not set for %u MHz: it stays at 950 mV, no DVS\n", g3d_rates[gov_level].mhz);
+		} else {
+			for (unsigned i = 0; i < GOV_LEVELS; i++) {
+				say("mali: mali_dvs=1: %u MHz at B6OUT %#x = %u mV (the APM's %u uV + %u, at least %u)\n",
+				    g3d_rates[i].mhz, gov_vsel(i), 300 + gov_vsel(i) * 25 / 4, g3d_rates[i].uv, mali_dvs_margin,
+				    mali_dvs_floor);
+			}
+		}
+	}
 	gov_on = true;
 	gov_since = mach_absolute_time();
 	say("mali: mali_gov=1: the GPU's clock follows its load from %u MHz: %u%% of a %u ms window wanted at most; no more "
@@ -1674,11 +1809,20 @@ gov_set(unsigned level)
 	if (level == gov_level || level >= GOV_LEVELS) {
 		return;
 	}
+	/* mali_dvs: the voltage up before the clock goes up (a failed raise: no switch) */
+	if (gov_dvs && level > gov_level && gov_vsel(level) > gov_vsel(gov_level) && !rail_set(gov_vsel(level))) {
+		say("mali: mali_dvs: BUCK6 not raised for %u MHz: no switch\n", g3d_rates[level].mhz);
+		return;
+	}
 	lck_mtx_lock(&mali_job_lock);
 	pll_quiet = true;
 	switched = pll_switch(&g3d_rates[level]);
 	pll_quiet = false;
 	lck_mtx_unlock(&mali_job_lock);
+	/* ... and down only after the clock has come down */
+	if (switched && gov_dvs && level < gov_level && gov_vsel(level) < gov_vsel(gov_level)) {
+		(void)rail_set(gov_vsel(level));
+	}
 	if (switched) {
 		gov_ups += level > gov_level;
 		gov_downs += level < gov_level;
@@ -1689,6 +1833,10 @@ gov_set(unsigned level)
 	}
 	if ((gov_level = gov_level_now()) >= GOV_LEVELS || ++gov_failed >= 3) {
 		gov_on = false;
+		if (gov_dvs) {
+			gov_dvs = false;
+			(void)rail_set(B6OUT_950MV);    /* wherever the clock stopped, the voltage for any of them */
+		}
 		say("mali: mali_gov: PLL_G3D did not switch to %u MHz (%u times in a row; it runs at %u MHz): the governor stops\n",
 		    g3d_rates[level].mhz, gov_failed, pll_mhz());
 	}
@@ -2017,6 +2165,10 @@ hakios_mali_init(void)
 	(void)PE_parse_boot_argn("mali_mhz", &mali_mhz, sizeof(mali_mhz));
 	(void)PE_parse_boot_argn("mali_acpm", &mali_acpm, sizeof(mali_acpm));
 	(void)PE_parse_boot_argn("mali_gov", &mali_gov, sizeof(mali_gov));
+	(void)PE_parse_boot_argn("mali_max", &mali_max, sizeof(mali_max));
+	(void)PE_parse_boot_argn("mali_dvs", &mali_dvs, sizeof(mali_dvs));
+	(void)PE_parse_boot_argn("mali_dvs_margin", &mali_dvs_margin, sizeof(mali_dvs_margin));
+	(void)PE_parse_boot_argn("mali_dvs_floor", &mali_dvs_floor, sizeof(mali_dvs_floor));
 	(void)PE_parse_boot_argn("mali_nap_us", &mali_nap_us, sizeof(mali_nap_us));
 	mali_nap_us = mali_nap_us < 10 ? 10 : mali_nap_us > 1000 ? 1000 : mali_nap_us;
 	if (!PE_parse_boot_argn("mali", &last_step, sizeof(last_step)) || last_step == 0) {
