@@ -33,7 +33,8 @@
 #                                   (default: src/inject.c in backboardd, src/inject_sb.c in SpringBoard,
 #                                   src/inject_media.c in mediaserverd);
 #                                   init hands the list to the kernel (etc/inject.conf -> sysctl kern.exec_inject)
-#                      BT=1         Bluetooth on the Galaxy S9 (kernel bt=7, drivers/bluetooth/bcm4361/hakios.bcm4361_bt.c):
+#                      BT=0         without Bluetooth, which is in by default (BT=1, the same as leaving it unset):
+#                                   Bluetooth on the Galaxy S9 and S9+ (kernel bt=7, drivers/bluetooth/bcm4361/hakios.bcm4361_bt.c):
 #                                   the jobs com.apple.bluetoothd (its transport BT_HCI_TRANSPORT=H4:POSIX:
 #                                   com.apple.uart.bluetooth,4000000 -- the kernel's control at the chip's rate; give
 #                                   BT_HCI_TRANSPORT= for another) and com.apple.BlueTool; BlueTool started with
@@ -193,7 +194,11 @@ DARWIN_JOBS=${JOBS-"
 # (Count a QEMU run log with its duplicate lines removed: run-darwin.sh prints launchd's log twice.)
 # WIFID=0 leaves it out.
 [ "${WIFID-1}" != 0 ] && DARWIN_JOBS="$DARWIN_JOBS com.apple.wifid"
-# Bluetooth (BT=1): bluetoothd at load, BlueTool when bluetoothd asks it (mkjobs.py gives bluetoothd BT_HCI_TRANSPORT)
+# Bluetooth: bluetoothd at load, BlueTool when bluetoothd asks it (mkjobs.py gives bluetoothd BT_HCI_TRANSPORT).
+# In by default, as wifid is: the S9's and the S9+'s kernels start the chip (bt=7 is a default of both, configs/), and
+# their images were being built without it, so Settings had no Bluetooth there. Where the kernel has no chip (QEMU, the
+# Note9) bluetoothd finds no "bluetooth" registry entry with an address, exits, and launchd paces it. BT=0 leaves it out.
+[ "${BT-1}" != 0 ] && BT=1 || BT=
 if [ -n "$BT" ]; then
 	DARWIN_JOBS="$DARWIN_JOBS com.apple.bluetoothd com.apple.BlueTool"
 	export BT_HCI_TRANSPORT=${BT_HCI_TRANSPORT-H4:POSIX:com.apple.uart.bluetooth,4000000}
