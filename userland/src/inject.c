@@ -1160,6 +1160,7 @@ extern void IOHIDEventSetFloatValue(IOHIDEventRef event, uint32_t field, double 
 #define GYRO_DPS_PER_COUNT      (1.0 / 16400)   /* to rad/s below */
 #define MAG_UT_PER_COUNT        0.015
 
+static volatile int proximity_near;     /* sensors_thread()'s: the proximity sensor covered (tap_to_wake()) */
 static IOHIDEventSystemClientRef hid_client;    /* input_thread()'s, once the touch screen is made */
 
 static struct {
@@ -1463,6 +1464,7 @@ sensors_thread(void *arg)
 		case HAKIOS_SENSOR_PROXIMITY:
 			if (sensor.proximity != NULL && (s.v[0] != 0) != near) {
 				near = s.v[0] != 0;
+				proximity_near = near;
 				say("hakios: sensors: proximity %s\n", near ? "near" : "far");
 				sensor_send(sensor.proximity, NULL, IOHIDEventCreateProximtyEvent(NULL, s.time, near ?
 				    PROXIMITY_RECEIVER : 0, 0), HID_EVENT_PROXIMITY);
@@ -1492,6 +1494,70 @@ sensors_start(void)
 	}
 }
 
+/*
+ * Tap to wake. While the display is off the window server asks the touch screen for TOUCH_MODE_WAKE (Settings >
+ * Accessibility > Touch > Tap to Wake), and Apple's multitouch controller then reports a TAP: one finger, down and up
+ * again quickly, close to where it landed. The S6SY761 has no such gesture of its own here and reports every contact,
+ * so the tap is recognised here, and only a tap presses the lock button (what wakes the display; SpringBoard then
+ * shows the lock screen). Until 13 November any finger landing woke it: a palm, the phone picked up or put down, a
+ * cable pushed in while holding the phone, cloth in a pocket -- each a wake "for no reason" (build33: the lock screen
+ * lit at 00:17:38 by a "Lock" press 0.3 ms long with no side-button press under it, the touch count up by one).
+ * Not a tap, and so no wake:
+ *   - a second finger at any time during it;
+ *   - held longer than TAP_MOST_MS, or moved more than TAP_TRAVEL from where it landed (a sixteenth of the screen);
+ *   - the proximity sensor covered when it lands (in a pocket, face down on something): as iOS's own pocket check.
+ * Every finger that went down while the display was off is kept from the window server until it is lifted, whatever
+ * happens to the display meanwhile (no "moved" or "up" for a "down" it never had).
+ */
+#define TAP_MOST_MS             350
+#define TAP_TRAVEL              4096    /* of 65535 */
+
+static bool
+tap_to_wake(IOHIDServiceClientRef buttons, const struct hakios_touch *t)
+{
+	static unsigned held;                   /* fingers down since the display was off: theirs until lifted */
+	static bool candidate;                  /* the one finger down may still be a tap */
+	static uint32_t finger, x0, y0;
+	static uint64_t down_us;
+	unsigned bit = 1u << (t->finger & 31);
+	bool wake = (touch_mode & 0xff) == TOUCH_MODE_WAKE && buttons != NULL;
+
+	if (t->type == HAKIOS_TOUCH_DOWN) {
+		if (!wake && held == 0) {
+			return false;
+		}
+		/* a second finger, or a finger landing while one of before is still down: no tap */
+		candidate = wake && held == 0 && !proximity_near;
+		held |= bit;
+		finger = t->finger, x0 = t->x, y0 = t->y, down_us = micros(t->time);
+		return true;
+	}
+	if ((held & bit) == 0) {
+		return false;
+	}
+	if (candidate && t->finger == finger) {
+		uint32_t dx = t->x > x0 ? t->x - x0 : x0 - t->x, dy = t->y > y0 ? t->y - y0 : y0 - t->y;
+
+		if (dx > TAP_TRAVEL || dy > TAP_TRAVEL || micros(t->time) - down_us > TAP_MOST_MS * 1000ull) {
+			candidate = false;
+		}
+	}
+	if (t->type == HAKIOS_TOUCH_UP) {
+		held &= ~bit;
+		if (candidate && held == 0 && wake) {
+			struct hakios_touch press = { .time = t->time, .type = HAKIOS_BUTTON_DOWN, .finger = HAKIOS_BUTTON_LOCK };
+
+			send_button(buttons, &press);
+			press.type = HAKIOS_BUTTON_UP;
+			send_button(buttons, &press);
+		}
+		if (held == 0) {
+			candidate = false;
+		}
+	}
+	return true;
+}
+
 static void *
 input_thread(__unused void *arg)
 {
@@ -1500,7 +1566,7 @@ input_thread(__unused void *arg)
 	IOHIDServiceClientRef screen = NULL, buttons = NULL;
 	struct service *screen_made = NULL;
 	struct hakios_touch t;
-	unsigned count = 0, waking = 0;         /* waking: the fingers whose touch went into waking the display */
+	unsigned count = 0;
 	int device;
 
 	pthread_setname_np("redwood input");
@@ -1559,21 +1625,8 @@ input_thread(__unused void *arg)
 			if (buttons != NULL) {
 				send_button(buttons, &t);
 			}
-		} else if (t.type == HAKIOS_TOUCH_DOWN && (touch_mode & 0xff) == TOUCH_MODE_WAKE && buttons != NULL) {
-			/*
-			 * The display is off and a tap is to wake it. The lock button is what wakes it here:
-			 * press it for the finger, and keep the rest of this touch to ourselves.
-			 */
-			struct hakios_touch press = { .time = t.time, .type = HAKIOS_BUTTON_DOWN, .finger = HAKIOS_BUTTON_LOCK };
-
-			send_button(buttons, &press);
-			press.type = HAKIOS_BUTTON_UP;
-			send_button(buttons, &press);
-			waking |= 1u << (t.finger & 31);
-		} else if (waking & (1u << (t.finger & 31))) {
-			if (t.type == HAKIOS_TOUCH_UP) {
-				waking &= ~(1u << (t.finger & 31));
-			}
+		} else if (tap_to_wake(buttons, &t)) {
+			/* (a touch made while the display was off: never the window server's) */
 		} else {
 			send_touch(screen, &t);
 			if (touch_latency) {
