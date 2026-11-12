@@ -465,6 +465,7 @@ serial	l
 shub	k
 shub_acc_cal	k
 shub_acc_pos	k
+shub_ap_awake	k
 shub_chub_on	k
 shub_cold	k
 shub_div	k
@@ -472,6 +473,7 @@ shub_gyro_cal	k
 shub_hello	k
 shub_keep	k
 shub_log	k
+shub_mag	k
 shub_ms	k
 shub_peek	k
 shub_req_len	k

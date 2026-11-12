@@ -2,7 +2,7 @@
 
 Made by `tools/boot-args.py --markdown`; CI fails if it is out of date with the source (`tools/boot-args.py --check`).
 
-Every argument that the kernel, the loader or user space of this port reads, and which file reads it. **652 arguments**: 561 read by the kernel, 23 by the loader, 85 by user space (one is read in more than one place).
+Every argument that the kernel, the loader or user space of this port reads, and which file reads it. **654 arguments**: 563 read by the kernel, 23 by the loader, 85 by user space (one is read in more than one place).
 
 This is a catalogue of what exists and who reads it, not a manual. What an argument means is in the head of the file that reads it. The stable switches have a symbol in the configuration (`tools/hakios-config.py help SYMBOL`, `docs/configs.md`); the rest are the knobs of bring-up (a driver's steps, pauses, traces, test modes) and can change with the driver. Any of them can be given in a configuration with `CONFIG_BOOTARGS="name=value ..."`, which checks that each name is in this list. What the arguments of the two Metal paths do: [Metal on the Adreno](reference/metal.md#boot-arguments).
 
@@ -374,13 +374,14 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `sccam.turn` | K | `hakios.camera.c` | `CONFIG_SCCAM_TURN` |  |
 | `sccam.w` | K | `hakios.camera.c` | `CONFIG_SCCAM_W` |  |
 
-## Sensors (15)
+## Sensors (17)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
 | `shub` | K | `hakios.ssp.c` | `CONFIG_SHUB` |  |
 | `shub_acc_cal` | K | `hakios.ssp.c` | `CONFIG_SHUB_ACC_CAL` |  |
 | `shub_acc_pos` | K | `hakios.ssp.c` | `CONFIG_SHUB_ACC_POS` |  |
+| `shub_ap_awake` | K | `hakios.ssp.c` | `CONFIG_SHUB_AP_AWAKE` |  |
 | `shub_chub_on` | K | `hakios.ssp.c` | `CONFIG_SHUB_CHUB_ON` |  |
 | `shub_cold` | K | `hakios.ssp.c` | `CONFIG_SHUB_COLD` |  |
 | `shub_div` | K | `hakios.ssp.c` | `CONFIG_SHUB_DIV` |  |
@@ -388,6 +389,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `shub_hello` | K | `hakios.ssp.c` | `CONFIG_SHUB_HELLO` |  |
 | `shub_keep` | K | `hakios.ssp.c` | `CONFIG_SHUB_KEEP` |  |
 | `shub_log` | K | `hakios.ssp.c` | `CONFIG_SHUB_LOG` |  |
+| `shub_mag` | K | `hakios.ssp.c` | `CONFIG_SHUB_MAG` |  |
 | `shub_ms` | K | `hakios.ssp.c` | `CONFIG_SHUB_MS` |  |
 | `shub_peek` | K | `hakios.ssp.c` | `CONFIG_SHUB_PEEK` |  |
 | `shub_req_len` | K | `hakios.ssp.c` | `CONFIG_SHUB_REQ_LEN` |  |
