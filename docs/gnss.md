@@ -326,6 +326,17 @@ no assert, no baseband. **What is left of the build-30 difference is the warm ch
 `shub_cold=0`, then a bare `1c 01` + RESET as the first MEIF message. An assert means the baseband is alive on a warm
 chip and the cold start (LDO37 off for 100 ms) leaves it dead.
 
+**The build-30 assert is explained, and it was our own malformed RPC** (replayed at 21:19, fresh boot, RESET as the
+first MEIF message). The hand-typed `rpc 1e 0e00a593030008000100000000000c00a568` is 18 bytes, not 16: after
+`0300 0800 0100` come `0000 0000` (four bytes where the state takes two), and the framed bytes are 16 while their length
+word says 14 (`0e00`). The ROM's 0x1E decoder takes `[u16 14][14 bytes]`, two bytes are left over, and the dispatcher
+asserts (`rpc_engine.cpp` 222). The replay did exactly that again: ASSERT `rpc_engine.cpp` line 222, args 0 0 008f8c70,
+**one** event (the same ts 05e27434 in all eleven copies, so the chip resends its one assert record), and then the hub
+was dead until a restart. So the assert says nothing about the baseband. `gnsstool meif` builds the frame correctly
+(len 8, 14 framed bytes), and its RESETs never asserted. Remaining fact: after a correct RESET the ME waits for good
+(only RESET and REQ_CURRENT pass), and an IDLE before RESET reports "GPS BB not responding". The baseband never answers
+the ME, and why is still open.
+
 ## The tools (kernel and userland)
 
 - `/dev/hakios-gnss` (made at `shub=6`, root only; `drivers/input/ssp/hakios.ssp.c`): every RPC from the hub that is
