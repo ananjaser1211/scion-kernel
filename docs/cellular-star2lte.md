@@ -233,6 +233,59 @@ size. Everything sits inside the loader's keep-out (0xF0000000-0xFB1FFFFF).
 **The boot-loader size:** cbd passes BOOT's TOC size (0x1e40), with BOOT itself at +0, not after the TOC. That is the
 driver's default now. `shannon_toc=1` and `shannon_blsize=` remain only for experiments.
 
+### The secure request on this boot chain: builds 39-40, and Carbon at EL2
+
+**What the phone answered:**
+
+| Build | Secure request (`0x82000700`) | Answer |
+|---|---|---|
+| 39 | mode 0 | `0x13` CP_INVALID_CP_BASE |
+| 40 | mode `0xF0000000` (base ORed in, as Linux does with `use_cp_memory_map`) | `0xffffffff82001010` |
+
+- The build-40 answer, read as an int, is 0x82001010. It is not one of `smc_err_string`'s codes, nor one cbd knows. cbd
+  special-cases only 0xb for mode 2, and treats 0xfeed02, 0xfeed04, 0xfeed0002 and 0x50e00 as "Invalid Main image".
+- It sits beside the SSS (security engine) SiP IDs: 0x82001011 is the SSS clock, 0x82001012 `SMC_CMD_RANDOM`.
+- The images were byte-exact in both runs. Their crc32s equal RADIO's TOC crc fields.
+- The non-secure request (mode 2) answers 0xb both times, as on Android.
+
+**Is Carbon in the way? No: it passes the call through untouched.** Our EL2 is not Samsung's. The S9 UEFI
+(`devices/starlte/prebuilt/SILICIUM_UEFI.fd`, sha256 c5952455…) carries Project Silicium's
+[Carbon Hypervisor](https://github.com/Project-Silicium/Carbon-Hypervisor) (GPL-2.0, `Hyp.bin`).
+- **Where it sits:** at offset 0xf5b2c of the FD's LZMA firmware volume (the FV at FD+0xb030, 0x245008 bytes
+  unpacked).
+- **What the binary does:** the code there matches the public source (`arch/arm64/start.S`, `smc/smc_handler.c`):
+  - `HCR_EL2` is TSC (bit 19) and RW (bit 31) only. That means no stage-2 translation, so it does not touch
+    memory or addresses.
+  - Every SMC traps to `exception_smc_hook` (ESR EC 0x17). `smc_handler` answers only PSCI IDs (0x84…/0xC4…).
+  - For any other ID it returns "pass through", and the hook issues `smc #0` to EL3 with x0-x7 as the kernel
+    gave them. It copies x0-x3 back unchanged, then `eret`.
+- **So:** 0x82000700, 0x82001011 and 0x82001010 are neither blocked nor rewritten by Carbon. The
+  `0xffffffff82001010` in build 40 is what EL3 put in x0.
+
+**What Carbon does differently from Samsung's EL2.** On entry it makes one SiP call, `0xC2000401` with x1 = 0, and
+then returns to EL1. That is the call Samsung's own hypervisor (uH / RKP) makes to EL3 when its setup is done.
+Samsung's EL2 normally registers its services with EL3 through that call; Carbon registers nothing.
+- If EL3's CP verify path depends on the EL2 Samsung ships, for example to take the CP region out of the kernel's
+  stage-2 before EL3 closes it with the TZASC, then this boot chain is where it fails, not the driver.
+- 0x82001010 is in the same SiP numbering as the SSS calls. It could equally be the security engine's own status (a
+  clock or power domain the verify needs and that is not on).
+- Neither of these is proven.
+
+**What build 41 (170b5a8) measures, to tell these apart:**
+- x0-x3 of the SSS clock call and of the request, logged in full. A non-zero clock answer points at the security
+  engine.
+- The request repeated once with interrupts on, as Linux makes it from the ioctl.
+- The boot region zeroed of the loader's leftovers first. Build 40 found the loader's payload text at +0.
+
+**If the answer is still 0x82001010, the next steps are in the boot chain:**
+1. **Check the security engine.** Compare what Linux has on that Android does not leave to EL3: its CMU and power
+   domain at the time of the call (Apollo's `clk-exynos9810.c`/PMUCAL for SSS).
+2. **Find EL3's dependency on EL2.** Read what EL3 (the `el3_mon` in the phone's bootloader partition, read-only)
+   expects from the `0xC2000401` handshake.
+3. **Change EL2.** Either Carbon forwards what EL3 needs, or Carbon gets a mode that lets Samsung's own EL2 start.
+
+None of that is a driver change. The driver's sequence is cbd's, and its arguments are Linux's.
+
 ## 4. Talking to the CP
 
 `mif_pdata` in the device tree lists the channels (`iod,name` / `iod,id` / `format`). Format 0 is FMT, 1 is RAW, 2 is
