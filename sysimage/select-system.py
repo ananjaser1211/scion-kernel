@@ -103,6 +103,18 @@ KEEP_METALLIB = ('System/Library/Frameworks/QuartzCore.framework/default.metalli
                  # are another 47 MB and nothing in this port has asked for them yet.
                  'System/Library/Frameworks/MetalPerformanceShaders.framework/Frameworks/MPSCore.framework/default.metallib',
                  'System/Library/Frameworks/MetalPerformanceShaders.framework/Frameworks/MPSImage.framework/default.metallib')
+# ... and three machine-learning models ARE wanted, because searchd aborts without them. Spotlight's ranking
+# (SpotlightServices -[... loadCannedModelWithType:error:] -> initSpecificModel:error:) builds its model's
+# path with [[NSBundle bundleForClass:] pathForResource:NAME ofType:@"mlmodelc"] and hands the answer to
+# +[NSURL fileURLWithPath:] unchecked, so a missing model is not a weaker ranking but
+#   *** -[NSURL initFileURLWithPath:]: nil string parameter
+# in searchd, every time a query is ranked: 7 SIGABRTs in the build25 session, 4 in build26b, each burst
+# ending in "service exceeded successive crash limit", and Spotlight (the home screen's search, Settings'
+# search) with nothing behind it. The models are 4.1, 15.1 and 7.2 MB, the first just over SMALL, the other
+# two .DAT besides, which is how the rules below lost them. Which one is asked for depends on the query's
+# kind (the _mail pair for mail), so all three -- 26 MB. An instruction to extract, not Apple's bytes here.
+KEEP_MODELS = tuple(f'System/Library/PrivateFrameworks/SpotlightServices.framework/{name}.mlmodelc/'
+                    for name in ('spotlight_l2', 'spotlight_l2_mail', 'spotlight_l2_recency_mail'))
 # ... and '.dat' and '.bin' are also what these keep the tables in that the user interface is made with:
 # the layouts of the on-screen keyboard, the emoji, the list of public domain suffixes
 DATA_FRAMEWORKS = tuple(f'System/Library/{name}.framework/' for name in (
@@ -203,6 +215,8 @@ def wanted_file(path, size):
         return not path.lower().endswith(SKIP_APP_EXT) and '.mlmodelc/' not in path
     if path.startswith(FRAMEWORKS):
         if path in KEEP_METALLIB or (path.endswith('.metallib') and size <= MAX_METALLIB):
+            return True
+        if path.startswith(KEEP_MODELS):
             return True
         if re.search(r'/(XPCServices|Support|Helpers)/', path):
             return size <= 32 << 20 and not path.lower().endswith(('.png', '.car', '.loctable', '.caml'))
