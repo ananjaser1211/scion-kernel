@@ -175,6 +175,14 @@ gpsd's framing. So the bytes sent were well formed. The likeliest reading is tha
 whose own RPCs then failed. That is not proven. Until it is understood, do not send CONTROL(RESET) again. The next probe
 is CONTROL(REQ_CURRENT), `gnsstool meif 3 0b00`, which changes no state, with the chip's log enabled first.
 
+**MEIF works** (build 31, after a cold power cycle of the chip). The sequence was `rpc 34 1101` (LNA pin mux),
+`rpc 401` `enable_log_to_host_LOG_DEBUG_Overwrite`, `rpc 1c 01`, then `meif 3 0b00` (REQ_CURRENT). The chip answered at
+once in RPC 0x1F with a framed STATE_REPORT (len 20, checksum good): **SETUP -> SETUP**, serial bytes `01 01` (our
+serial, then the chip's own). It sent nothing else in 10 s, and no assert. The hub and the peek reader kept working.
+So the path from the host to the engine is right, and the engine is already in SETUP without a RESET, which is where
+gpsd sends CONFIG_GET / CONFIG_SET / the config string / CONTROL(IDLE). The RESET assert is still unexplained. Skipping
+RESET is the working rule.
+
 ## The tools (kernel and userland)
 
 - `/dev/hakios-gnss` (made at `shub=6`, root only; `drivers/input/ssp/hakios.ssp.c`): every RPC from the hub that is
