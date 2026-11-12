@@ -1890,7 +1890,7 @@ af_up(void)
 		say("exynos_camera: af: %s: the first position not taken: no focus\n", cur->name);
 		return;
 	}
-	delay_for_interval(5, NSEC_PER_MSEC);
+	delay_for_interval(10, NSEC_PER_MSEC);  /* vendor_first_delay 10000 us (star2lte/starlte DT, AK737x) */
 	if (!af_write(AK737X_MODE, AK737X_ACTIVE)) {
 		say("exynos_camera: af: %s: active mode not taken: no focus\n", cur->name);
 		return;
