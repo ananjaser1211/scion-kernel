@@ -44,8 +44,16 @@ RUST=${HAKIOS_RUST:-$ROOT/xnu-deps/rust}
 WHAT=${1:-mac}
 # Xcode's own tools: called from userland/build.sh, PATH starts with the kernel build's stand-ins (xnu-deps/host/bin: an xcrun that
 # answers the kernel's SDK, a clang that targets it), and Homebrew's binutils may come before Xcode's strip and nm.
+#
+# On Linux (the WSL build host) there is no Xcode: only `ios` is built, linked by the kernel build's xnu-clang (cctools ld64) against
+# THEOS's iPhoneOS16.5 SDK and stripped by its cctools strip. The self-test's shaders need Xcode's Metal compiler, so the library is
+# built without them (nmb_selftest then has no fixtures), and m2v_test with its metallib is not made; the plug-in's own check on the
+# phone is userland/src/metalvk/metal_tri.m, whose shaders are hand-written AIR (tools/metal/air, tools/metal/mkmetallib.py).
+HOSTBIN=$ROOT/xnu-deps/host/bin
 PATH=$(echo "$PATH" | tr ':' '\n' | grep -v '/xnu-deps/host/bin$' | paste -sd: -)
 XCRUN=/usr/bin/xcrun
+LINUX=
+[ "$(uname)" = Darwin ] || LINUX=1
 mkdir -p "$B"
 cd "$B"
 
@@ -59,7 +67,12 @@ if [ "$(git -C AdrenoMetal rev-parse HEAD 2>/dev/null)" != "$ADRENOMETAL_REV" ];
 fi
 if [ ! -d src/.git ]; then
 	git clone -q --filter=blob:none --no-checkout https://github.com/steelbrain/metal2vulkan.git src
-	git -C src sparse-checkout set --cone crates/metal2vulkan crates/metal2vulkan-air crates/metal2vulkan-runtime
+fi
+# `init --cone` first: git before 2.35 takes `set --cone` as a pattern named --cone, and the checkout then lacks the workspace's
+# Cargo.toml at the top (the crates inherit their edition from it). A checkout made that way is put right here as well.
+if [ ! -f src/Cargo.toml ] || [ "$(git -C src sparse-checkout list 2>/dev/null | head -1)" = --cone ]; then
+	git -C src sparse-checkout init --cone
+	git -C src sparse-checkout set crates/metal2vulkan crates/metal2vulkan-air crates/metal2vulkan-runtime
 fi
 PATCHES=$( { echo "$M2V_REV ${M2V_PATCHES:-1}"; [ "${M2V_PATCHES:-1}" = 0 ] || cat AdrenoMetal/bridge/patches/*.patch;
 	cat "$ROOT"/tools/metal/m2v/*.patch 2>/dev/null || true; } | shasum -a 256 | cut -c1-16)
@@ -98,6 +111,10 @@ export M2V_RUNTIME_ID="metal2vulkan-${M2V_REV:0:12}-$PATCHES"
 # the self-test's shaders as AIR bitcode, for the platform the library is for
 air() {
 	local sdk=$1 target=$2
+	if [ -n "$LINUX" ]; then
+		echo "mk-metal2vulkan.sh: no Xcode here: the library is built without the self-test's shaders"
+		return
+	fi
 	for s in m2v_selftest m2v_constant; do
 		$XCRUN -sdk "$sdk" metal -target "$target" -c -o "air/$s.$sdk.air" "$ROOT/tools/metal/$s.metal"
 	done
@@ -127,27 +144,41 @@ ios)
 		[ -d "$SDK" ] || SDK=$($XCRUN --sdk iphoneos --show-sdk-path)
 	fi
 	air iphoneos air64-apple-ios16.0
-	# The SDK for the library's own link only (SDKROOT would reach the build scripts, which are built for this Mac): rustc names
-	# xcrun's iPhoneOS SDK first, and the later -isysroot is the one the linker takes.
-	(cd bridge && IPHONEOS_DEPLOYMENT_TARGET=16.0 M2V_INSTALL_NAME=/redwood/lib/libmetal2vulkan.dylib \
-		CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS="-C link-arg=-isysroot -C link-arg=$SDK" \
-		CARGO_TARGET_DIR="$B/target-ios" "$CARGO" build -q --locked --release --target aarch64-apple-ios)
+	if [ -n "$LINUX" ]; then
+		# rustc's Apple targets take the SDK from SDKROOT where there is no xcrun (the build scripts are built for Linux and do
+		# not read it), and link with the C compiler they are given: the kernel build's, which drives cctools' ld64
+		(cd bridge && IPHONEOS_DEPLOYMENT_TARGET=16.0 M2V_INSTALL_NAME=/redwood/lib/libmetal2vulkan.dylib SDKROOT="$SDK" \
+			CARGO_TARGET_AARCH64_APPLE_IOS_LINKER="$HOSTBIN/xnu-clang" \
+			CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS="-C link-arg=-isysroot -C link-arg=$SDK" \
+			CARGO_TARGET_DIR="$B/target-ios" "$CARGO" build -q --locked --release --target aarch64-apple-ios)
+		STRIP="$HOSTBIN/strip" NM="$HOSTBIN/nm"
+	else
+		# The SDK for the library's own link only (SDKROOT would reach the build scripts, which are built for this Mac): rustc names
+		# xcrun's iPhoneOS SDK first, and the later -isysroot is the one the linker takes.
+		(cd bridge && IPHONEOS_DEPLOYMENT_TARGET=16.0 M2V_INSTALL_NAME=/redwood/lib/libmetal2vulkan.dylib \
+			CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS="-C link-arg=-isysroot -C link-arg=$SDK" \
+			CARGO_TARGET_DIR="$B/target-ios" "$CARGO" build -q --locked --release --target aarch64-apple-ios)
+		STRIP="$XCRUN strip" NM="$XCRUN nm"
+	fi
 	mkdir -p out/ios
-	# Xcode's strip (a GNU strip found first on PATH turns a Mach-O into nonsense); -x keeps the exported symbols
-	$XCRUN strip -x -o out/ios/libmetal2vulkan.dylib target-ios/aarch64-apple-ios/release/libmetal2vulkan_bridge.dylib
+	# Xcode's or cctools' strip (a GNU strip found first on PATH turns a Mach-O into nonsense); -x keeps the exported symbols
+	$STRIP -x -o out/ios/libmetal2vulkan.dylib target-ios/aarch64-apple-ios/release/libmetal2vulkan_bridge.dylib
 	[ -n "$KEEP" ] || rm -rf target-ios
 	echo "$M2V_RUNTIME_ID" > out/ios/built-from
 	# what userland/build.sh METAL=vk compares to tell this library from one built of other sources (the same command there)
 	(cd "$ROOT/userland" && cat ../tools/metal/mk-metal2vulkan.sh ../tools/metal/bridge/* ../tools/metal/*.metal \
 		../tools/metal/m2v_test.c ../tools/metal/m2v/*.patch 2>/dev/null | sha256sum) > out/ios/built-from-tree
 	# the same test as on the Mac, for the guest (userland/build.sh METAL=vk puts it in /redwood/bin, its metallib in /redwood/share;
-	# userland/rc.jobs.metalvk runs it on the guest's Vulkan driver)
-	$XCRUN -sdk iphoneos metal -target air64-apple-ios16.0 -c -o air/m2v_test.iphoneos.air "$ROOT/tools/metal/m2v_test.metal"
-	$XCRUN -sdk iphoneos metallib -o out/ios/m2v_test.metallib air/m2v_test.iphoneos.air
-	$XCRUN clang -target arm64-apple-ios16.0 -isysroot "$SDK" -O1 -Wall -Wextra -Iout/include -o out/ios/m2v_test \
-		"$ROOT/tools/metal/m2v_test.c" out/ios/libmetal2vulkan.dylib
-	echo "mk-metal2vulkan.sh: $B/out/ios/libmetal2vulkan.dylib ($(stat -f %z out/ios/libmetal2vulkan.dylib) bytes," \
-		"$($XCRUN nm -gU out/ios/libmetal2vulkan.dylib | grep -c ' _nmb_') nmb_* functions)"
+	# userland/rc.jobs.metalvk runs it on the guest's Vulkan driver); its shaders need Xcode, so not on Linux
+	rm -f out/ios/m2v_test out/ios/m2v_test.metallib
+	if [ -z "$LINUX" ]; then
+		$XCRUN -sdk iphoneos metal -target air64-apple-ios16.0 -c -o air/m2v_test.iphoneos.air "$ROOT/tools/metal/m2v_test.metal"
+		$XCRUN -sdk iphoneos metallib -o out/ios/m2v_test.metallib air/m2v_test.iphoneos.air
+		$XCRUN clang -target arm64-apple-ios16.0 -isysroot "$SDK" -O1 -Wall -Wextra -Iout/include -o out/ios/m2v_test \
+			"$ROOT/tools/metal/m2v_test.c" out/ios/libmetal2vulkan.dylib
+	fi
+	echo "mk-metal2vulkan.sh: $B/out/ios/libmetal2vulkan.dylib ($(wc -c < out/ios/libmetal2vulkan.dylib) bytes," \
+		"$($NM -gU out/ios/libmetal2vulkan.dylib | grep -c ' _nmb_') nmb_* functions)"
 	;;
 *)
 	echo "usage: $0 fetch|mac|ios" >&2
