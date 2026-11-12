@@ -3892,7 +3892,10 @@ s9dev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 		break;
 	case HAKIOS_CAMERA_FOCUS:
 		/* the lens to c.a (0-1023): written by the stream's thread at the next frame (af_move) */
-		af_pending = c.a > 1023 ? 1023 : c.a;
+		/* (HAKIOS_CAMERA_NO_FOCUS is no position: it would clamp to 1023, the macro end) */
+		if (c.a != HAKIOS_CAMERA_NO_FOCUS) {
+			af_pending = c.a > 1023 ? 1023 : c.a;
+		}
 		break;
 	case HAKIOS_CAMERA_KEEP:
 		break;
