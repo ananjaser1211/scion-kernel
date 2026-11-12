@@ -139,6 +139,10 @@ const char *hakios_exynos_camera_shot(__unused uint32_t n, __unused int pattern)
 #ifndef HAKIOS_EXYNOS_TEE
 void hakios_exynos_tee_init(void) {}
 #endif
+#ifndef HAKIOS_SHANNON
+void hakios_shannon_init(void);
+void hakios_shannon_init(void) {}
+#endif
 #ifndef HAKIOS_EXYNOS_IRIS
 void hakios_exynos_iris_init(void) {}
 void hakios_exynos_iris_quiesce(void) {}

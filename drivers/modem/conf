@@ -14,3 +14,11 @@ driver MODEM
 	requires QMI UFS
 	help    the modem (modem=1): started, its file systems served from the flash, the IPA's data path as en1,
 	help    the SIM and the network registration. Research; needs fw-modem/ from the phone
+
+driver SHANNON
+	file    bsd/dev/hakios.shannon.c
+	requires UFS
+	default n
+	help    the Galaxy S9/S9+ Shannon modem (the Exynos 9810 CP), a step at a time (shannon=N): 1 its registers and the
+	help    RADIO partition headers, read only; 2 RADIO loaded into the CP memory and verified by EL3 (SMC 0x82000700),
+	help    not started; 3 started and its mailbox listened to for 60 s. docs/cellular-star2lte.md

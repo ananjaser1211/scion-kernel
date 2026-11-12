@@ -293,6 +293,7 @@ static const struct cdevsw touch_cdevsw = {
 
 extern void hakios_esslog_start(void);
 extern void hakios_exynos_dvfs_start(void);   /* drivers/soc/exynos/hakios.exynos_acpm.c */
+extern void hakios_shannon_init(void);    /* drivers/modem/hakios.shannon.c (a stub in hakios.stubs.c without CONFIG_HAKIOS_SHANNON) */
 void
 hakios_input_init(void)
 {
@@ -331,6 +332,7 @@ hakios_input_init(void)
 	hakios_wifi_init();
 	hakios_adsp_init();
 	hakios_mpss_init();
+	hakios_shannon_init();          /* drivers/modem/hakios.shannon.c: the Galaxy S9 modem (shannon=N) */
 }
 
 /*

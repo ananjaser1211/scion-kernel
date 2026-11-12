@@ -87,6 +87,7 @@ modem    bsd/dev/hakios.cell.c
 modem    bsd/dev/hakios.qmi.c
 modem    bsd/dev/hakios.nas.c
 modem    bsd/dev/hakios.ipa.c
+modem    bsd/dev/hakios.shannon.c
 
 net      bsd/dev/hakios.net.c
 virtio   bsd/dev/hakios.virtio_net.c

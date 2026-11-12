@@ -112,6 +112,9 @@ CONFIG_HAKIOS_QMI=y
 # the modem (modem=1): started, its file systems served from the flash, the IPA's data path as en1, the SIM and the ... [hakios.mpss.c, hakios.cell.c, hakios.nas.c, hakios.ipa.c; requires CONFIG_HAKIOS_QMI, CONFIG_HAKIOS_UFS]
 CONFIG_HAKIOS_MODEM=y
 
+# the Galaxy S9/S9+ Shannon modem (the Exynos 9810 CP), a step at a time (shannon=N): 1 its registers and the RADIO ... [hakios.shannon.c; requires CONFIG_HAKIOS_UFS]
+# CONFIG_HAKIOS_SHANNON is not set
+
 # the battery: kern.hakios.battery_*, and HakiosBattery, the IOPMPowerSource Darwin reads the charge from (the state ... [hakios.battery.c, hakios.battery.cpp]
 CONFIG_HAKIOS_BATTERY=y
 
