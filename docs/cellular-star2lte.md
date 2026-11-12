@@ -1,4 +1,4 @@
-# Cellular on the Galaxy S9+ (star2lte): feasibility, plan, step 1
+# Cellular on the Galaxy S9+ (star2lte): feasibility, status, plan
 
 Phase 1, 13 November 2026. iOS 16.5 (20F66, the iPhone X's D22 userland) on an SM-G965N (Exynos 9810). The modem is
 Samsung's Shannon, built into the SoC as the "CP". Today the CP never boots. CommCenter is in `userland/mkjobs.py`'s DENY
@@ -9,7 +9,100 @@ Exynos SiP SMCs already work from this kernel (MFC, Mali, camera and TEE all mak
 Samsung protocol (SIPC5 framing, IPC 4.x messages), but nobody has implemented it outside Samsung's binaries for this
 generation. Running Apple's CommCenter on top of it is not realistic. The way to go is redwood's: the kernel owns the
 modem and publishes `kern.hakios.cellular_*`, and the status bar reads them. A small CommCenter stand-in can come later,
-to answer CoreTelephony. Step 1 (`shannon=1..3`, `drivers/modem/hakios.shannon.c`) is written and waits for a build.
+to answer CoreTelephony. Where the work stands is the next section.
+
+## Status, 13 November 2026 (end of day; definitive)
+
+The driver is `drivers/modem/hakios.shannon.c` (`CONFIG_HAKIOS_SHANNON`: on for star2lte, off in common). **It is inert
+without `shannon=`**: `hakios_shannon_init()` returns before mapping, reading or starting anything, and the release build
+boots without the argument. Nothing in this work writes to flash. It reads the phone's own RADIO partition, and EFS only
+with `shannon_nv=1`.
+
+### What works on the phone
+
+| Build | Kernel | Run | Result |
+|---|---|---|---|
+| 36 | 540c944 | `shannon=1` | Step 1, read only, clean. CP cold: CP_CTRL_NS 0x2016a0, CP_CTRL_S 0, CP_STAT 1, RESET_SEQUENCER_STATUS 0. RADIO TOC and CP memory map read; both match the device tree and the backup. |
+| 37 | fbd8bcb | `shannon=2` | Panic in `thread_setrun`: thread bound to a processor not yet up. Fixed in 43ad5a3 (no binding; interrupts off on a core that is not CPU 0). |
+| 38 | 43ad5a3 | `shannon=2` | `cal_cp_init` works (CP_CTRL_S → 0x8, RESET_SEQUENCER_STATUS 5 at once). Mode-2 request from MPIDR 0x80000103 answered 0xb CP_NOT_WORKING, as on Android. Loading then stopped on a wrong read-return check; fixed in 9a260f3. |
+| 39 | 9a260f3 | `shannon=2` | Same init and mode-2 answer. BOOT, MAIN, VSS loaded at +0, +0x10000, +0x7900000; their crc32s equal RADIO's TOC crcs (0x81b03fbb, 0x134cb2fd, 0x5e715799). NV 0xFF at +0x4900000. Secure request (0, 0x1e40, 0x24075c0) answered **0x13 CP_INVALID_CP_BASE**. |
+| 40 | d3f6a75 | `shannon=2` | Same, with the base in the mode (0xF0000000, 0x1e40, 0x24075c0). Answer: **0xffffffff82001010**, which is no CP_ code. The region held the loader's payload leftovers before loading. |
+
+The mode-2 call leaves the PMU at CP_CTRL_NS 0xc02016a2 and CP_STAT 0x10. That state does not survive the restart into
+TWRP: build 39 found the CP cold again.
+
+### The open problem: the secure verify
+
+- **Not the caller.** EL3 rejects the secure request (`SMC 0x82000700`, mode 0 | base) with 0x82001010. Our call is
+  what Linux makes: a plain `dsb; smc #0`, the same arguments, and the int compared against `smc_err_string`.
+- **Not Carbon's code.** Carbon (our EL2) passes the call through untouched. See "The secure request on this boot
+  chain" in §3.
+- **Suspect 1: no Samsung EL2.** Carbon registers nothing with EL3 in the `0xC2000401` handshake that Samsung's EL2
+  (uH/RKP) makes. EL3's verify may depend on Samsung's EL2.
+- **Suspect 2: the security engine.** 0x82001010 neighbours the SSS IDs 0x82001011 (clock) and 0x82001012, so it may be
+  the security engine's status: a clock or power domain off.
+- **Next diagnostic, never run.** 170b5a8 is committed and ready. It logs x0-x3 of the SSS clock calls and of the
+  request, retries once with interrupts on, and zeroes the boot region first. It was not flashed today, so build 41 is
+  the next phone run: `shannon=2`.
+
+### Next steps, in order
+
+1. **Get the verify past EL3.**
+   - Run 170b5a8 (`shannon=2`).
+   - If the answer is still 0x82001010, check the SSS clock and power domain at the call (Apollo `clk-exynos9810.c`,
+     PMUCAL).
+   - Read what the phone's EL3 expects from the `0xC2000401` handshake. Read the bootloader partition read-only; do not
+     flash it.
+   - Decide between a Carbon change (it forwards or provides what EL3 needs) and letting Samsung's EL2 start. This is
+     boot-chain work, not driver work.
+   - Fallbacks to try once: `shannon_toc=1` (TOC at +0, BOOT at +0x200) and `shannon_base=0`.
+2. **Step 3 (written, never run): `shannon=3`.**
+   - MODEM_ON (AP status word, AP2CP_CFG = 1, only once RESET_SEQUENCER_STATUS is 5) and BOOT_ON (CP status within 2 s).
+   - DL_START (legacy IPC map at 0xF8000000 reset, magic 0x424F4F54, AP status 1).
+   - The UDL handshake (0x900d → 0xa00d, 0x9f00 → 0xaf00 as SIPC5 frames `FC D7 08 00` + word in the RAW queues).
+   - Then 60 s of the CP mailbox (PHONE_START, INIT_START).
+3. **SBD rings.** Lay out the shared-buffer descriptors in the IPC region (`link_device_memory_sbd.c`), answer
+   INIT_START with PIF_INIT_DONE, and then INIT_END.
+4. **RFS server** for `umts_rfs0`. Serve the CP's `/efs` files from the phone's EFS (`hakios_partition_file`), with
+   writes kept in RAM, the redwood RMTFS policy. Give the CP its real NV (`shannon_nv=1`) only then.
+5. **IPC 4.x client** on `umts_ipc0`: PWR (phone on), SEC (SIM status), NET (registration, serving network), DISP/MISC
+   (signal).
+6. **Publish `kern.hakios.cellular_*`** (up, registered, bars, dBm, operator; the redwood names). The SpringBoard hook
+   (`userland/src/inject_sb.c`) and the telephonyd stand-in for `com.apple.commcenter.coretelephony.xpc` (another
+   agent's) read them.
+   - The names must not be defined by two drivers: `CONFIG_HAKIOS_MODEM` (redwood) and `CONFIG_HAKIOS_SHANNON` are never
+     both on.
+7. **Data, then SMS, then calls.** A GPRS PDP context and `rmnet0` into `hakios.cell.c`'s `en1`; then SMS; then calls,
+   which need ABOX's CPU running.
+
+### Boot arguments (all off unless given)
+
+| Argument | Effect |
+|---|---|
+| `shannon=1` | Read only: CP_CTRL via the read SMC, PMU CP words, mailbox INTMR0, RADIO TOC and memory map |
+| `shannon=2` | cal_cp_init, SMC(2,0,0), BOOT/MAIN/VSS/NV loaded, secure SMC; CP not started |
+| `shannon=3` | Step 2, then MODEM_ON, BOOT_ON, DL_START, the UDL handshake, 60 s of mailbox |
+| `shannon_peek=1` | Step 1 also reads the CP region's first page |
+| `shannon_regs=1` | Step 1 also reads the CP SYS_PWR registers and more mailbox words |
+| `shannon_nv=1` | NV from `EFS:/nv_data.bin` (size logged, never contents); default 0xFF |
+| `shannon_base=0` | Secure request without the base in its mode (default: with) |
+| `shannon_toc=1` | TOC at +0 and BOOT at +0x200 (experiment) |
+| `shannon_blsize=N` | Boot-loader size for the secure request (default BOOT's TOC size, 0x1e40) |
+| `shannon_again=0` | No second try with interrupts on (170b5a8) |
+| `shannon_zero=0` | Do not zero the boot region before loading (170b5a8) |
+| `shannon_sysrev=N` | Board revision in the AP status word (default 0) |
+| `shannon_udl_irq=1` | Also ring the mailbox after each UDL word |
+
+### Risks
+
+- **External aborts on CP-side registers.** AP2CP_CFG read with the CP cold panicked build 35. Every MMIO read is now
+  logged before it is made, and AP2CP_CFG is touched only after a successful verify.
+- **Scheduler state.** Never bind threads to processors from this driver (build 37).
+- **What the SMCs change.** They change PMU state for the CP until the next power cycle. A failed secure request leaves
+  the CP powered but not running. It has no lasting effect: the CP was cold again after each restart.
+- **Identity data.** NV holds the phone's identity. It is never logged, and it is only loaded with `shannon_nv=1`. With
+  no RFS server nothing the CP writes reaches flash.
+- **Cost of a failed run.** Each one costs a TWRP round trip. Run one step at a time, `shannon=1` → `2` → `3`.
 
 ## 1. How redwood does it (and what carries over)
 
