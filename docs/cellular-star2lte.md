@@ -206,7 +206,8 @@ in `hakios.stubs.c`. It needs UFS (`ufs=2`).
 
 | Argument | Effect |
 |---|---|
-| `shannon=1` | Read only. Logs PMU CP registers (CP_STAT, CENTRAL_SEQ, RESET_SEQUENCER_STATUS, CP SYS_PWR_REGs, CP_ADDR_CFG0-3), CP_CTRL_NS/S via SMC READ_CTRL, AP2CP_CFG, the mailbox, then RADIO's TOC and the MEM map |
+| `shannon=1` | Read only, each MMIO read logged before it is made: CP_CTRL_NS/S via SMC READ_CTRL, PMU CP_STAT, CENTRAL_SEQ conf/status, RESET_SEQUENCER_STATUS (what Samsung reads at any time), mailbox INTMR0 (read by Linux at boot), then RADIO TOC and MEM map. **Not** AP2CP_CFG: build 35 showed that reading it with the CP never initialised is a synchronous external abort (panic in `log_cp_registers`). It is touched only in step 3, once RESET_SEQUENCER_STATUS is 5 and the verify call passed, as `ss310ap_on` does |
+| `shannon_regs=1` | Also the CP SYS_PWR_REGs and the other mailbox words (INTSR0/INTMR1/INTSR1, words 0-3) |
 | `shannon_peek=1` | Also logs a few words of the first page at `0xF0000000` (what the boot loader left; Linux reads the same page at probe time) |
 | `shannon=2` | Then loads TOC+BOOT, MAIN and VSS from RADIO into `0xF0000000` (logging crc32s), zeroes NV, runs `cal_cp_init` if needed, makes the verify SMC and logs its answer by name. Does not start the CP |
 | `shannon_nv=1` | With 2-3: NV from `EFS:/nv_data.bin` (size logged, never contents) |

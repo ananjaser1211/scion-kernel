@@ -17,9 +17,16 @@
  *      (SBD) in the IPC region and answers PIF_INIT_DONE, then INIT_END once rild's channels are open.
  *
  * The steps here:
- *   shannon=1  read only: the RADIO partition's table of contents and the CP's memory map (firmware headers, nothing of
- *              the phone's identity), the PMU's CP registers, CP_CTRL_NS/_S through the read SMC, AP2CP_CFG, and the
- *              mailbox. shannon_peek=1 also reads the first page of the CP's memory (what the boot loader left there).
+ *   shannon=1  read only: CP_CTRL_NS/_S through the read SMC, the four PMU words Samsung's exynos_print_cp_status reads
+ *              at any time (CP_STAT, CENTRAL_SEQ_CP conf and status, RESET_SEQUENCER_STATUS), the mailbox's INTMR0 (the
+ *              one word Linux reads at boot, mbox_request_irq, before the CP is on), then RADIO's table of contents and
+ *              the CP's memory map (firmware headers, nothing of the phone's identity). Each MMIO read is said before it
+ *              is made, so a fault names its register. shannon_regs=1 adds the CP SYS_PWR_REGs and the other mailbox
+ *              words; shannon_peek=1 the first page of the CP's memory (what the boot loader left there).
+ *              NOT read before the CP is initialised: AP2CP_CFG (0x14820000). It is in the CP's block, and a read with
+ *              the CP never initialised is a synchronous external abort (build 35: panic in log_cp_registers, FAR at
+ *              that page's offset 0). Samsung's kernel touches it only in ss310ap_on, after the security request has
+ *              run cal_cp_init; so does this driver (step 3, RESET_SEQUENCER_STATUS == 5 and the verify call passed).
  *   shannon=2  ... and steps 1 and 2: the images loaded, the CP initialised if it is not, and the SMC; its answer logged
  *              by name. The CP is not started. shannon_nv=1 loads EFS:/nv_data.bin into NV (its size is logged, never
  *              its contents); without it NV is left zero and the CP is expected to rebuild its defaults.
@@ -60,12 +67,10 @@ void hakios_shannon_init(void);
 #define PMU_PA                  0x14060000u     /* the 9810's PMU (alive block) */
 #define PMU_SIZE                0x8000u
 #define PMU_CP_STAT             0x0038u
-#define PMU_CP_DEBUG            0x003Cu
 #define PMU_CENTRAL_SEQ_CP_CONF 0x0280u
 #define PMU_CENTRAL_SEQ_CP_STAT 0x0284u         /* [23:16]: 0x80 reset asserted, 0 running */
 #define PMU_RESET_SEQ_STATUS    0x0504u         /* [2:0] == 5: the CP has been initialised (cal_cp_status) */
 #define PMU_CP_SYS_PWR_FIRST    0x1320u         /* RESET_AHEAD_CP .. CP_DUMP_PC _SYS_PWR_REG, seven words */
-#define PMU_CP_ADDR_CFG0        0x7140u         /* four words: the CP's window into DRAM, set by EL3 */
 
 #define GICD_PENDING_PA         0x10101000u     /* pmucal: 0x10100000 + 0x1238, bit 28, waited on after the CP's init */
 #define GICD_PENDING_OFF        0x0238u
@@ -246,28 +251,68 @@ map_registers(void)
 	if (pmu == NULL) {
 		pmu = (volatile uint8_t *)ml_io_map(PMU_PA, PMU_SIZE);
 		mbox = (volatile uint8_t *)ml_io_map(MBOX_PA, MBOX_SIZE);
-		ap2cp_cfg = (volatile uint8_t *)ml_io_map(AP2CP_CFG_PA, 0x1000);
 	}
+}
+
+static bool
+cp_initialised(void)
+{
+	return pmu != NULL && (rd(pmu, PMU_RESET_SEQ_STATUS) & 7) == 5;
+}
+
+/* One MMIO read, said first: if it faults, the last line in the log names it. */
+static uint32_t
+peek(const char *when, const char *name, volatile uint8_t *base, uint32_t pa, uint32_t offset)
+{
+	uint32_t value;
+
+	say("shannon: %s: read %s (%#x)\n", when, name, pa + offset);
+	value = rd(base, offset);
+	say("shannon: %s:   %s = %#x\n", when, name, value);
+	return value;
 }
 
 static void
 log_cp_registers(const char *when)
 {
-	uint32_t ns = 0, s = 0;
-	bool have_ns = cp_ctrl_read(CP_CTRL_NS, &ns), have_s = cp_ctrl_read(CP_CTRL_S, &s);
+	uint32_t ns = 0, s = 0, regs = 0;
+	static const char *const pwr_names[] = {
+		"RESET_AHEAD_CP_SYS_PWR_REG", "CLEANY_BUS_CP_SYS_PWR_REG", "LOGIC_RESET_CP_SYS_PWR_REG",
+		"TCXO_GATE_CP_SYS_PWR_REG", "CP_DISABLE_ISO_SYS_PWR_REG", "CP_RESET_ISO_SYS_PWR_REG", "CP_DUMP_PC_SYS_PWR_REG",
+	};
 
-	say("shannon: %s: CP_CTRL_NS %s%#x CP_CTRL_S %s%#x CP_STAT %#x CP_DEBUG %#x CENTRAL_SEQ_CP conf %#x status %#x "
-	    "RESET_SEQUENCER_STATUS %#x AP2CP_CFG %#x\n", when, have_ns ? "" : "(unread) ", ns, have_s ? "" : "(unread) ", s,
-	    rd(pmu, PMU_CP_STAT), rd(pmu, PMU_CP_DEBUG), rd(pmu, PMU_CENTRAL_SEQ_CP_CONF), rd(pmu, PMU_CENTRAL_SEQ_CP_STAT),
-	    rd(pmu, PMU_RESET_SEQ_STATUS), rd(ap2cp_cfg, 0));
-	say("shannon: %s: CP SYS_PWR_REGs %#x %#x %#x %#x %#x %#x %#x; CP_ADDR_CFG %#x %#x %#x %#x\n", when,
-	    rd(pmu, PMU_CP_SYS_PWR_FIRST), rd(pmu, PMU_CP_SYS_PWR_FIRST + 4), rd(pmu, PMU_CP_SYS_PWR_FIRST + 8),
-	    rd(pmu, PMU_CP_SYS_PWR_FIRST + 12), rd(pmu, PMU_CP_SYS_PWR_FIRST + 16), rd(pmu, PMU_CP_SYS_PWR_FIRST + 20),
-	    rd(pmu, PMU_CP_SYS_PWR_FIRST + 24), rd(pmu, PMU_CP_ADDR_CFG0), rd(pmu, PMU_CP_ADDR_CFG0 + 4),
-	    rd(pmu, PMU_CP_ADDR_CFG0 + 8), rd(pmu, PMU_CP_ADDR_CFG0 + 12));
-	say("shannon: %s: mailbox INTMR0 %#x INTSR0 %#x INTMR1 %#x INTSR1 %#x; words 0-3 %#x %#x %#x %#x\n", when,
-	    rd(mbox, MBOX_INTMR0), rd(mbox, MBOX_INTSR0), rd(mbox, MBOX_INTMR1), rd(mbox, MBOX_INTSR1),
-	    rd(mbox, MBOX_ISSR(0)), rd(mbox, MBOX_ISSR(1)), rd(mbox, MBOX_ISSR(2)), rd(mbox, MBOX_ISSR(3)));
+	(void)PE_parse_boot_argn("shannon_regs", &regs, sizeof(regs));
+	say("shannon: %s: CP_CTRL_NS and CP_CTRL_S through SMC %#x READ_CTRL\n", when, SMC_CP);
+	if (cp_ctrl_read(CP_CTRL_NS, &ns)) {
+		say("shannon: %s:   CP_CTRL_NS = %#x\n", when, ns);
+	}
+	if (cp_ctrl_read(CP_CTRL_S, &s)) {
+		say("shannon: %s:   CP_CTRL_S = %#x\n", when, s);
+	}
+	(void)peek(when, "PMU CP_STAT", pmu, PMU_PA, PMU_CP_STAT);
+	(void)peek(when, "PMU CENTRAL_SEQ_CP_CONFIGURATION", pmu, PMU_PA, PMU_CENTRAL_SEQ_CP_CONF);
+	(void)peek(when, "PMU CENTRAL_SEQ_CP_STATUS", pmu, PMU_PA, PMU_CENTRAL_SEQ_CP_STAT);
+	(void)peek(when, "PMU RESET_SEQUENCER_STATUS", pmu, PMU_PA, PMU_RESET_SEQ_STATUS);
+	(void)peek(when, "mailbox INTMR0", mbox, MBOX_PA, MBOX_INTMR0);
+	if (regs) {
+		for (uint32_t i = 0; i < 7; i++) {
+			(void)peek(when, pwr_names[i], pmu, PMU_PA, PMU_CP_SYS_PWR_FIRST + 4 * i);
+		}
+		(void)peek(when, "mailbox INTSR0", mbox, MBOX_PA, MBOX_INTSR0);
+		(void)peek(when, "mailbox INTMR1", mbox, MBOX_PA, MBOX_INTMR1);
+		(void)peek(when, "mailbox INTSR1", mbox, MBOX_PA, MBOX_INTSR1);
+		for (uint32_t i = 0; i < 4; i++) {
+			char name[24];
+
+			snprintf(name, sizeof(name), "mailbox word %u", i);
+			(void)peek(when, name, mbox, MBOX_PA, MBOX_ISSR(i));
+		}
+	}
+	if (ap2cp_cfg != NULL) {
+		(void)peek(when, "AP2CP_CFG", ap2cp_cfg, AP2CP_CFG_PA, 0);
+	} else {
+		say("shannon: %s: AP2CP_CFG not read (only once the CP is initialised and verified: step 3)\n", when);
+	}
 }
 
 static const struct toc_entry *
@@ -444,13 +489,25 @@ start_and_listen(void)
 	uint64_t ap;
 
 	(void)PE_parse_boot_argn("shannon_sysrev", &sysrev, sizeof(sysrev));
+	if (!cp_initialised()) {
+		say("shannon: RESET_SEQUENCER_STATUS %#x is not 5: the CP is not initialised, AP2CP_CFG is not touched; not started\n",
+		    rd(pmu, PMU_RESET_SEQ_STATUS));
+		return;
+	}
+	say("shannon: mapping AP2CP_CFG (%#x): the CP is initialised\n", AP2CP_CFG_PA);
+	ap2cp_cfg = (volatile uint8_t *)ml_io_map(AP2CP_CFG_PA, 0x1000);
+	if (ap2cp_cfg == NULL) {
+		say("shannon: AP2CP_CFG could not be mapped; not started\n");
+		return;
+	}
 	for (int i = 0; i < MBOX_WORDS; i++) {
 		wr(mbox, MBOX_ISSR(i), 0);
 	}
 	ap = (uint64_t)(sysrev & 0xff) << 6 | 0u << 14 /* ds_det: one SIM */ | 1u << 5 /* pda_active */;
 	wr(mbox, MBOX_ISSR(MBX_AP2CP_STATUS), (uint32_t)ap);
-	say("shannon: the AP's status word %#x (sys_rev %u, one SIM, pda_active); AP2CP_CFG was %#x\n", (uint32_t)ap, sysrev,
-	    rd(ap2cp_cfg, 0));
+	say("shannon: the AP's status word %#x (sys_rev %u, one SIM, pda_active)\n", (uint32_t)ap, sysrev);
+	(void)peek("start", "AP2CP_CFG", ap2cp_cfg, AP2CP_CFG_PA, 0);
+	say("shannon: writing AP2CP_CFG = 1\n");
 	wr(ap2cp_cfg, 0, AP2CP_CFG_DONE);
 	say("shannon: AP2CP_CFG = 1 (reads %#x): the CP runs\n", rd(ap2cp_cfg, 0));
 	IOSleep(300);
@@ -505,9 +562,10 @@ shannon_thread(void *arg, __unused wait_result_t wr_result)
 {
 	uint32_t step = (uint32_t)(uintptr_t)arg, peek = 0;
 
+	say("shannon: thread up; mapping the PMU (%#x) and the mailbox (%#x)\n", PMU_PA, MBOX_PA);
 	map_registers();
-	if (pmu == NULL || mbox == NULL || ap2cp_cfg == NULL) {
-		say("shannon: the PMU, the mailbox or AP2CP_CFG could not be mapped\n");
+	if (pmu == NULL || mbox == NULL) {
+		say("shannon: the PMU or the mailbox could not be mapped\n");
 		return;
 	}
 	log_cp_registers("as found");
