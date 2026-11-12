@@ -36,6 +36,8 @@
  *            by 4 again in the SPI, about 5.5 MHz; Samsung runs it up to 25 MHz). 255 leaves it as found.
  *   shub_chub_on=1       at step 2, power the CHUB domain on if step 1 found it off, using the PMU's chub_on sequence
  *            from Samsung's flexpmu tables. Default: stop.
+ *   shub_cold=0          leave LDO37 on at a warm start (default 1: off for 100 ms, so a hub that stopped answering
+ *                        starts again from cold)
  *   shub_keep=0          power the hub off again (NSTDBY low) when the steps end or one fails. Default 1: leave it
  *            running, which the sensors need.
  *   shub_log=1           log the first bytes of every SPI frame (very loud). The first 40 frames are always logged.
@@ -168,6 +170,7 @@
 #define HELLO_POLLS             100
 #define NSTDBY_LOW_MS           20
 #define AFTER_POWER_MS          50
+#define LDO_OFF_MS              100     /* LDO37 off at a warm start, for the chip to start from cold */
 #define AUTOBAUD_BYTES          36
 #define AUTOBAUD_MS             100
 #define SYNC_TRIES              6
@@ -199,6 +202,7 @@ static struct hakios_exynos_spi bus = {
 
 static vm_offset_t pmu, cmu_top, cmu_chub, gpio_chub, alive, peric0;
 static uint32_t steps, keep = 1, log_frames, div_ratio = 15, chub_on_ok;
+static uint32_t cold_start = 1;                 /* shub_cold: LDO37 off and on at a warm start */
 static uint32_t want_sensors = 0x2b3, period_ms = 20, req_rpc = SHUB_RPC_SENSOR_REQ, req_len = 1;
 static uint32_t acc_position = ACC_POSITION_S9; /* hakios_ssp_init(): by HAKIOS_DEVICE, or shub_acc_pos= */
 static bool acc_cal_given, gyro_cal_given;      /* shub_acc_cal=, shub_gyro_cal= */
@@ -409,6 +413,17 @@ power_on(void)
 		if (!hakios_exynos_spi_map(&bus, say)) {
 			return false;
 		}
+	}
+	/* A warm restart leaves LDO37 on and the chip running whatever it last ran: a hub that has stopped answering (an
+	 * assert in its ROM) stays that way through NSTDBY, which is only standby. Its supply off and on again starts it
+	 * from cold, as a power-up does (shub_cold=0: not). */
+	if (cold_start && hakios_acpm_pmic_read(HAKIOS_ACPM_PMIC_PMIC, LDO37_CTRL, &ldo) == 0 && (ldo & LDO_ON) == LDO_ON) {
+		pin_output(peric0, BANK_GPG0, PIN_NSTDBY, false);
+		(void)hakios_acpm_pmic_update(HAKIOS_ACPM_PMIC_PMIC, LDO37_CTRL, LDO_ON, 0);
+		sleep_ms(LDO_OFF_MS);
+		(void)hakios_acpm_pmic_update(HAKIOS_ACPM_PMIC_PMIC, LDO37_CTRL, LDO_ON, LDO_ON);
+		say("shub: 2: LDO37 off for %u ms and on again: the chip starts from cold (shub_cold)\n", LDO_OFF_MS);
+		sleep_ms(20);
 	}
 	if (hakios_acpm_pmic_read(HAKIOS_ACPM_PMIC_PMIC, LDO37_CTRL, &ldo) == 0 && (ldo & LDO_ON) != LDO_ON) {
 		uint8_t back = 0;
@@ -2123,6 +2138,7 @@ hakios_ssp_init(void)
 		n = 6;
 	}
 	PE_parse_boot_argn("shub_keep", &keep, sizeof(keep));
+	PE_parse_boot_argn("shub_cold", &cold_start, sizeof(cold_start));
 	PE_parse_boot_argn("shub_log", &log_frames, sizeof(log_frames));
 	PE_parse_boot_argn("shub_div", &div_ratio, sizeof(div_ratio));
 	PE_parse_boot_argn("shub_chub_on", &chub_on_ok, sizeof(chub_on_ok));
