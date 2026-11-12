@@ -72,7 +72,7 @@ export PATH=$B/venv/bin:$PATH
 cat > cross.ini <<INI
 [binaries]
 c = ['$CC', '-arch', 'arm64', '-isysroot', '$SDK']
-cpp = ['$CC++', '-arch', 'arm64', '-isysroot', '$SDK', '-fuse-cxa-atexit']
+cpp = ['$CC++', '-arch', 'arm64', '-isysroot', '$SDK', '-fuse-cxa-atexit', '-stdlib=libc++']
 objc = ['$CC', '-arch', 'arm64', '-isysroot', '$SDK']
 ar = 'llvm-ar'
 ranlib = 'llvm-ranlib'
@@ -91,7 +91,7 @@ needs_exe_wrapper = true
 INI
 OPTIONS=(--wrap-mode=nofallback --prefix=/redwood --libdir=lib --buildtype=release -Db_ndebug=true
 	-Dplatforms= -Dgallium-drivers= -Dvulkan-drivers=panfrost -Dglx=disabled -Degl=disabled -Dgbm=disabled
-	-Dosmesa=false -Dllvm=disabled -Dshared-glapi=disabled -Dgles1=disabled -Dgles2=disabled -Dopengl=false
+	-Dosmesa=false -Dllvm=disabled -Dzlib=disabled -Dshared-glapi=disabled -Dgles1=disabled -Dgles2=disabled -Dopengl=false
 	-Dzstd=disabled -Dxmlconfig=disabled -Dexpat=disabled -Dshader-cache=disabled -Dvalgrind=disabled
 	-Dlibunwind=disabled -Dglvnd=disabled -Dvideo-codecs= -Dtools= -Dgallium-vdpau=disabled -Dgallium-va=disabled
 	-Dgallium-xa=disabled -Dlmsensors=disabled -Dbuild-tests=false -Dvulkan-layers= -Dperfetto=false)

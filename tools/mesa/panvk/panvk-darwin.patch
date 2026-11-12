@@ -13,6 +13,8 @@ MIT, applies to the lines it adds). Written for Scion; no other project's patch 
     os_get_total_physical_memory().
   - vk_image.h/.c: drm_format_mod (VK_EXT_image_drm_format_modifier, which PanVK uses for its
     own tiling choices) on Apple as on Linux and the BSDs.
+  - src/vulkan/wsi/meson.build: wsi_common.c without HAVE_LIBDRM on Darwin, since wsi_common_drm.c
+    (dma-buf, KMS) is not built there; otherwise its nine calls into it are left undefined.
 
 --- a/meson.build
 +++ b/meson.build
@@ -20,8 +22,8 @@ MIT, applies to the lines it adds). Written for Scion; no other project's patch 
    # dependencies (such as vk-runtime) linking to it
    dep_libdrm = null_dep
  endif
--if host_machine.system() == 'darwin' and (with_gallium_freedreno or with_gallium_panfrost)
-+if host_machine.system() == 'darwin' and (with_gallium_freedreno or with_gallium_panfrost or with_panfrost_vk)
+-if host_machine.system() == 'darwin' and (with_gallium_freedreno or with_gallium_panfrost or with_freedreno_vk)
++if host_machine.system() == 'darwin' and (with_gallium_freedreno or with_gallium_panfrost or with_freedreno_vk or with_panfrost_vk)
    # No DRM on this system: freedreno's requests go to the kernel's driver through a stand-in
    # for libdrm (src/hakios-drm, put there by Darwin on redwood's tools/mk-mesa.sh; its one
    # source file is built with freedreno's drm layer, src/freedreno/drm, or, without freedreno,
@@ -212,3 +214,15 @@ MIT, applies to the lines it adds). Written for Scion; no other project's patch 
  VKAPI_ATTR VkResult VKAPI_CALL
  vk_common_GetImageDrmFormatModifierPropertiesEXT(UNUSED VkDevice device,
                                                   VkImage _image,
+--- a/src/vulkan/wsi/meson.build
++++ b/src/vulkan/wsi/meson.build
+@@ -55,6 +55,9 @@
+   'vulkan_wsi',
+   [files_vulkan_wsi, wsi_entrypoints],
+   include_directories : [inc_include, inc_src],
++  # Darwin: libdrm is the stand-in (src/hakios-drm), with no dma-buf and no KMS, and wsi_common_drm.c
++  # is not built (above), so wsi_common.c's calls into it are left out as well (panvk-darwin.patch)
++  c_args : host_machine.system() == 'darwin' ? ['-UHAVE_LIBDRM'] : [],
+   dependencies : [
+     vulkan_wsi_deps, dep_libdrm, dep_libudev, idep_vulkan_util_headers,
+     idep_vulkan_runtime_headers, idep_xmlconfig, idep_mesautil, platform_deps,
