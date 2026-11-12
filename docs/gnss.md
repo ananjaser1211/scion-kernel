@@ -292,6 +292,31 @@ Android does that we do not is not known yet. The likeliest candidates are somet
 we have seen, and the order of `gnss_start` / the 0x38 `$pglirm` handshake (lhd forwards `$pglirm` to gpsd and repeats
 it until gpsd acks).
 
+**lhd's bring-up of the hub, compared with `hakios.ssp.c`** (read from lhd's FirmwareDownloader and Tick):
+
+| lhd | ours |
+|---|---|
+| NSTDBY (`GpioNStdbyPath` = GPS_PWR_EN = gpg0-2, the DT `gps` node, `sec_gps_bcm4753.c`) low, then high | same pin, same order; LDO37 cycled first on a cold start |
+| autobaud, sync, `GetVersion` (0x00 -> 0x03); a ROM mismatch -> `Reset` 0x1A | sync and version the same |
+| patch records (`MemoryWrite` 0x05; masked writes, CRC/checksum verifies, `ServiceStart` 0x37 records: none in this patch) | the same writes; the patch has only 0xF1 records |
+| `<Type=Application>` -> `StartScratchApp` 0x2E (`ServiceStart` 0x37 only for other types) | 0x2E |
+| `GetVersion` again (FD_WAIT4APP) | (version read at sync) |
+| at "MCU Transport Synchronized": `SetLoggingConfig` 0x2B `[1][level][mask]` (mask 0xffffdfff by default) | not sent (sent by hand, no effect seen) |
+| at LhReady: `SetPinMuxing` 0x34 `[17][1]` (ExternalLna, LheSettings+25, on by default); `[7][2]` only with `EnablePpsOut` | not sent at boot; sent by hand |
+| `/dev/bbd_control`: `ESW:READY`, `GPSD:CORE_ON/OFF`, `BBD:PassThru`, `BBD:DEBUG`, `BBD:RESET_REQ`, `LHD:STOP` | Samsung's `ssp_bbd.c` only records them (`IsGpsWorking`, crash counts); nothing reaches the chip |
+| gpsd open -> `Start` 0x1C `[1]`, then gpsd's MEIF through 0x1E | 0x1C by hand |
+
+Samsung's sensor driver has no GNSS step of its own. The star2lte sensor HAL talks to the ssp driver only. No AP clock or
+TCXO is switched for GNSS: the DT's only GNSS pin is gpg0-2, which we drive, and `SetGnssTcxoMode` 0x39 is never sent by lhd.
+So lhd does nothing at bring-up that we skip, apart from the logging config and the pin mux.
+
+One difference in the tests themselves stands out. The only RESET that got a reply from the baseband side (the
+`rpc_engine.cpp` 222 assert, build 30, warm) was sent **without** the pin mux 0x34 `[17][1]`. Every attempt since then
+sent the pin mux first, and the baseband stayed silent. Next test, on a cold chip: `1c 01`, **no pin mux**, logging
+CONFIG_SET, RESET, then gpsd's order (wait for RESET -> SETUP, REQ_CURRENT, wait for SETUP -> SETUP, CONFIG_GET, ...),
+with serials consecutive. If the assert comes back, the pin mux is what silences the baseband (or the warm start is
+what made it talk). If the ME then accepts CONFIG_GET, carry on to CONFIG_SET and IDLE.
+
 ## The tools (kernel and userland)
 
 - `/dev/hakios-gnss` (made at `shub=6`, root only; `drivers/input/ssp/hakios.ssp.c`): every RPC from the hub that is
