@@ -1073,7 +1073,8 @@ forget_launchservices_on_new_image(void)
 		fsync(fd);
 		close(fd);
 	}
-	printf("  a new system image (%.36s): %d LaunchServices database files removed, lsd registers every bundle again\n",
+	want[36] = 0;           /* the stamp is a UUID; libmini's printf has no precision, so cut it here */
+	printf("  a new system image (%s): %d LaunchServices database files removed, lsd registers every bundle again\n",
 	    want, removed);
 }
 
