@@ -103,6 +103,11 @@
 #                                   (lib/HakiosMetal.icd). Plus bin/m2v_test and share/m2v_test.metallib: the same checks as on a
 #                                   Mac, on the guest's driver (RC_JOBS=rc.jobs.metalvk). Still behind boot-arg metal=N like the
 #                                   other plug-in; with no driver at that path there is simply no device. docs/metal-plan.md.
+#                                   Also bin/metal_tri, share/metal_tri.metallib and MetalTri.app (a triangle through the Metal
+#                                   API, src/metalvk/metal_tri.m), which open the plug-in themselves, shown the device by
+#                                   lib/HakiosMetal.clients: no boot-arg needed. M2V_DIR=DIR takes a libmetal2vulkan.dylib
+#                                   already built (mk-metal2vulkan.sh ios, which also runs on Linux). On the S9:
+#                                   PANVK_DIR=... METAL=vk METAL_ICD=/redwood/lib/libvulkan_panfrost.dylib (docs/metal.md).
 #                      TURNIP=1     with Turnip, Mesa's Vulkan driver for the Adreno (tools/mk-turnip.sh), as
 #                                   lib/libvulkan_freedreno.dylib (11 MB), and bin/vk_turnip_test, which runs it once round
 #                                   (src/vk_turnip_test.c; RC_JOBS=rc.jobs.vkturnip): the first piece of a Metal on Vulkan
@@ -546,16 +551,31 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 			# again when it is missing or tools/metal/ has changed since (its pins, the bridge, the shaders: the same hash
 			# tools/metal/mk-metal2vulkan.sh writes beside it). ARC and C++17 for AdrenoMetal's frontend; -fuse-cxa-atexit
 			# undoes the kernel's -fno-use-cxa-atexit that xnu-clang++ adds, as tools/mk-mesa.sh does.
-			V=../xnu-deps/build/metal2vulkan/out/ios
-			[ -f $V/libmetal2vulkan.dylib ] && [ "$(cat $V/built-from-tree 2>/dev/null)" = "$(cat ../tools/metal/mk-metal2vulkan.sh \
-				../tools/metal/bridge/* ../tools/metal/*.metal ../tools/metal/m2v_test.c ../tools/metal/m2v/*.patch 2>/dev/null |
-				sha256sum)" ] || ../tools/metal/mk-metal2vulkan.sh ios
+			# M2V_DIR=DIR takes a library already built (tools/metal/mk-metal2vulkan.sh ios's out/ios, anywhere) as it is.
+			V=${M2V_DIR:-../xnu-deps/build/metal2vulkan/out/ios}
+			if [ -n "${M2V_DIR:-}" ]; then
+				[ -f $V/libmetal2vulkan.dylib ] || { echo "build.sh: M2V_DIR=$V has no libmetal2vulkan.dylib" >&2; exit 1; }
+			else
+				[ -f $V/libmetal2vulkan.dylib ] && [ "$(cat $V/built-from-tree 2>/dev/null)" = "$(cat ../tools/metal/mk-metal2vulkan.sh \
+					../tools/metal/bridge/* ../tools/metal/*.metal ../tools/metal/m2v_test.c ../tools/metal/m2v/*.patch 2>/dev/null |
+					sha256sum)" ] || ../tools/metal/mk-metal2vulkan.sh ios
+			fi
 			$DYN -c -o obj/hakios_metal_shown.o src/hakios_metal_shown.c
-			xnu-clang++ -arch arm64 -isysroot ${THEOS:-$HOME/theos}/sdks/iPhoneOS16.5.sdk -O1 -fuse-cxa-atexit -std=c++17 -fobjc-arc \
-				-I../tools/metal -Isrc/metalvk -bundle -framework Foundation -framework Metal -framework IOSurface -framework IOKit \
-				-framework CoreFoundation -lobjc -o obj/HakiosMetal src/metalvk/HakiosMetalVK.mm \
+			xnu-clang++ -arch arm64 -isysroot ${THEOS:-$HOME/theos}/sdks/iPhoneOS16.5.sdk -O1 -fuse-cxa-atexit -std=c++17 -stdlib=libc++ \
+				-fobjc-arc -I../tools/metal -Isrc/metalvk -bundle -framework Foundation -framework Metal -framework IOSurface \
+				-framework IOKit -framework CoreFoundation -lobjc -o obj/HakiosMetal src/metalvk/HakiosMetalVK.mm \
 				src/metalvk/NativeBridgeMetalFrontend.mm obj/hakios_metal_shown.o $V/libmetal2vulkan.dylib
-			cp $V/libmetal2vulkan.dylib $V/m2v_test $V/m2v_test.metallib obj/
+			cp $V/libmetal2vulkan.dylib obj/
+			# m2v_test and its metallib only where Xcode made them (not on Linux)
+			[ -f $V/m2v_test ] && [ -f $V/m2v_test.metallib ] && cp $V/m2v_test $V/m2v_test.metallib obj/
+			# metal_tri: a triangle through the Metal API on this plug-in, checked pixel by pixel; also MetalTri.app (below). Its
+			# shaders are hand-written AIR (tools/metal/air), assembled by llvm-as and put in a library by tools/metal/mkmetallib.py.
+			$DYN -fobjc-arc -framework Foundation -framework UIKit -framework QuartzCore -framework Metal -framework IOSurface \
+				-framework IOKit -lobjc -o obj/metal_tri src/metalvk/metal_tri.m
+			${LLVM_AS:-llvm-as} -o obj/tri_vertex.bc ../tools/metal/air/tri_vertex.ll
+			${LLVM_AS:-llvm-as} -o obj/tri_fragment.bc ../tools/metal/air/tri_fragment.ll
+			python3 ../tools/metal/mkmetallib.py obj/metal_tri.metallib tri_vertex:vertex:obj/tri_vertex.bc \
+				tri_fragment:fragment:obj/tri_fragment.bc
 			echo "build.sh: HakiosMetal is Metal on Vulkan (libmetal2vulkan.dylib, $(cat $V/built-from))"
 		elif [ "${METAL_PLUGIN:-}" = ca ]; then
 			# METAL_PLUGIN=ca: the plug-in that serves CoreAnimation's window server (src/HakiosMetalCA.m, vcvkk's with
@@ -799,9 +819,23 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	# METAL=vk: the runtime the plug-in links, the guest's test of it, and the Vulkan driver it opens if not the default
 	if [ -f obj/libmetal2vulkan.dylib ]; then
 		cp obj/libmetal2vulkan.dylib root/lib/
-		cp obj/m2v_test root/bin/
-		cp obj/m2v_test.metallib root/share/
+		mkdir -p root/share
+		if [ -f obj/m2v_test ]; then
+			cp obj/m2v_test root/bin/
+			cp obj/m2v_test.metallib root/share/
+		fi
 		[ -z "$METAL_ICD" ] || echo "$METAL_ICD" > root/lib/HakiosMetal.icd
+		# metal_tri and MetalTri.app open the plug-in themselves (no boot-arg): this file shows it the device
+		# (src/hakios_metal_shown.c); with boot-arg metal=N the level decides for every other process as before
+		echo metal_tri > root/lib/HakiosMetal.clients
+		cp obj/metal_tri root/bin/
+		cp obj/metal_tri.metallib root/share/
+		rm -rf obj/MetalTri.app
+		mkdir -p obj/MetalTri.app
+		cp obj/metal_tri obj/MetalTri.app/
+		cp src/metalvk/metal_tri.plist obj/MetalTri.app/Info.plist
+		printf 'APPL????' > obj/MetalTri.app/PkgInfo
+		echo "build.sh: METAL=vk: metal_tri, share/metal_tri.metallib, MetalTri.app for /Applications (SYSTEM=1)"
 	fi
 	if [ -n "${TURNIP:-}" ]; then
 		cp obj/libvulkan_freedreno.dylib root/lib/
@@ -1243,6 +1277,11 @@ if [ -f $DARWIN/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 		cp -a obj/HakiosGPS.app sysroot/Applications/
 		echo "  HakiosGPS.app in /Applications (com.hakios.gps, scheme hakiosgps:)"
 	fi
+	# METAL=vk: a triangle drawn by Metal on the Mali (src/metalvk/metal_tri.m), only in an image built with it
+	if [ "$METAL" = vk ] && [ -d obj/MetalTri.app ]; then
+		cp -a obj/MetalTri.app sysroot/Applications/
+		echo "  MetalTri.app in /Applications (com.hakios.metaltri)"
+	fi
 	# Applications from outside this tree: every .app in ../apps, which is kept out of the
 	# repository the way ../fw-* and ../jb are, so that nothing of somebody else's package can
 	# reach it. They go into /Applications beside the port's own on exactly the same terms --
@@ -1268,6 +1307,9 @@ if [ -f $DARWIN/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	[ -d root/lib/HakiosMetal.bundle ] && ln -sfn /redwood/lib/HakiosMetal.bundle sysroot/System/Library/Extensions/HakiosMetal.bundle
 	# METAL_ICD's file is read "beside the bundle", which is either directory depending on the path the bundle was loaded by
 	if [ -f root/lib/HakiosMetal.icd ]; then ln -sfn /redwood/lib/HakiosMetal.icd sysroot/System/Library/Extensions/HakiosMetal.icd; fi
+	if [ -f root/lib/HakiosMetal.clients ]; then
+		ln -sfn /redwood/lib/HakiosMetal.clients sysroot/System/Library/Extensions/HakiosMetal.clients
+	fi
 	# the OS cryptex: on a device a separate volume grafted at /System/Cryptexes/OS. It holds the dyld
 	# shared cache (dyld looks there first) and a few libraries and resources outside the cache.
 	mkdir -p sysroot/System/Cryptexes
