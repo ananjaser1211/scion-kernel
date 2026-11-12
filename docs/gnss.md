@@ -317,6 +317,15 @@ CONFIG_SET, RESET, then gpsd's order (wait for RESET -> SETUP, REQ_CURRENT, wait
 with serials consecutive. If the assert comes back, the pin mux is what silences the baseband (or the warm start is
 what made it talk). If the ME then accepts CONFIG_GET, carry on to CONFIG_SET and IDLE.
 
+Done (TWRP restart at 21:15, cold chip), with **no pin mux**: `1c 01`, logging CONFIG_SET (ACK), RESET (ACK,
+RESET -> SETUP), REQ_CURRENT (SETUP -> SETUP), CONFIG_GET -> **NACK**. It was the same with the pin mux, so the pin mux
+is not the cause. Then the build-30 history was replayed in the same boot (`enable_log_to_host_LOG_INFO_Overwrite`,
+`gnss_start` (with its `$pglirm` answer), `gnss_stop`, `1c 00`, `1c 01`) and RESET was sent again: ACK, RESET -> SETUP,
+no assert, no baseband. **What is left of the build-30 difference is the warm chip**: that boot had no LDO37 power cycle
+(shub_cold came with build 31), and the RESET there was the first MEIF message of the boot. Next: one boot with
+`shub_cold=0`, then a bare `1c 01` + RESET as the first MEIF message. An assert means the baseband is alive on a warm
+chip and the cold start (LDO37 off for 100 ms) leaves it dead.
+
 ## The tools (kernel and userland)
 
 - `/dev/hakios-gnss` (made at `shub=6`, root only; `drivers/input/ssp/hakios.ssp.c`): every RPC from the hub that is
