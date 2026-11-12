@@ -98,6 +98,9 @@ bt_tty	k
 bt_uart_mhz	k
 bt_vendor	k
 bt_vendor_part	k
+bus_log	k
+bus_mask	k
+bus_max	k
 buttons	k
 buttons_steps	k
 ca_metallib	u
@@ -156,9 +159,12 @@ core0	kl
 core1	l
 cpufreq	k
 cpufreq_gov	k
+cpufreq_gov_big_dual	k
 cpufreq_gov_big_max	k
 cpufreq_gov_big_min	k
 cpufreq_gov_big_oc	k
+cpufreq_gov_big_quad	k
+cpufreq_gov_big_single	k
 cpufreq_gov_lit_max	k
 cpufreq_gov_lit_min	k
 cpufreq_gov_log	k
@@ -300,10 +306,14 @@ m3_prep	k
 machine_name	k
 mali	k
 mali_acpm	k
+mali_dvs	k
+mali_dvs_floor	k
+mali_dvs_margin	k
 mali_fastmap	k
 mali_flush	k
 mali_gov	k
 mali_gov_frame	k
+mali_max	k
 mali_mhz	k
 mali_nap_us	k
 mali_pll	k

@@ -2,13 +2,13 @@
 
 Made by `tools/boot-args.py --markdown`; CI fails if it is out of date with the source (`tools/boot-args.py --check`).
 
-Every argument that the kernel, the loader or user space of this port reads, and which file reads it. **634 arguments**: 543 read by the kernel, 23 by the loader, 85 by user space (one is read in more than one place).
+Every argument that the kernel, the loader or user space of this port reads, and which file reads it. **644 arguments**: 553 read by the kernel, 23 by the loader, 85 by user space (one is read in more than one place).
 
 This is a catalogue of what exists and who reads it, not a manual. What an argument means is in the head of the file that reads it. The stable switches have a symbol in the configuration (`tools/hakios-config.py help SYMBOL`, `docs/configs.md`); the rest are the knobs of bring-up (a driver's steps, pauses, traces, test modes) and can change with the driver. Any of them can be given in a configuration with `CONFIG_BOOTARGS="name=value ..."`, which checks that each name is in this list. What the arguments of the two Metal paths do: [Metal on the Adreno](reference/metal.md#boot-arguments).
 
 Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl kern.bootargs`).
 
-## GPU and display (112)
+## GPU and display (116)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
@@ -97,10 +97,14 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `hakios_kver` | K | `MiniIOMobileFramebuffer.cpp`, `hakios.version.c` |  | the loader (from the payload's kernel.ver) |
 | `mali` | K | `hakios.mali.c` | `CONFIG_MALI` |  |
 | `mali_acpm` | K | `hakios.mali.c` | `CONFIG_MALI_ACPM` |  |
+| `mali_dvs` | K | `hakios.mali.c` | `CONFIG_MALI_DVS` |  |
+| `mali_dvs_floor` | K | `hakios.mali.c` | `CONFIG_MALI_DVS_FLOOR` |  |
+| `mali_dvs_margin` | K | `hakios.mali.c` | `CONFIG_MALI_DVS_MARGIN` |  |
 | `mali_fastmap` | K | `hakios.mali.c` | `CONFIG_MALI_FASTMAP` |  |
 | `mali_flush` | K | `hakios.mali.cpp` | `CONFIG_MALI_FLUSH` |  |
 | `mali_gov` | K | `hakios.mali.c` | `CONFIG_MALI_GOV` |  |
 | `mali_gov_frame` | K | `hakios.mali.c` | `CONFIG_MALI_GOV_FRAME` |  |
+| `mali_max` | K | `hakios.mali.c` | `CONFIG_MALI_MAX` |  |
 | `mali_mhz` | K | `hakios.mali.c` | `CONFIG_MALI_MHZ` |  |
 | `mali_nap_us` | K | `hakios.mali.c` | `CONFIG_MALI_NAP_US` |  |
 | `mali_pll` | K | `hakios.mali.c` | `CONFIG_MALI_PLL` |  |
@@ -591,7 +595,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `ufs_probe` | L | `loader.c` | `CONFIG_UFS_PROBE` |  |
 | `ufs_write_guid` | L | `loader.c` | `CONFIG_UFS_WRITE_GUID` |  |
 
-## User space (131)
+## User space (137)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
@@ -613,6 +617,9 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `bt_uart_mhz` | K | `hakios.bcm4361_bt.c` | `CONFIG_BT_UART_MHZ` |  |
 | `bt_vendor` | K | `hakios.bcm4361_bt.c` | `CONFIG_BT_VENDOR` |  |
 | `bt_vendor_part` | K | `hakios.bcm4361_bt.c` | `CONFIG_BT_VENDOR_PART` |  |
+| `bus_log` | K | `hakios.exynos_acpm.c` | `CONFIG_BUS_LOG` |  |
+| `bus_mask` | K | `hakios.exynos_acpm.c` | `CONFIG_BUS_MASK` |  |
+| `bus_max` | K | `hakios.exynos_acpm.c` | `CONFIG_BUS_MAX` |  |
 | `ca_metallib` | U | `inject.c` | `CONFIG_CA_METALLIB` |  |
 | `ca_prof` | U | `HakiosMetalCA.m` | `CONFIG_CA_PROF` |  |
 | `ca_vbl` | U | `inject.c` | `CONFIG_CA_VBL` |  |
@@ -623,9 +630,12 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `cohtest_delay` | K | `hakios.exynos_m3.c` | `CONFIG_COHTEST_DELAY` |  |
 | `console_quiet` | K | `1003-avf-console-quiet.patch` | `CONFIG_CONSOLE_QUIET` |  |
 | `cpufreq_gov` | K | `hakios.exynos_cpufreq.c` | `CONFIG_CPUFREQ_GOV` |  |
+| `cpufreq_gov_big_dual` | K | `hakios.exynos_cpufreq.c` | `CONFIG_CPUFREQ_GOV_BIG_DUAL` |  |
 | `cpufreq_gov_big_max` | K | `hakios.exynos_cpufreq.c` | `CONFIG_CPUFREQ_GOV_BIG_MAX` |  |
 | `cpufreq_gov_big_min` | K | `hakios.exynos_cpufreq.c` | `CONFIG_CPUFREQ_GOV_BIG_MIN` |  |
 | `cpufreq_gov_big_oc` | K | `hakios.exynos_cpufreq.c` | `CONFIG_CPUFREQ_GOV_BIG_OC` |  |
+| `cpufreq_gov_big_quad` | K | `hakios.exynos_cpufreq.c` | `CONFIG_CPUFREQ_GOV_BIG_QUAD` |  |
+| `cpufreq_gov_big_single` | K | `hakios.exynos_cpufreq.c` | `CONFIG_CPUFREQ_GOV_BIG_SINGLE` |  |
 | `cpufreq_gov_lit_max` | K | `hakios.exynos_cpufreq.c` | `CONFIG_CPUFREQ_GOV_LIT_MAX` |  |
 | `cpufreq_gov_lit_min` | K | `hakios.exynos_cpufreq.c` | `CONFIG_CPUFREQ_GOV_LIT_MIN` |  |
 | `cpufreq_gov_log` | K | `hakios.exynos_cpufreq.c` | `CONFIG_CPUFREQ_GOV_LOG` |  |

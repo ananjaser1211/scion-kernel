@@ -93,6 +93,9 @@ BT_TTY	arg	bt_tty	User space	k	hakios.bcm4361_bt.c
 BT_UART_MHZ	arg	bt_uart_mhz	User space	k	hakios.bcm4361_bt.c	UART_BT's clock in MHz, if bt=1 shows the divider or mux not as Android leaves them (default 200)
 BT_VENDOR	arg	bt_vendor	User space	k	hakios.bcm4361_bt.c	never read the patch from the phone's VENDOR partition (default: read it there with ufs=2)
 BT_VENDOR_PART	arg	bt_vendor_part	User space	k	hakios.bcm4361_bt.c	the partition the patch is read from (default VENDOR)
+BUS_LOG	arg	bus_log	User space	k	hakios.exynos_acpm.c	do not log the APM's tables at boot (default: one line per domain, read only)
+BUS_MASK	arg	bus_mask	User space	k	hakios.exynos_acpm.c	
+BUS_MAX	arg	bus_max	User space	k	hakios.exynos_acpm.c	MIF, INT and DISP to their top at boot, kept there (re-asked every 10 s, cheap)
 BUTTONS	arg	buttons	Touch and buttons	k	hakios.buttons.c	
 BUTTONS_STEPS	arg	buttons_steps	Touch and buttons	k	hakios.buttons.c	
 CA_METALLIB	arg	ca_metallib	User space	u	inject.c	
@@ -145,9 +148,12 @@ CONSOLE_QUIET	arg	console_quiet	User space	k	1003-avf-console-quiet.patch
 CORE0	arg	core0	Loader	kl	loader.c,psci_smp.c	the kernel's box for this core (above), if it has one, and only with a kernel on another core to watch
 CORE1	arg	core1	Loader	l	loader.c	core 1, which S-Boot uses for its own display work, listed for the kernel all the same
 CPUFREQ_GOV	arg	cpufreq_gov	User space	k	hakios.exynos_cpufreq.c	run it (0, or none: the fixed rates of cpufreq_lit= and cpufreq_big=)
+CPUFREQ_GOV_BIG_DUAL	arg	cpufreq_gov_big_dual	User space	k	hakios.exynos_cpufreq.c	
 CPUFREQ_GOV_BIG_MAX	arg	cpufreq_gov_big_max	User space	k	hakios.exynos_cpufreq.c	
 CPUFREQ_GOV_BIG_MIN	arg	cpufreq_gov_big_min	User space	k	hakios.exynos_cpufreq.c	
 CPUFREQ_GOV_BIG_OC	arg	cpufreq_gov_big_oc	User space	k	hakios.exynos_cpufreq.c	
+CPUFREQ_GOV_BIG_QUAD	arg	cpufreq_gov_big_quad	User space	k	hakios.exynos_cpufreq.c	
+CPUFREQ_GOV_BIG_SINGLE	arg	cpufreq_gov_big_single	User space	k	hakios.exynos_cpufreq.c	
 CPUFREQ_GOV_LIT_MAX	arg	cpufreq_gov_lit_max	User space	k	hakios.exynos_cpufreq.c	
 CPUFREQ_GOV_LIT_MIN	arg	cpufreq_gov_lit_min	User space	k	hakios.exynos_cpufreq.c	
 CPUFREQ_GOV_LOG	arg	cpufreq_gov_log	User space	k	hakios.exynos_cpufreq.c	a summary line this often (0: none; 1)
@@ -282,11 +288,15 @@ M3_PREP	arg	m3_prep	User space	k	hakios.exynos_m3.c,hakios_arm_init.h,hakios_com
 MACHINE_NAME	arg	machine_name	CPU, memory and boot	k	GenericARMPE.cpp	
 MALI	arg	mali	GPU and display	k	hakios.mali.c	run the first N steps (9: all, then serve)
 MALI_ACPM	arg	mali_acpm	GPU and display	k	hakios.mali.c	do not raise the rail. The GPU is then touched at the boot's voltage, which hung the S9+ (test only).
+MALI_DVS	arg	mali_dvs	GPU and display	k	hakios.mali.c	the voltage up before the clock goes up (a failed raise: no switch)
+MALI_DVS_FLOOR	arg	mali_dvs_floor	GPU and display	k	hakios.mali.c	
+MALI_DVS_MARGIN	arg	mali_dvs_margin	GPU and display	k	hakios.mali.c	
 MALI_FASTMAP	arg	mali_fastmap	GPU and display	k	hakios.mali.c	walk the page tables through the GPU's caches; each buffer entered is then an MMU update of AS 0
 MALI_FLUSH	arg	mali_flush	GPU and display	k	hakios.mali.cpp	
 MALI_GOV	arg	mali_gov	GPU and display	k	hakios.mali.c	the clock follows the load (see gov_window())
 MALI_GOV_FRAME	arg	mali_gov_frame	GPU and display	k	hakios.mali.c	clock floor while frames are shown (default 572; 0: none)
-MALI_MHZ	arg	mali_mhz	GPU and display	k	hakios.mali.c	GPU clock: 260 (default), 455 or 572
+MALI_MAX	arg	mali_max	GPU and display	k	hakios.mali.c	
+MALI_MHZ	arg	mali_mhz	GPU and display	k	hakios.mali.c	GPU clock: 260 (default), 455 or 572 (or mali_max's level)
 MALI_NAP_US	arg	mali_nap_us	GPU and display	k	hakios.mali.c	poll interval for a job still running after its first 200 us, clamped to 10..1000 (default 50)
 MALI_PLL	arg	mali_pll	GPU and display	k	hakios.mali.c	leave PLL_G3D as the boot set it; the step stops if it is not running
 MALI_TRACE	arg	mali_trace	GPU and display	k	hakios.mali.c	one line per job: "tl: j SEQ f|v q QUEUED b BEGAN e ENDED", in microseconds
