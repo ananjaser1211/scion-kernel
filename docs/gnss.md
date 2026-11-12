@@ -504,6 +504,31 @@ log shows "HW Flow Control Set", "Received HW Version 47752 B0", "Exiting Legacy
 Version received: Asic 0x3000000F, IFC 132, Radio 0x03"**, then **STATE_REPORT SETUP -> IDLE**, followed by MEIF ASIC
 (0x15) messages. The engine stayed in IDLE.
 
+**ON, and what keeps the receiver off** (22:00-22:20, three boots).
+- The whole sequence is repeatable on a cold chip: the ESW load (0.6-1.3 s), then RESET, esw_ctrl, IDLE, and **CONTROL(ON) -> STATE_REPORT IDLE -> ON**.
+- While IDLE the baseband searched for about 60 s. Indoors and not yet at the window it made 64 GPS and 20 GLONASS
+  attempts with 0 detections. The serial link to it had no errors (1135 packets received, 0 sequence or CRC errors).
+- At ON, `GlOnChipReqMgr::ProcessPowerCycleLogic` reports "MeIfStateOn, MeEngLoaded, Asic Off". It sends the ASIC to
+  standby (`AsicToStandby`), unloads the engine and destroys the MicroNav. The config dump shows `ReqType 0x0`: without a
+  position request, the on-chip request manager does not keep the receiver on.
+- `gnss_start` (RPC 0x401) with the engine ON only gets the usual `$pglirm,req_breadcrumb,pvtOnChip,periodSec,36000,
+  batchOption,128`. On Android, gpsd answers that with its own request. **The request reaches the chip as MEIF 0x818E**
+  (gpsd `GlPePexHostEncoder::SendReqInfo` / `SendGeofenceInfo`), len 28:
+  `[u16 a][u16 b][u16 c][u16 d][u16 e][u16 h][u16 0][u32 g][u16 geofence count][u16 0]`, then 32 bytes per geofence.
+  The hub decodes it (0x00823c14) into `GlOnChipReqMgr::UpdateHostRequest(a, b, c, d, e, now, g, h)` (0x00804a60):
+  - a = request id. 0xFFFF, 0xFFFE, 0xFFFD and 0xFFFC are commands (clear, stop, dump, ...).
+  - c = flags. Bit 0x800 means geofence, bit 0x80 means ignored here. Otherwise it is a batching request:
+    `[+0]=1, id, b, flags, d (0 -> 3), e, g, h`.
+  - The fields' meanings (period, count, accuracy) are not settled yet. The next test is a minimal batching request
+    (a=1, b=1, the rest 0) after ON.
+- Hazards seen:
+  - **RPC 0x401 typed by hand without its trailing u8 asserts the chip** (`rpc_engine.cpp` 222) and wedges the hub until
+    a restart. `gnsstool pvt TEXT` now builds it.
+  - **Turning on the hub log facilities with RPC 0x2B, many in a row**, once about 90 s after boot and once at about
+    7 min, was followed both times by the reliable-RPC channel dying ("NOT acknowledged", no peek answers) while the
+    sensors kept running. Turn on only a few facilities, and never all 256.
+  - Without facilities, `enable_log_to_host_LOG_INFO_Overwrite` alone gives only the PVT task's own lines.
+
 **Integration, when it works.**
 - **Firmware**: `devices/star2lte/firmware/gnss/` holds a README and SHA256SUMS only. `tools/fetch-firmware.sh`
   extracts the three 4775_B0 segments from the user's own gpsd: `--from DIR`, or the pinned vendor tree if it has
