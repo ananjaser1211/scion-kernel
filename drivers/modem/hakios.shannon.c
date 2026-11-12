@@ -36,8 +36,11 @@
  *              made off CPU 0 as cbd makes them; the answers logged by name. The CP is not started. shannon_nv=1 loads
  *              EFS:/nv_data.bin into NV (its size is logged, never its contents); without it NV is 0xFF, what cbd's
  *              create_empty_nv writes, and the CP is expected to rebuild its defaults.
- *   shannon=3  ... and steps 3 and 4, then 60 s of the CP's mailbox: each message it sends is logged with its command
- *              (PHONE_START, INIT_START, ...). Nothing is answered yet: the SBD rings are the next step.
+ *   shannon=3  ... and cbd's 8 to 11: MODEM_ON (AP2CP_CFG), BOOT_ON (the CP's status), DL_START (the IPC map and its
+ *              magic, AP status 1) and the UDL handshake (0x900d -> 0xa00d, 0x9f00 -> 0xaf00 over the RAW queues), then
+ *              60 s of the CP's mailbox, each message logged with its command (PHONE_START, INIT_START, ...). Nothing
+ *              is answered yet: PIF_INIT_DONE needs the SBD rings, the next step. shannon_udl_irq=1 also rings the
+ *              mailbox after each UDL word (Linux does not).
  * Other arguments: shannon_sysrev=N (the board revision the AP reports, 0 if not given: Samsung reads it from eight GPIOs),
  * shannon_blsize=N (the boot loader's size for the SMC, BOOT's TOC size if not given, as cbd), shannon_toc=1 (the TOC at
  * +0 and BOOT after it, the layout shm_ipc.c's memory-map probe reads; not what cbd does), shannon_base=1 (the region's
@@ -149,6 +152,7 @@ struct toc_entry {                              /* RADIO's table of contents, 32
 static struct toc_entry toc[TOC_MAX];
 static unsigned int toc_count;
 static volatile uint8_t *pmu, *mbox, *ap2cp_cfg;
+static volatile uint8_t *cp_mem;                /* the CP's memory, mapped by step 2 */
 static int shannon_state;
 
 SYSCTL_DECL(_kern_hakios);
@@ -475,6 +479,8 @@ load_and_verify(void)
 	volatile uint8_t *cp;
 	uint64_t answer;
 
+	cp_mem = NULL;
+
 	(void)PE_parse_boot_argn("shannon_toc", &with_toc, sizeof(with_toc));
 	(void)PE_parse_boot_argn("shannon_nv", &nv_wanted, sizeof(nv_wanted));
 	(void)PE_parse_boot_argn("shannon_blsize", &blsize, sizeof(blsize));
@@ -506,7 +512,7 @@ load_and_verify(void)
 	log_cp_registers("after the non-secure request");
 
 	/* 4: IOCTL_MODEM_XMIT_BOOT, TOC entries BOOT, MAIN, VSS, NV, each to (address & 0x3fffffff) */
-	cp = (volatile uint8_t *)hakios_physmap_wc(CP_PA, CP_SIZE);
+	cp = cp_mem = (volatile uint8_t *)hakios_physmap_wc(CP_PA, CP_SIZE);
 	if (cp == NULL) {
 		say("shannon: the CP's memory (%#llx, %#llx bytes) could not be mapped\n", CP_PA, CP_SIZE);
 		return false;
@@ -563,6 +569,119 @@ load_and_verify(void)
 	return answer == 0;
 }
 
+/*
+ * cbd's steps 10 and 11 (docs/cellular-star2lte.md): IOCTL_MODEM_DL_START and the UDL handshake, over the legacy IPC
+ * map at the IPC region (shmem_4mb_phys_map without LEGACY_QOS): magic +0, access +4, FMT tx head/tail +8/+0xc, FMT
+ * rx +0x10/+0x14, RAW tx +0x18/+0x1c, RAW rx +0x20/+0x24; FMT tx/rx buffers at +0x1000/+0x2000 (4 KB each), RAW tx at
+ * +0x3000 (2084864 bytes), RAW rx at +0x200000 (2 MB). cbd writes a 4-byte word to umts_boot0; the io device puts a
+ * SIPC5 header on it (config 0xFC once DL_START has made the link aligned, channel 215, length 8) and xmit_udl puts
+ * the frame in the RAW tx queue, with no interrupt; the answer comes back in the RAW rx queue.
+ */
+#define IPC_MAGIC               0x00u
+#define IPC_ACCESS              0x04u
+#define IPC_RAW_TX_HEAD         0x18u
+#define IPC_RAW_TX_TAIL         0x1Cu
+#define IPC_RAW_RX_HEAD         0x20u
+#define IPC_RAW_RX_TAIL         0x24u
+#define IPC_RAW_TX_BUFF         0x3000u
+#define IPC_RAW_TX_SIZE         2084864u
+#define IPC_RAW_RX_BUFF         0x200000u
+#define IPC_RAW_RX_SIZE         0x200000u
+#define MEM_BOOT_MAGIC          0x424F4F54u
+#define SIPC5_CH_BOOT0          215u
+
+static bool
+dl_start(volatile uint8_t *ipc)
+{
+	say("shannon: DL_START: writing the IPC map at %#llx (outside what the secure call closes, if Samsung's layout holds)
+",
+	    CP_PA + CP_IPC_OFFSET);
+	for (uint32_t offset = 0x08; offset <= 0x24; offset += 4) {
+		wr(ipc, offset, 0);
+	}
+	wr(ipc, IPC_MAGIC, MEM_BOOT_MAGIC);
+	say("shannon: DL_START: the IPC map reset, magic %#x (reads %#x)\n", MEM_BOOT_MAGIC, rd(ipc, IPC_MAGIC));
+	return rd(ipc, IPC_MAGIC) == MEM_BOOT_MAGIC;
+}
+
+static void
+raw_tx(volatile uint8_t *ipc, uint32_t word)
+{
+	uint8_t frame[8] = { 0xFC, SIPC5_CH_BOOT0, 8, 0, (uint8_t)word, (uint8_t)(word >> 8), (uint8_t)(word >> 16),
+		             (uint8_t)(word >> 24) };
+	uint32_t head = rd(ipc, IPC_RAW_TX_HEAD);
+
+	for (uint32_t i = 0; i < sizeof(frame); i++) {
+		ipc[IPC_RAW_TX_BUFF + (head + i) % IPC_RAW_TX_SIZE] = frame[i];
+	}
+	__builtin_arm_dsb(15);
+	wr(ipc, IPC_RAW_TX_HEAD, (head + sizeof(frame)) % IPC_RAW_TX_SIZE);
+}
+
+/* One UDL request and its answer, as std_udl_req_resp: 30 s at most. */
+static bool
+udl_req_resp(volatile uint8_t *ipc, uint32_t request, uint32_t expect, bool ring)
+{
+	say("shannon: UDL request %#x (expecting %#x)\n", request, expect);
+	raw_tx(ipc, request);
+	if (ring) {
+		wr(mbox, MBOX_ISSR(MBX_AP2CP_MSG), INT_VALID | 0x01u /* MASK_SEND_RAW */);
+		wr(mbox, MBOX_INTGR1, 1u << INT_AP2CP_MSG);
+	}
+	for (int ms = 0; ms < 30000; ms += 10) {
+		uint32_t head = rd(ipc, IPC_RAW_RX_HEAD), tail = rd(ipc, IPC_RAW_RX_TAIL);
+
+		if (head != tail) {
+			uint8_t hdr[8];
+			uint32_t length, word;
+
+			for (uint32_t i = 0; i < sizeof(hdr); i++) {
+				hdr[i] = ipc[IPC_RAW_RX_BUFF + (tail + i) % IPC_RAW_RX_SIZE];
+			}
+			length = hdr[2] | (uint32_t)hdr[3] << 8;
+			word = hdr[4] | (uint32_t)hdr[5] << 8 | (uint32_t)hdr[6] << 16 | (uint32_t)hdr[7] << 24;
+			if (hdr[0] & 0x04) {
+				length = (length + 3) & ~3u;
+			}
+			say("shannon: UDL answer after %d ms: frame %02x %02x len %u, word %#x (rx head %#x tail %#x)\n", ms,
+			    hdr[0], hdr[1], hdr[2] | hdr[3] << 8, word, head, tail);
+			wr(ipc, IPC_RAW_RX_TAIL, (tail + (length ? length : (head - tail) % IPC_RAW_RX_SIZE)) % IPC_RAW_RX_SIZE);
+			return word == expect;
+		}
+		IOSleep(10);
+	}
+	say("shannon: no UDL answer in 30 s (raw tx head %#x tail %#x, rx head %#x tail %#x, CP status %#x)\n",
+	    rd(ipc, IPC_RAW_TX_HEAD), rd(ipc, IPC_RAW_TX_TAIL), rd(ipc, IPC_RAW_RX_HEAD), rd(ipc, IPC_RAW_RX_TAIL),
+	    rd(mbox, MBOX_ISSR(MBX_CP2AP_STATUS)));
+	return false;
+}
+
+static void
+boot_handshake(void)
+{
+	uint32_t ring = 0;
+	volatile uint8_t *ipc;
+
+	if (cp_mem == NULL) {
+		say("shannon: no mapping of the CP's memory: no handshake\n");
+		return;
+	}
+	(void)PE_parse_boot_argn("shannon_udl_irq", &ring, sizeof(ring));
+	ipc = cp_mem + CP_IPC_OFFSET;
+	if (!dl_start(ipc)) {
+		say("shannon: the IPC map does not hold the magic: no handshake\n");
+		return;
+	}
+	/* modem_boot_confirm: AP status 1 (after DL_START in IOCTL_MODEM_DL_START) */
+	wr(mbox, MBOX_ISSR(MBX_AP2CP_STATUS), (rd(mbox, MBOX_ISSR(MBX_AP2CP_STATUS)) & ~(0xfu << 1)) | 1u << 1);
+	say("shannon: AP status word %#x (boot confirmed)\n", rd(mbox, MBOX_ISSR(MBX_AP2CP_STATUS)));
+	if (udl_req_resp(ipc, 0x900d, 0xa00d, ring != 0) && udl_req_resp(ipc, 0x9f00, 0xaf00, ring != 0)) {
+		say("shannon: the UDL handshake is done (stage done, then 0xf): BOOT_OFF waits for the CP's init\n");
+	} else {
+		say("shannon: the UDL handshake did not complete\n");
+	}
+}
+
 /* Steps 3 and 4: the AP's status, the CP let go, its status awaited; then its messages, logged. */
 static void
 start_and_listen(void)
@@ -601,10 +720,10 @@ start_and_listen(void)
 	}
 	say("shannon: the CP's status word %#x after 2 s: %s\n", rd(mbox, MBOX_ISSR(MBX_CP2AP_STATUS)),
 	    shannon_state >= 3 ? "it is up" : "nothing (Samsung's kernel gives up here: -EACCES)");
-	if (shannon_state >= 3) {
-		wr(mbox, MBOX_ISSR(MBX_AP2CP_STATUS), (rd(mbox, MBOX_ISSR(MBX_AP2CP_STATUS)) & ~(0xfu << 1)) | 1u << 1);
-	}
 	log_cp_registers("after the start");
+	if (shannon_state >= 3) {
+		boot_handshake();       /* cbd's DL_START and HANDSHAKE COMMAND */
+	}
 	last_status = rd(mbox, MBOX_ISSR(MBX_CP2AP_STATUS));
 	for (int tick = 0; tick < 60 * 100; tick++) {
 		uint32_t pending = rd(mbox, MBOX_INTSR0) >> 16, status = rd(mbox, MBOX_ISSR(MBX_CP2AP_STATUS));
@@ -636,7 +755,7 @@ start_and_listen(void)
 		}
 		IOSleep(10);
 	}
-	say("shannon: 60 s listened to; nothing answered (the SBD rings and INIT_END are the next step)\n");
+	say("shannon: 60 s listened to; nothing answered (PIF_INIT_DONE on SBD rings and INIT_END are the next step)\n");
 }
 
 static void
