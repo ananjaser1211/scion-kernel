@@ -309,7 +309,8 @@ in `hakios.stubs.c`. It needs UFS (`ufs=2`).
 | `shannon_toc=1` | Experiment only: TOC at +0 and BOOT after it (the layout of `shm_ipc.c`'s memory-map probe), not cbd's |
 | `shannon_base=1` | Experiment only: the region's base ORed into the secure request's mode (Linux does so only after a warm boot) |
 | `shannon_blsize=N` | The boot-loader size for the secure request (default BOOT's TOC size, as cbd) |
-| `shannon=3` | Then the AP status word, AP2CP_CFG = 1, waits up to 2 s for the CP's status, then logs every CP mailbox message (PHONE_START, INIT_START, …) and status change for 60 s. Answers nothing yet |
+| `shannon=3` | Then cbd steps 8-11: the AP status word, AP2CP_CFG = 1 (only with RESET_SEQUENCER_STATUS 5), up to 2 s for the CP status; DL_START (the legacy IPC map at 0xF8000000 reset, magic 0x424F4F54, AP status 1); the UDL handshake (0x900d to 0xa00d, then 0x9f00 to 0xaf00, as SIPC5 frames FC D7 08 00 + word in the RAW queues, 30 s each); then 60 s of the CP mailbox (PHONE_START, INIT_START, ...). PIF_INIT_DONE / INIT_END (the SBD rings) are next |
+| `shannon_udl_irq=1` | Also rings the mailbox (MASK_SEND_RAW) after each UDL word; Linux xmit_udl does not |
 | `shannon_sysrev=N` | The board revision in the AP status word (default 0) |
 
 `sysctl kern.hakios.shannon_state` is 0 (nothing), 1 (read), 2 (verified), 3 (CP status up) or 4 (CP spoke). The
