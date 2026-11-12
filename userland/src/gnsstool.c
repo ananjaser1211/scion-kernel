@@ -14,6 +14,8 @@
  *                                        put the engine in PASSTHROUGH and talk to the baseband's boot ROM as gpsd does:
  *                                        handshake, then load each FILE at baseband address ADDR (hex) in checked blocks;
  *                                        -r RESET first, -n no flow control, -2 clock doubler, -x GetOutOfLegacy at the end
+ *   gnsstool pvt TEXT [SECONDS]          the on-chip engine's debug request (RPC 0x401): gnss_start, gnss_stop,
+ *                                        enable_log_to_host_LOG_INFO_Overwrite, ...
  *   gnsstool bri HEX [SECONDS]           raw bytes for the baseband in a MEIF PASS_THRU (in PASSTHROUGH), then listen
  *
  * MEIF_SERIAL in the environment sets the serial of the first MEIF message sent (meif, esw, bri; default 1).
@@ -942,6 +944,29 @@ main(int argc, char **argv)
 		    r->flags ? "acknowledged" : "NOT acknowledged");
 		fflush(stdout);
 		listen_for(argc > 4 ? atof(argv[4]) : 5);
+	} else if (strcmp(cmd, "pvt") == 0 && argc > 2) {
+		/* RPC 0x401, GnssPvtDebugRequest: [u16 n][the text and its NUL, n bytes][u8 0]. A wrong length makes the
+		 * chip assert (rpc_engine.cpp 222) and wedges the hub until a cold restart, so it is built here, not by hand */
+		uint8_t q[3 + 1000];
+		size_t t = strlen(argv[2]) + 1;
+		struct rec *r;
+
+		if (t > 900) {
+			return 2;
+		}
+		q[0] = 'R';
+		q[1] = 0x01;
+		q[2] = 0x04;
+		q[3] = (uint8_t)t;
+		q[4] = (uint8_t)(t >> 8);
+		memcpy(q + 5, argv[2], t);
+		q[5 + t] = 0;
+		put(q, 6 + t);
+		r = answer('A', 8);
+		printf("RPC 0x401 \"%s\": %s\n", argv[2], r == NULL ? "no word from the kernel" :
+		    r->flags ? "acknowledged" : "NOT acknowledged");
+		fflush(stdout);
+		listen_for(argc > 3 ? atof(argv[3]) : 3);
 	} else if (strcmp(cmd, "esw") == 0) {
 		return esw_main(argc, argv);
 	} else if (strcmp(cmd, "bri") == 0 && argc > 2) {
@@ -1023,7 +1048,8 @@ main(int argc, char **argv)
 	} else {
 		fprintf(stderr, "usage: gnsstool listen [SECONDS] | rpc|prpc ID [HEX] [SECONDS] | ssp CMD OPTS ARG LEN [HEX] |\n"
 		    "                peek ADDR [LEN] | dump ADDR LEN FILE [CHUNK] | meif ID [HEX] [SECONDS] |\n"
-		    "                esw [-r] [-n] [-2] [-x] [-l SECONDS] [FILE@ADDR ...] | bri HEX [SECONDS]\n"
+		    "                esw [-r] [-n] [-2] [-x] [-l SECONDS] [FILE@ADDR ...] | bri HEX [SECONDS] |\n"
+		    "                pvt TEXT [SECONDS]\n"
 		    "                (numbers in hex, CHUNK decimal)\n");
 		return 2;
 	}
