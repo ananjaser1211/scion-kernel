@@ -6,6 +6,10 @@ answered by asking the *host* to start the engine (`$pglirm,...` in RPC 0x38). S
 `lhd`'s side of the protocol, and nothing here answers that yet. Location today still comes from Wi-Fi only. This file is
 the trail towards real GNSS.
 
+Update (12 Nov, night): Android's `lhd` and `gpsd` were found in FloydROM and read (below). The chip runs the measurement
+engine, and Broadcom's gpsd is the position engine. They talk MEIF, framed, through TxNav RPCs 0x1E/0x1F. The first MEIF
+message sent from here, CONTROL(RESET), made the chip assert and hang the hub until a cold power cycle.
+
 ## What the chip is
 
 The S9's GNSS receiver is the Broadcom BCM4775 B0, the same chip that carries the sensor hub (`devices/starlte/SENSORS.md`):
@@ -106,6 +110,70 @@ the sensors were unaffected. Nothing came back for the first two. `gnss_start` w
 So `BrcmGnssStart` on the chip does not start the receiver itself. It asks the host (`lhd` on Android) to start the
 measurement engine and the on-chip PVT, in Broadcom's `$PGLIRM` command language, and `lhd` drives the engine.
 `gnss_stop` and `GnssPvtDataStart(0)` were sent afterwards, and the sensors kept running.
+
+## Android's userland: lhd and gpsd (FloydROM, read 12 Nov 2026, night)
+
+FloydROM (an S9 ROM, `FloydROM_T_Exynos9810_Build-22.zip`) carries Samsung's and Broadcom's GNSS userland under
+`floyd/device/common/vendor/`: `bin/hw/lhd` (Broadcom "LHD2 ver. 108.20.545200"), `bin/hw/gpsd` (GLL, same build,
+"StarFlagtailandroid"), `etc/gnss/gps.xml`, `etc/init/init.gps.rc`, and `vendor/etc/sensor/lhd.conf`. Both daemons are
+stripped, but they keep a MiniDebugInfo section (`.gnu_debugdata`, xz) with every function's name: 1.2k symbols in lhd and
+17k in gpsd. The binaries are analysed locally for interoperability only, and never committed. What they show:
+
+**lhd is only a pipe.** `lhd.conf`: `LheBbdPacket=/dev/ttyBCM`, `LheBbdControl=/dev/bbd_control`, `LhePatch=/dev/bbd_patch`,
+`LhePinMux=P17=M1` ("ExtLNA for GNSS"), `GpioNStdbyPath=/sys/class/sec/gps/GPS_PWR_EN/value`. lhd owns the transport
+and the patch download (the same job `hakios.ssp.c` does). Towards gpsd it is a pair of named pipes
+(`/data/system/gps/.pipe.gpsd_to_lhd` and its partner, plus `CtrlPipe`). IPC message 3 carries gpsd's bytes, and lhd
+passes them on **unchanged**. For GNSS it uses these RPCs (lhd's own names):
+
+| RPC | Direction | lhd's name | Encoding |
+|---|---|---|---|
+| 0x1C | to chip | `RpcTxNavigationEncoder::Start(bool)` | `[u8 on]`, reliable; sent when gpsd opens (`GnssTurnOn`) |
+| 0x1D | to chip | `TxNavigation::BurstMode(bool,bool,u16,u16)` | never used by lhd; asserts in the patch |
+| 0x1E | to chip | `TxNavigation::Data(u16, u8*)` | `[u16 n][n bytes]` of gpsd's stream, reliable, at most 1000 per RPC |
+| 0x1F | from chip | `RpcRxNavigationDecoder` | `[u16 n][n bytes]` for gpsd |
+| 0x38 | from chip | `RpcGnssRequestDecoder::GnssControl(char*)` | `[u16 n][text][u8]`: `$pglirm,...` is forwarded to gpsd, and lhd repeats it on a timer until gpsd acks (`GNSS_CONTROL_ACK`) |
+| 0x34 | to chip | `RpcGlobalRequestEncoder::SetPinMuxing(u8 pin, u8 mode)` | sent once the hub is ready: `[17][1]` (LhePinMux P17=M1, the external LNA); `[7][2]` too, behind a flag, on ASIC 0x4775B0 |
+| 0x18 | from chip | assert | `[u32 line][u32 arg2][u32 arg3][u32 arg4][u32 ts][u8 n][file]` |
+
+`GPSD:CORE_ON` / `CORE_OFF` (to `/dev/bbd_control`) is only lhd telling Samsung's kernel driver that gpsd turned GNSS on
+(`OnGnssTurnedOn`); the chip never sees it. The firmware's "GnssPvtDataStart" and "PVT data" are these TxNav RPCs: 0x1E's
+bytes go into a ring buffer for the GNSS task (`Flagtail`), which deframes them as MEIF.
+
+**gpsd is the position engine, and the measurement engine is on the chip.** gpsd's `GlPe_MeIfImpl` talks to the hub
+firmware's `GlMe_PeIfImpl` (ME "Chinook", on the chip). gpsd's `SetRfType`, `SetRfMode`, `SetLnaMask` and the other RF
+setters are empty stubs here: the chip configures its own RF. gps.xml's `FrqPlan`, `RfType` and LNA go only into a text
+string (`lte_band_13:%d;...;lna_mask:%d;rf_mode:%d;gps_carrier_type:...`, `SetOnChipConfigParameters`). The host ME
+driver that gpsd also contains (`GlMeSrd*`, Pike/Carp `EswRpc*`, ESW patch loader) is for other chips. The MEIF wire
+format is:
+
+- message: `[u16 id][u16 len][u16 serial][payload][u16 sum]`. `len` counts everything before the sum, and the sum adds
+  those bytes. The serial counts up from 1 (u8 wrap). gpsd asserts that `len` is even.
+- framing: `A5 93` + message, with every `A5` doubled, + `A5 68`. The hub's deframer (0x008112ac) matches.
+- ids: 0 ACK, 1 NACK, 2 ERROR, 3 CONTROL, 4 STATE_REPORT, 5 EVENT_REPORT, 6 CONFIG_SET, 7 CONFIG_GET, 8 CONFIG_VALUES,
+  9 AIDING, 0xA DATA_AIDING, 0xB MEASUREMENT, 0xC DATA, 0xD DEBUG, 0xE/0xF TEST, 0x10 SW_UPLOAD (also carries config
+  strings, type 0x8000), 0x11-0x13 SENSOR, 0x14 ASIC_CFG, 0x15 ASIC, 0x16 PLATF_STATS; 0x8000 LOGGING, 0x8002
+  PASS_THRU, 0x8003 DEBUG_CONFIG, 0x8004 DAC; 0x8100 GLPP2, 0x8101 COMPACTMEAS, 0x8102 TIME_TRANSFER, 0x8103
+  GPS_TIME_REPORT; PEX (on-chip "MicroNav" PVT) 0x8180 AIDING, 0x8181 UTC_TIME_AIDING, 0x8182 LTO, 0x8183 CONFIG,
+  0x8185 HOST_ME_HB, 0x8186/0x8187 TIME_INJECT, 0x818B INITIAL_POS, 0x818C HOST_MICRO_NAV_FIX_STATUS, 0x81A0
+  TIME_REPORT, 0x81A1 STATUS_REPORT, 0x81D0 NVRAM.
+- CONTROL is `[serial][u16 state]` (10 bytes in all): states 0 RESET, 1 SETUP, 2 OFF, 3 SLEEP, 4 IDLE, 5 ON,
+  6 POWER_SAVE, 7 TEST, 8 SHUTDOWN, 9 ERROR, 10 PASSTHROUGH, 11 REQ_CURRENT. STATE_REPORT has the old state at byte 6
+  and the new state at byte 8.
+- gpsd's sequence: `TurnAsicOn` sends CONTROL(RESET). When the chip reports a state of OFF or below, gpsd sends CONFIG_GET,
+  CONFIG_SET (a list of items built from GlSettings), the config string, and CONTROL(IDLE). When the chip reports IDLE and
+  gpsd wants measurements, its first aiding (satellites, signal, or oscillator offset) is followed by CONTROL(ON). The chip
+  then sends MEASUREMENT / COMPACTMEAS, and gpsd's Kalman filter computes the fix (`GlPeNavGnssKF`). The on-chip MicroNav
+  is used for batching and geofences (`$pglirm,req_breadcrumb,pvtOnChip`), configured with PEX messages.
+
+Tried on the phone (build 30, indoors): `gnsstool rpc 1c 01`, then `rpc 1e 0e00a593030008000100000000000c00a568`, which is
+CONTROL(RESET), gpsd's first message, framed. Both RPCs were acknowledged. About 0.1 s later the chip sent eleven RPC 0x18
+asserts over 22 s, at intervals growing from 0.56 s to 0.88 s, all `rpc_engine.cpp` line 222. That is the ROM's RPC
+dispatcher (0x0001cb42), which asserts when a decoder that handled an RPC left bytes unread or read past the end. After
+that the hub answered nothing (no SSP, no sensor logs), and a warm reboot did not bring it back: LDO37 stays on. Read from
+the ROM, the 0x1E decoder (0x00022f5c) is GetU16 then GetBuffer(n), little-endian, and the hub's MEIF deframer matches
+gpsd's framing. So the bytes sent were well formed. The likeliest reading is that RESET made the ME restart something
+whose own RPCs then failed. That is not proven. Until it is understood, do not send CONTROL(RESET) again. The next probe
+is CONTROL(REQ_CURRENT), `gnsstool meif 3 0b00`, which changes no state, with the chip's log enabled first.
 
 ## The tools (kernel and userland)
 
