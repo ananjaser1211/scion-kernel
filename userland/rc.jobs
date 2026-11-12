@@ -20,5 +20,3 @@
 /redwood/bin/var_sync 5 &
 # the device's name as the computer name (no lockdownd here): Bluetooth and Bonjour see it (src/devname.c)
 /redwood/bin/devname
-# apps from ../apps in the system image: LaunchServices keeps its database on the kept /private/var and does not walk /Applications again
-/var/jb/usr/bin/uicache -p /Applications/YouTube.app

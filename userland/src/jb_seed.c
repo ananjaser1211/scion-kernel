@@ -253,6 +253,39 @@ run(char *const argv[])
 }
 
 /*
+ * The applications from ../apps (userland/build.sh lists them in /Applications/.extra-apps, one name a line). They
+ * are plain directories in /Applications like the port's own, but LaunchServices keeps its database on the kept
+ * /private/var and does not walk /Applications again on a later image, so each is registered with the prefix's
+ * uicache -- here and not in rc.jobs, which runs before this job has put uicache there on a fresh phone.
+ */
+static void
+register_apps(void)
+{
+	FILE *list = fopen("/Applications/.extra-apps", "r");
+	char name[256], path[320];
+	struct stat st;
+
+	if (list == NULL || stat("/var/jb/usr/bin/uicache", &st) != 0) {
+		if (list != NULL) {
+			fclose(list);
+		}
+		return;
+	}
+	while (fgets(name, sizeof(name), list) != NULL) {
+		name[strcspn(name, "\r\n")] = '\0';
+		if (name[0] == '\0' || strchr(name, '/') != NULL) {
+			continue;
+		}
+		snprintf(path, sizeof(path), "/Applications/%s", name);
+		if (stat(path, &st) == 0) {
+			char *const argv[] = { "/var/jb/usr/bin/uicache", "-p", path, NULL };
+			run(argv);
+		}
+	}
+	fclose(list);
+}
+
+/*
  * A new prefix in the image (its stamp differs from the copy's, or the copy has none): the copy is moved aside,
  * whole, to /private/var/jb.old-SECONDS, and the image's is seeded in its place -- so that what a later bootstrap
  * adds (OpenSSH, ElleKit) reaches a phone seeded before it. Nothing is deleted; a failed seed puts the old one back.
@@ -326,5 +359,6 @@ main(void)
 	if (stat("/var/jb/prep.sh", &st) == 0) {
 		run(prep);
 	}
+	register_apps();
 	return 0;
 }

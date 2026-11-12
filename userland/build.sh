@@ -1172,9 +1172,12 @@ if [ -f $DARWIN/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	#
 	# cp -aL and not cp -a: a bundle made of symbolic links is refused ("Unable to register"),
 	# so whatever a link points at is copied as the file itself.
+	# Their names go to /Applications/.extra-apps: jb_seed registers each with uicache once the prefix is there.
+	rm -f sysroot/Applications/.extra-apps
 	for app in ../apps/*.app; do
 		[ -d "$app" ] || continue
 		cp -aL "$app" sysroot/Applications/
+		echo "${app##*/}" >> sysroot/Applications/.extra-apps
 		echo "  ${app##*/} in /Applications ($(du -sm "$app" | cut -f1) MB from ../apps)"
 	done
 	# our audio device, where the audio server looks for such plug-ins (and for no others: Apple's are left out)
