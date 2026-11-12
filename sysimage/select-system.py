@@ -172,6 +172,15 @@ SKIP_PREFIX = ('usr/share/tokenizer/', 'usr/share/firmware/', 'usr/share/mecabra
                'usr/standalone/', 'Library/Audio/', 'Library/Ringtones/',
                HEALTH + 'Assets/FitnessUIAssets.bundle/') + \
     tuple(f'System/Library/{name}/' for name in SKIP_SYSTEM_LIBRARY)
+# ... but these parts of the directories skipped above are wanted all the same, whole (docs/system-selection.md):
+#   the English language assets (84.6 MB): the lexicons and models the keyboard's autocorrection, predictive text
+#     and spell checking work from;
+#   the ringtones and alert tones (17.2 MB): without them Settings > Sounds has none to choose and alarms and
+#     timers have only the default sound;
+#   three small preinstalled MobileAssets (22.2 MB): the game controller database (GameController maps a pad's
+#     buttons with it), the language detector's models, locationd's configuration.
+KEEP_SKIPPED = ('System/Library/LinguisticData/RequiredAssets_en.bundle/', 'Library/Ringtones/') +     tuple(f'System/Library/PreinstalledAssetsV2/RequiredByOs/com_apple_MobileAsset_{name}/'
+          for name in ('GameController_DB1', 'LanguageDetectorAssets', 'CoreLocationConfig'))
 BIG_PROGRAM = 10 << 20           # daemons bigger than this (lskdd, ...) are not on the way to the screen
 # ... but these are wanted all the same: locationd (31 MB), without which nothing in iOS has a location
 # -- Weather and its widget, Maps, the clock's cities' local weather -- and every app that asks for one
@@ -228,6 +237,8 @@ def wanted_file(path, size):
         return False
     if path.startswith(AUDIO):
         return not path.startswith(SKIP_AUDIO) and '.espresso.' not in path
+    if path.startswith(KEEP_SKIPPED):
+        return True
     if path.startswith(SKIP_PREFIX):
         return False
     if path.startswith('System/Library/Fonts/'):
@@ -280,7 +291,8 @@ def main():
             keep = wanted_file(path, size)
         elif stat.S_ISLNK(mode):
             # a symlink costs nothing: keep every one that lives where we take anything at all
-            keep = '/' not in path or path.startswith(WHOLE) and not path.startswith(SKIP_PREFIX)
+            keep = '/' not in path or path.startswith(WHOLE) and (not path.startswith(SKIP_PREFIX) or
+                                                               path.startswith(KEEP_SKIPPED))
         else:
             # (the sound plug-ins' too: Library/Audio is skipped but for AUDIO, and without its en.lproj the
             # virtual audio device's port names came out NULL -- mediaserverd died naming the microphone)
