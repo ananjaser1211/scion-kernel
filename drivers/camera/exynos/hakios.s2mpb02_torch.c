@@ -26,12 +26,19 @@
  *   torch=3    ... the light for iOS until the run ends: /dev/hakios-torch takes a level of 0 to 1000 (a 32-bit number,
  *              0 off) and a read gives what is lit; on for torch_max_s at a time at most (default 30, never more than
  *              120), off and staying off while the battery is above 45 C
+ *   torch_flash_ms=N after setup, test the rear camera's flash output for N ms (1-500; Star2 defaults to 120). The
+ *              flash current is Apollo's device-tree code 12 (1.25 A), its hardware timer code 7, and both pins are
+ *              forced low again before the normal iOS torch service starts.
+ *   torch_code_max=N  the torch current code iOS's full level maps to (1-9, default 3: the S9's 60 mA). Star2's device
+ *              tree gives Android's flashlight levels codes 2-9 (torch-sec1's torch_table); 9 is never exceeded.
+ * The chip's controller is the camera driver's too: every message goes under hakios_s2mpb02_bus_lock().
  *
  * Sources: the phone's device tree (hsi2c@10920000, s2mpb02@59 and its flash node: torch1-gpio, flash1-gpio, the
  * currents and timers), Samsung's leds-s2mpb02.c and s2mpb02-private.h of the S9's kernel, Linux's pinctrl-exynos.c
  * (GPL: read for these facts, not copied).
  */
 #include <kern/clock.h>
+#include <kern/locks.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_time.h>
@@ -54,7 +61,10 @@
 #define FLED_CUR1       0x14
 #define FLED_TIME1      0x15
 #define FLED_CTRL2_ANDROID 0x38         /* what Android leaves in FLED_CTRL2 on the S9 (the header) */
-#define TORCH_CODE_MAX  3               /* 60 mA: Android's flashlight, never more */
+#define TORCH_CODE_MAX  3               /* 60 mA: Android's flashlight on the S9 */
+#define TORCH_CODE_CAP  9               /* Star2's DT torch_table tops out at 9: torch_code_max never above it */
+#define FLASH_CODE      12              /* Apollo star2: brightness 0xc, 1.25 A */
+#define FLASH_TIME_CODE 7               /* Apollo star2: timeout 0x7 */
 #define HOT_C           45
 
 #define GPIO_PERIC0_PA  EXYNOS_GPIO_PERIC0_PA
@@ -80,6 +90,7 @@ static vm_offset_t peric0, peric1;
 static uint32_t lit;                    /* the level lit now, 0 to 1000 */
 static uint64_t lit_since;
 static uint32_t max_secs = 30;
+static uint32_t torch_code_max = TORCH_CODE_MAX;   /* torch_code_max: the brightest torch code iOS's 1000 maps to (1-9) */
 static bool broken;                     /* a write did not read back, or the bus failed: no more writing */
 static lck_mtx_t *torch_lock;
 
@@ -95,10 +106,43 @@ wr(vm_offset_t base, uint32_t off, uint32_t v)
 	*(volatile uint32_t *)(base + off) = v;
 }
 
+/*
+ * The S2MPB02's controller (hsi2c@10920000) is the camera driver's too (hakios.exynos_camera.c: the cameras' LDOs):
+ * one transfer at a time, whichever driver makes it. Taken by both around every message to the chip.
+ */
+static LCK_GRP_DECLARE(s2mpb02_bus_grp, "hakios-s2mpb02-bus");
+static LCK_MTX_DECLARE(s2mpb02_bus_mtx, &s2mpb02_bus_grp);
+
+void hakios_s2mpb02_bus_lock(void);
+void hakios_s2mpb02_bus_unlock(void);
+
+void
+hakios_s2mpb02_bus_lock(void)
+{
+	lck_mtx_lock(&s2mpb02_bus_mtx);
+}
+
+void
+hakios_s2mpb02_bus_unlock(void)
+{
+	lck_mtx_unlock(&s2mpb02_bus_mtx);
+}
+
+static uint32_t
+get_locked(uint8_t reg, uint8_t *value)
+{
+	return hakios_hsi2c_read_reg(&bus, CHIP, reg, value, 1);
+}
+
 static uint32_t
 get(uint8_t reg, uint8_t *value)
 {
-	return hakios_hsi2c_read_reg(&bus, CHIP, reg, value, 1);
+	uint32_t error;
+
+	hakios_s2mpb02_bus_lock();
+	error = get_locked(reg, value);
+	hakios_s2mpb02_bus_unlock();
+	return error;
 }
 
 /* the flash block's registers only, every write read back */
@@ -106,11 +150,15 @@ static bool
 put(uint8_t reg, uint8_t value)
 {
 	uint8_t buf[2] = { reg, value }, back = 0;
+	bool failed;
 
 	if (broken || reg < FLED_CTRL1 || reg > FLED_TIME1) {
 		return false;
 	}
-	if (hakios_hsi2c_message(&bus, CHIP, false, buf, 2, true) != 0 || get(reg, &back) != 0 || back != value) {
+	hakios_s2mpb02_bus_lock();
+	failed = hakios_hsi2c_message(&bus, CHIP, false, buf, 2, true) != 0 || get_locked(reg, &back) != 0 || back != value;
+	hakios_s2mpb02_bus_unlock();
+	if (failed) {
 		say("s2mpb02: register %#x: wrote %#x, read back %#x (bus %#x): no more writing for this run\n", reg, value, back,
 		    bus.last_error);
 		broken = true;
@@ -148,7 +196,7 @@ dark(void)
 static bool
 light(uint32_t permille)
 {
-	uint32_t code = (TORCH_CODE_MAX * permille + 999) / 1000;
+	uint32_t code = (torch_code_max * permille + 999) / 1000;
 
 	if (permille == 0) {
 		dark();
@@ -157,8 +205,8 @@ light(uint32_t permille)
 	if (code < 1) {
 		code = 1;
 	}
-	if (code > TORCH_CODE_MAX) {
-		code = TORCH_CODE_MAX;
+	if (code > torch_code_max) {
+		code = torch_code_max;
 	}
 	if (!put_bits(FLED_CUR1, 0x0f, (uint8_t)code)) {
 		dark();
@@ -170,6 +218,23 @@ light(uint32_t permille)
 		lit_since = mach_absolute_time();
 	}
 	lit = permille;
+	return true;
+}
+
+static bool
+flash_test(uint32_t ms)
+{
+	if (ms == 0) return true;
+	if (ms > 500) ms = 500;
+	if (!put_bits(FLED_CUR1, 0xf0, FLASH_CODE << 4) || !put_bits(FLED_TIME1, 0xf0, FLASH_TIME_CODE << 4)) {
+		dark();
+		return false;
+	}
+	pin(peric0 + GPG2, TORCH_PIN, false);
+	pin(peric1 + GPG3, FLASH_PIN, true);
+	say("s2mpb02: camera flash test: %u ms at Apollo code %u (1.25 A)\n", ms, FLASH_CODE);
+	IOSleep(ms);
+	dark();
 	return true;
 }
 
@@ -251,7 +316,7 @@ static const struct cdevsw torch_cdevsw = {
 static void
 torch_thread(void *arg, __unused wait_result_t result)
 {
-	uint32_t steps = (uint32_t)(uintptr_t)arg, secs = 2;
+	uint32_t steps = (uint32_t)(uintptr_t)arg, secs = 2, flash_ms = 0;
 	uint8_t id = 0, regs[4] = { 0 };
 
 	say("s2mpb02: 1: map the bus (USI10 of PERIC1) and the two pins' GPIO blocks\n");
@@ -263,8 +328,10 @@ torch_thread(void *arg, __unused wait_result_t result)
 	say("s2mpb02: 1: torch1 (gpg2-4): CON %x DAT %x; flash1 (gpg3-5): CON %x DAT %x\n",
 	    (rd(peric0 + GPG2, 0) >> (4 * TORCH_PIN)) & 0xf, (rd(peric0 + GPG2, 4) >> TORCH_PIN) & 1,
 	    (rd(peric1 + GPG3, 0) >> (4 * FLASH_PIN)) & 0xf, (rd(peric1 + GPG3, 4) >> FLASH_PIN) & 1);
+	hakios_s2mpb02_bus_lock();
 	hakios_hsi2c_power(&bus);
 	hakios_hsi2c_reset(&bus);
+	hakios_s2mpb02_bus_unlock();
 	if (get(REG_ID, &id) != 0) {
 		say("s2mpb02: 1: no answer at 0x%x (%x)\n", CHIP, bus.last_error);
 		goto out;
@@ -280,6 +347,10 @@ torch_thread(void *arg, __unused wait_result_t result)
 		say("s2mpb02: 2: the flash block could not be set up\n");
 		goto out;
 	}
+	PE_parse_boot_argn("torch_flash_ms", &flash_ms, sizeof(flash_ms));
+	if (flash_ms && (too_hot() || !flash_test(flash_ms))) {
+		say("s2mpb02: camera flash test refused or failed\n");
+	}
 	if (steps == 2) {
 		PE_parse_boot_argn("torch_secs", &secs, sizeof(secs));
 		secs = secs > 10 ? 10 : secs;
@@ -291,6 +362,8 @@ torch_thread(void *arg, __unused wait_result_t result)
 		goto out;
 	}
 	PE_parse_boot_argn("torch_max_s", &max_secs, sizeof(max_secs));
+	PE_parse_boot_argn("torch_code_max", &torch_code_max, sizeof(torch_code_max));
+	torch_code_max = torch_code_max == 0 ? TORCH_CODE_MAX : torch_code_max > TORCH_CODE_CAP ? TORCH_CODE_CAP : torch_code_max;
 	max_secs = max_secs == 0 ? 30 : max_secs > 120 ? 120 : max_secs;
 	{
 		int major = cdevsw_add(-1, &torch_cdevsw);
@@ -327,6 +400,7 @@ hakios_s2mpb02_torch_init(void)
 {
 	uint32_t steps = 0, camera = 0;
 	thread_t thread;
+	kern_return_t result;
 
 	if (!PE_parse_boot_argn("torch", &steps, sizeof(steps)) || steps == 0) {
 		return;
@@ -335,11 +409,13 @@ hakios_s2mpb02_torch_init(void)
 		return;                 /* not the Exynos 9810's (the POCO's torch=N is its own driver's) */
 	}
 	if (PE_parse_boot_argn("cam_s9", &camera, sizeof(camera)) && camera != 0) {
-		say("s2mpb02: not with cam_s9=%u: the camera's driver (hakios.exynos_camera.c) has this bus in this run\n", camera);
-		return;
+		say("s2mpb02: cam_s9=%u shares this controller; camera discovery was started first\n", camera);
 	}
 	torch_lock = lck_mtx_alloc_init(lck_grp_alloc_init("s2mpb02", LCK_GRP_ATTR_NULL), LCK_ATTR_NULL);
-	if (kernel_thread_start(torch_thread, (void *)(uintptr_t)steps, &thread) == KERN_SUCCESS) {
+	result = kernel_thread_start(torch_thread, (void *)(uintptr_t)steps, &thread);
+	if (result == KERN_SUCCESS) {
 		thread_deallocate(thread);
+	} else {
+		say("s2mpb02: torch worker could not start (%#x)\n", result);
 	}
 }

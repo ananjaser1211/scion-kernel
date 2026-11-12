@@ -149,6 +149,11 @@ const char *hakios_exynos_iris_shot(__unused uint32_t n) { return "this kernel h
 #ifndef HAKIOS_S2MPB02_TORCH
 void hakios_s2mpb02_torch_init(void) {}
 void hakios_s2mpb02_torch_quiesce(void) {}
+/* the S2MPB02's bus lock (hakios.exynos_camera.c takes it): no flashlight, nobody else on the bus */
+void hakios_s2mpb02_bus_lock(void);
+void hakios_s2mpb02_bus_lock(void) {}
+void hakios_s2mpb02_bus_unlock(void);
+void hakios_s2mpb02_bus_unlock(void) {}
 #endif
 #ifndef HAKIOS_BCM4361_BT
 void hakios_bcm4361_bt_init(void) {}

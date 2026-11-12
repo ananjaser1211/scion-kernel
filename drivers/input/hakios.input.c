@@ -311,13 +311,14 @@ hakios_input_init(void)
 	hakios_exynos_keys_init();
 	hakios_s6sy761_init();
 	hakios_s6e3ha8_init();
-	hakios_s2mpb02_torch_init();
 	hakios_exynos_abox_init();
 	hakios_exynos_mfc_init();
 	hakios_battery_init();
 	hakios_scfb_battery_init();
 	hakios_max77705_init();
 	hakios_exynos_camera_init();
+	/* The camera inspects the shared S2MPB02 first; start its flashlight service afterwards. */
+	hakios_s2mpb02_torch_init();
 	hakios_exynos_iris_init();
 	hakios_exynos_tee_init();
 	hakios_ufs_init();
