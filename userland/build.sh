@@ -454,6 +454,12 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 		# the GNSS bring-up's raw RPCs, SSP transactions and hub memory reads through /dev/hakios-gnss
 		# (src/gnsstool.c, docs/gnss.md)
 		$DYN -o obj/gnsstool src/gnsstool.c
+		# the GNSS receiver for iOS: its fixes to locationd, for every app (src/gnssd.m, docs/gnssd.md); locationd takes
+		# them only from a program with its simulation entitlement: by ldid, or by ../tools/machosign.py
+		$DYN -fobjc-arc -framework Foundation -framework CoreLocation -o obj/gnssd src/gnssd.m &&
+			{ ${LDID:-ldid} -Ssrc/gnssd.entitlements obj/gnssd 2>/dev/null ||
+			  python3 ../tools/machosign.py obj/gnssd src/gnssd.entitlements com.hakios.gnssd ||
+			  echo "build.sh: no ldid: gnssd is unsigned, and locationd will refuse its fixes"; }
 		# our library for inside stock Darwin programs (the jobs in INJECT are started with it)
 		$DYN -dynamiclib -install_name /redwood/lib/libhakios.dylib -framework CoreFoundation -framework IOKit -lobjc \
 			-o obj/libhakios.dylib src/inject.c
@@ -642,6 +648,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	[ -f obj/wifipw_test ] && cp obj/wifipw_test root/bin/
 	[ -f obj/loctool ] && cp obj/loctool root/bin/
 	[ -f obj/gnsstool ] && cp obj/gnsstool root/bin/
+	[ -f obj/gnssd ] && cp obj/gnssd root/bin/
 	[ -f obj/aes_test ] && cp obj/aes_test root/bin/
 	[ -f obj/sound_test ] && cp obj/sound_test root/bin/
 	[ -f obj/torch_test ] && cp obj/torch_test root/bin/
@@ -837,6 +844,8 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	# sshd from the prefix, when there is a key of ours to let in (com.hakios.sshd.plist; SHARE=1: never)
 	if [ -z "$SHARE" ] && [ -f ../ssh/authorized_keys ]; then cp com.hakios.sshd.plist root/LaunchDaemons/; else rm -f root/LaunchDaemons/com.hakios.sshd.plist; fi
 	[ ! -f root/bin/selftest ] || cp com.hakios.selftest.plist root/LaunchDaemons/
+	# the GNSS receiver's fixes to locationd (src/gnssd.m, docs/gnssd.md)
+	[ ! -f root/bin/gnssd ] || cp com.hakios.gnssd.plist root/LaunchDaemons/
 	[ -z "$JB_KEPT_ONLY" ] || : > root/etc/jb.kept-only     # init: no graft on a memory filesystem (src/init.c)
 	VOLUME=""
 	[ -n "$FLASHBOOT" ] && [ -f $DARWIN/rootfs.slt ] && VOLUME="--root-volume $DARWIN/rootfs.slt"
