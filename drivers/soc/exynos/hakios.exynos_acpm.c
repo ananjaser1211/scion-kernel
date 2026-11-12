@@ -54,6 +54,9 @@
 #include <sys/hakios.exynos_acpm.h>
 #include <sys/hakios.exynos_soc.h>
 #include <sys/hakios.xnu.h>
+#include <kern/thread.h>
+#include <stdarg.h>
+#include <sys/systm.h>
 
 #define MBOX_PA         EXYNOS_APM_MBOX_PA
 #define MBOX_INTGR0     0x08
@@ -498,15 +501,13 @@ names_dvfs(const char *name)
 	return false;
 }
 
-uint32_t
-hakios_acpm_dvfs_table(uint32_t index, uint32_t *khz, uint32_t *uv, uint32_t most, int (*say)(const char *, ...))
+/* where the DVFS plugin's map is in the SRAM; 0 when it is not found (said with `say`) */
+static uint32_t
+fvmap_at(int (*say)(const char *, ...))
 {
-	uint32_t plugins, count, map = 0, header, levels, at;
+	uint32_t plugins, count, map = 0;
 	char name[24];
 
-	if (!acpm_ready) {
-		return 0;
-	}
 	plugins = srd(INITDATA + ID_PLUGINS);
 	count = srd(INITDATA + ID_NPLUGINS);
 	if (count == 0 || count > 32 || !sram_ok(plugins, count * PL_SIZE)) {
@@ -530,6 +531,16 @@ hakios_acpm_dvfs_table(uint32_t index, uint32_t *khz, uint32_t *uv, uint32_t mos
 	}
 	if (map == 0) {
 		say("acpm: fvmap: no plugin named for DVFS among %u\n", count);
+	}
+	return map;
+}
+
+uint32_t
+hakios_acpm_dvfs_table(uint32_t index, uint32_t *khz, uint32_t *uv, uint32_t most, int (*say)(const char *, ...))
+{
+	uint32_t map, header, levels, at;
+
+	if (!acpm_ready || (map = fvmap_at(say)) == 0) {
 		return 0;
 	}
 	header = map + index * FV_HEADER;
@@ -574,6 +585,222 @@ hakios_acpm_stop(void)
 }
 
 /*
+ * The other DVFS domains: the memory bus (MIF), the internal bus (INT, which also clocks the video codec's CLKCMU_MFC_BUS),
+ * the display (DISP) and the rest. Their indexes are Samsung's (Apollo drivers/soc/samsung/cal-if/exynos9810/
+ * acpm_dvfs_exynos9810.h:2-16: mif 0, int 1, cpucl0 2, cpucl1 3, g3d 4, intcam 5, fsys0 6, cam 7, disp 8, aud 9, iva 10,
+ * score 11, cp 12; the devfreq nodes' dfs_id 0xb04000N carry the same N). Samsung's devfreq sets each with
+ * cal_dfs_set_rate(dfs_id, kHz) -> exynos_acpm_set_rate(N, kHz) (exynos9810_bus_mif.c:216-224, cal-if.c:49-66), the
+ * request hakios_acpm_dvfs_set() sends; the APM applies the level's voltage itself.
+ * Samsung's limits, star2lte_kor_26.dts devfreq_* freq_info = <initial default_qos suspend min MAX reboot> (exynos-devfreq.c:
+ * 959-970) and boot_info = <seconds kHz>: MIF max 2093000, boot 1794000 for 40 s (:9489-9490); INT max 667000, boot 667000
+ * (:9511-9512); DISP max 640000, boot 640000 (:9553-9554). A rate asked here is never above Samsung's max nor the APM's top.
+ *
+ * Boot-args:
+ *   bus_log=0   do not log the APM's tables at boot (default: one line per domain, read only)
+ *   bus_max=1   MIF, INT and DISP to their top at boot, kept there (re-asked every 10 s, cheap)
+ *   bus_max=2   MIF, INT and DISP at their top while frames are shown or video decoded (hakios_exynos_bus_busy()), back
+ *               to Samsung's boot rates (1794000 / 667000 / 640000) after 5 s of neither
+ *   bus_mask=N  which of the pinned domains bus_max moves, a bit per DVFS index (default 0x1a3: MIF 0, INT 1, INTCAM 5,
+ *               CAM 7, DISP 8). S-Boot leaves DISP at 400 MHz, INTCAM and CAM at their slowest (630 / 590 MHz) and MIF
+ *               at 1794 MHz; Samsung's devfreq starts them at initial_freq (DISP 640000, INTCAM and CAM 690000 --
+ *               star2lte_kor_26.dts devfreq_intcam/_cam freq_info). bus_max=1 with all of them hung the S9+ at once
+ *               (build 17, a purple screen, nothing logged): bus_mask=0x1a2 leaves MIF where S-Boot put it.
+ */
+#define BUS_DOMAINS_MOST        13
+#define BUS_LEVELS_MOST         32
+#define BUS_POLL_US             250000u
+#define BUS_HOLD_MS             1000u   /* bus_max=2: busy if a frame or a decode came within this */
+#define BUS_IDLE_MS             5000u   /* ... and back to the boot rates after this much without */
+#define BUS_REASK_MS            10000u  /* bus_max=1: asked again this often (the APM may have been asked otherwise) */
+#define CMU_MIF_PA              0x1B800000u     /* Apollo cal-if exynos9810 cmucal-sfr.c: CMU_MIF; PLL_CON0_PLL_MIF +0x120 */
+#define CMU_MIF_PLL_CON0        0x120
+
+static const char *const bus_names[BUS_DOMAINS_MOST] = {
+	"MIF", "INT", "CPUCL0", "CPUCL1", "G3D", "INTCAM", "FSYS0", "CAM", "DISP", "AUD", "IVA", "SCORE", "CP",
+};
+static const struct bus_pin { uint32_t index, samsung_max, samsung_boot; } bus_pins[] = {
+	{ 0, 2093000, 1794000 },        /* MIF  star2lte_kor_26.dts:9489-9490 */
+	{ 1, 667000, 667000 },          /* INT  :9511-9512 */
+	{ 8, 640000, 640000 },          /* DISP :9553-9554 */
+	{ 5, 690000, 640000 },          /* INTCAM devfreq_intcam: freq_info initial/max 690000, boot_info 640000 */
+	{ 7, 690000, 630000 },          /* CAM devfreq_cam: initial/max 690000, boot_info 630000 */
+};
+#define BUS_PINS        (sizeof(bus_pins) / sizeof(bus_pins[0]))
+static uint32_t bus_top[BUS_DOMAINS_MOST];      /* the APM's fastest level of each domain, kHz (0: not read) */
+static uint32_t bus_max, bus_log = 1, bus_level, bus_mask = 0x1a3;  /* bus_level: 0 not set, 1 the boot rates, 2 the top */
+static uint64_t bus_busy_at;
+
+static void
+bus_say(const char *format, ...)
+{
+	char line[480];
+	va_list ap;
+
+	va_start(ap, format);
+	vsnprintf(line, sizeof(line), format, ap);
+	va_end(ap);
+	printf("%s", line);
+	loader_log_line(line);
+}
+
+/* a frame shown (hakios.mali.c hakios_mali_frame) or a picture decoded (hakios.exynos_mfc.c): any context, a stamp only */
+void hakios_exynos_bus_busy(void);
+void
+hakios_exynos_bus_busy(void)
+{
+	__atomic_store_n(&bus_busy_at, mach_absolute_time(), __ATOMIC_RELAXED);
+}
+
+/* PLL_MIF as the CMU has it, MHz (the DRAM's bus at about half); 0 when it cannot be read */
+static uint32_t
+bus_mif_pll_mhz(void)
+{
+	static vm_offset_t cmu_mif;
+	uint32_t con0, m, p, s;
+
+	if (cmu_mif == 0 && (cmu_mif = ml_io_map(CMU_MIF_PA, 0x1000)) == 0) {
+		return 0;
+	}
+	con0 = rd(cmu_mif, CMU_MIF_PLL_CON0);
+	m = (con0 >> 16) & 0x3ff;
+	p = (con0 >> 8) & 0x3f;
+	s = con0 & 7;
+	return p != 0 && (con0 & (1u << 31)) ? (uint32_t)(26ull * m / p >> s) : 0;
+}
+
+/* every domain's levels, one line each, read only; bus_top[] filled */
+static void
+bus_report(void)
+{
+	uint32_t map = fvmap_at(printf);
+
+	if (map == 0) {
+		return;
+	}
+	for (uint32_t d = 0; d < BUS_DOMAINS_MOST; d++) {
+		uint32_t header = map + d * FV_HEADER, levels, init_lv, at, n = 0;
+		char line[400];
+
+		if (!sram_ok(header & ~3u, FV_HEADER + 4)) {
+			break;
+		}
+		levels = srd8(header + FV_NUM_LV);
+		init_lv = srd8(header + 0x08);  /* fvmap.h struct fvmap_header: init_lv, the level the boot left */
+		at = map + srd16(header + 0x14);
+		if (levels == 0 || levels > BUS_LEVELS_MOST || !sram_ok(at, levels * 8)) {
+			bus_say("bus: DVFS %u (%s): %u levels at +%#x: not a table\n", d, bus_names[d], levels, at);
+			continue;
+		}
+		n = (uint32_t)snprintf(line, sizeof(line), "bus: DVFS %u (%s): %u levels, the boot's level %u; kHz/uV:", d,
+		    bus_names[d], levels, init_lv);
+		for (uint32_t l = 0; l < levels && n < sizeof(line) - 24; l++) {
+			uint32_t khz = srd(at + 8 * l), uv = srd(at + 8 * l + 4);
+
+			if (l == 0 && khz >= 1000 && khz <= 4000000) {
+				bus_top[d] = khz;
+			}
+			n += (uint32_t)snprintf(line + n, sizeof(line) - n, " %u/%u", khz, uv);
+		}
+		if (n < sizeof(line) - 2) {
+			line[n] = '\n';
+			line[n + 1] = 0;
+		}
+		if (bus_log) {
+			bus_say("%s", line);
+		}
+	}
+}
+
+/* the pinned domains to their top (top true) or to Samsung's boot rates */
+static void
+bus_set(bool top, bool quiet)
+{
+	uint32_t before = bus_mif_pll_mhz();
+
+	for (uint32_t i = 0; i < BUS_PINS; i++) {
+		const struct bus_pin *b = &bus_pins[i];
+		uint32_t want = b->samsung_boot;
+		int e;
+
+		if ((bus_mask & (1u << b->index)) == 0) {
+			continue;
+		}
+		if (top) {
+			want = bus_top[b->index] != 0 && bus_top[b->index] < b->samsung_max ? bus_top[b->index] : b->samsung_max;
+		}
+		e = hakios_acpm_dvfs_set(b->index, want);
+		if (!quiet || e != 0) {
+			bus_say("bus: %s (DVFS %u) asked for %u kHz (%s; the APM's top %u, Samsung's max %u): %d\n",
+			    bus_names[b->index], b->index, want, top ? "the top" : "Samsung's boot rate", bus_top[b->index],
+			    b->samsung_max, e);
+		}
+	}
+	if (!quiet) {
+		bus_say("bus: PLL_MIF %u MHz before, %u MHz after (the memory bus at about half)\n", before, bus_mif_pll_mhz());
+	}
+	bus_level = top ? 2 : 1;
+}
+
+static void
+bus_thread(__unused void *arg, __unused wait_result_t wr)
+{
+	uint64_t hold, idle, reask, last_ask = 0;
+
+	for (int tries = 0; !hakios_acpm_init(printf); tries++) {
+		if (tries >= 40) {
+			bus_say("bus: no ACPM: the DVFS domains are left as they are\n");
+			return;
+		}
+		delay(BUS_POLL_US);
+	}
+	bus_report();
+	if (bus_max == 0) {
+		return;
+	}
+	nanoseconds_to_absolutetime((uint64_t)BUS_HOLD_MS * NSEC_PER_MSEC, &hold);
+	nanoseconds_to_absolutetime((uint64_t)BUS_IDLE_MS * NSEC_PER_MSEC, &idle);
+	nanoseconds_to_absolutetime((uint64_t)BUS_REASK_MS * NSEC_PER_MSEC, &reask);
+	bus_say("bus: bus_max=%u, bus_mask %#x: the pinned domains (MIF, INT, INTCAM, CAM, DISP) %s\n", bus_max, bus_mask, bus_max == 1 ? "at their top from now on" :
+	    "at their top while frames are shown or video decoded, Samsung's boot rates after 5 s of neither");
+	for (;;) {
+		uint64_t now = mach_absolute_time(), busy = __atomic_load_n(&bus_busy_at, __ATOMIC_RELAXED);
+
+		if (bus_max == 1) {
+			if (bus_level == 0 || now - last_ask >= reask) {
+				bus_set(true, bus_level != 0);
+				last_ask = now;
+			}
+		} else if (busy != 0 && now - busy < hold) {
+			if (bus_level != 2) {
+				bus_set(true, bus_level != 0);
+			}
+		} else if (bus_level == 2 && (busy == 0 || now - busy >= idle)) {
+			bus_set(false, true);
+		}
+		delay(BUS_POLL_US);
+	}
+}
+
+static void
+hakios_exynos_bus_start(void)
+{
+	thread_t thread;
+
+	if (!HAKIOS_SOC_HAS(APM_MBOX_PA)) {
+		return;
+	}
+	(void)PE_parse_boot_argn("bus_max", &bus_max, sizeof(bus_max));
+	(void)PE_parse_boot_argn("bus_log", &bus_log, sizeof(bus_log));
+	(void)PE_parse_boot_argn("bus_mask", &bus_mask, sizeof(bus_mask));
+	if ((bus_max == 0 && bus_log == 0) || bus_max > 2) {
+		return;
+	}
+	if (kernel_thread_start(bus_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	}
+}
+
+/*
  * The Galaxy S9's CPU clocks through ACPM's DVFS (Samsung's cal_dfs_set_rate -> exynos_acpm_set_rate: domain index,
  * kHz, FREQ_REQ). acpm_dvfs_exynos9810.h: dvfs_cpucl0 (the A55s) is index 2, dvfs_cpucl1 (the M3s) index 3.
  * boot-args cpufreq_lit=kHz, cpufreq_big=kHz; nothing without them. With cpufreq_gov=1 the governor
@@ -587,6 +814,7 @@ hakios_exynos_dvfs_start(void)
 		{ "cpufreq_lit", "the A55s (cpucl0)", 2 }, { "cpufreq_big", "the M3s (cpucl1)", 3 },
 	};
 
+	hakios_exynos_bus_start();
 	if (hakios_exynos_cpufreq_gov_start()) {
 		return;
 	}

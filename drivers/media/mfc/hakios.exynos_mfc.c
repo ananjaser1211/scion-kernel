@@ -61,6 +61,7 @@ extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint6
 
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern boolean_t pmap_valid_page(ppnum_t);
+extern void hakios_exynos_bus_busy(void);  /* drivers/soc/exynos/hakios.exynos_acpm.c: a stamp only */
 
 
 /* say() output also goes to the log the boot loader keeps across a return to it; TWRP shows a run's log from there */
@@ -1186,6 +1187,7 @@ mfc_ioctl(dev_t dev __unused, u_long cmd, caddr_t data, int flag __unused, proc_
 		struct hakios_mfc_decode *d = (struct hakios_mfc_decode *)(void *)data;
 		struct mfc_result r;
 
+		hakios_exynos_bus_busy();       /* bus_max=2: MIF and INT at their top while video is decoded */
 		if (!I.open || !I.buffers) {
 			error = ENXIO;
 			break;
