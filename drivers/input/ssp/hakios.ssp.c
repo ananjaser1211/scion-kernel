@@ -1540,6 +1540,90 @@ post_sample(const struct shub_sample *s)
 	lck_mtx_unlock(&shub_lock);
 }
 
+/*
+ * The rate each sensor is read at, as user space asks for it (write() below): what iOS's clients of the sensor want,
+ * so that the hub does not stream the accelerometer, the gyroscope and the magnetometer at 50 Hz to a backboardd
+ * that throws the samples away (12 November: backboardd at 12% of a core with the screen off, doing just that).
+ * RATE_BOOT is the boot's rate (shub_ms, or 200 ms for light, proximity and pressure); 0 is off. run() carries the
+ * changes out between its reads (apply_rates()); the last close puts every sensor back to the boot's rate, so a
+ * reader that dies leaves nothing switched off.
+ */
+#ifndef HAKIOS_SENSOR_RATE_OFF
+struct hakios_sensor_rate {             /* one write() record; the same in userland/src/hakios.sensors.h */
+	uint32_t type;                  /* HAKIOS_SENSOR_* */
+	uint32_t period_ms;             /* HAKIOS_SENSOR_RATE_OFF, HAKIOS_SENSOR_RATE_BOOT, or 5-1000 */
+};
+#define HAKIOS_SENSOR_RATE_OFF  0
+#define HAKIOS_SENSOR_RATE_BOOT 0xffffffffu
+#endif
+#define RATE_MS_LEAST           5
+#define RATE_MS_MOST            1000
+
+static uint32_t rate_ms[SSP_SENSORS];           /* 0 = off, HAKIOS_SENSOR_RATE_BOOT = the boot's; under shub_lock */
+static volatile uint64_t rate_pending;          /* the sensors whose rate_ms run() has still to carry out */
+static bool rates_made;
+
+/* Samsung's number of the sensor behind a HAKIOS_SENSOR_* type; -1 if none */
+static int
+ssp_id_of(uint32_t type)
+{
+	switch (type) {
+	case HAKIOS_SENSOR_ACCEL: return SSP_ACCEL;
+	case HAKIOS_SENSOR_GYRO: return SSP_GYRO;
+	case HAKIOS_SENSOR_MAG: return SSP_MAG;
+	case HAKIOS_SENSOR_PRESSURE: return SSP_PRESSURE;
+	case HAKIOS_SENSOR_LIGHT: return SSP_LIGHT;
+	case HAKIOS_SENSOR_PROXIMITY: return SSP_PROXIMITY;
+	default: return -1;
+	}
+}
+
+/* every sensor back to the boot's rate (called with shub_lock held) */
+static void
+rates_to_boot_locked(void)
+{
+	for (uint32_t id = 0; id < SSP_SENSORS; id++) {
+		if (rates_made && rate_ms[id] != HAKIOS_SENSOR_RATE_BOOT) {
+			rate_pending |= 1ull << id;
+		}
+		rate_ms[id] = HAKIOS_SENSOR_RATE_BOOT;
+	}
+	rates_made = true;
+}
+
+/*
+ * write(): struct hakios_sensor_rate records, each the period a sensor is to be read at from now on. A record of an
+ * unknown type or of a period outside 5-1000 ms (other than off and the boot's) fails the write with EINVAL; the
+ * records before it stand.
+ */
+static int
+sensors_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+{
+	while (uio_resid(uio) >= (user_ssize_t)sizeof(struct hakios_sensor_rate)) {
+		struct hakios_sensor_rate r;
+		int id, error = uiomove((caddr_t)&r, sizeof(r), uio);
+
+		if (error != 0) {
+			return error;
+		}
+		id = ssp_id_of(r.type);
+		if (id < 0 || (r.period_ms != HAKIOS_SENSOR_RATE_OFF && r.period_ms != HAKIOS_SENSOR_RATE_BOOT &&
+		    (r.period_ms < RATE_MS_LEAST || r.period_ms > RATE_MS_MOST))) {
+			return EINVAL;
+		}
+		lck_mtx_lock(&shub_lock);
+		if (!rates_made) {
+			rates_to_boot_locked();
+		}
+		if (rate_ms[id] != r.period_ms) {
+			rate_ms[id] = r.period_ms;
+			rate_pending |= 1ull << id;
+		}
+		lck_mtx_unlock(&shub_lock);
+	}
+	return uio_resid(uio) == 0 ? 0 : EINVAL;
+}
+
 static int
 sensors_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
 {
@@ -1556,6 +1640,9 @@ sensors_close(__unused dev_t dev, __unused int flags, __unused int devtype, __un
 	lck_mtx_lock(&shub_lock);
 	if (q_readers > 0) {
 		q_readers--;
+	}
+	if (q_readers == 0 && rates_made) {
+		rates_to_boot_locked();
 	}
 	lck_mtx_unlock(&shub_lock);
 	return 0;
@@ -1593,7 +1680,7 @@ static const struct cdevsw sensors_cdevsw = {
 	.d_open = sensors_open,
 	.d_close = sensors_close,
 	.d_read = sensors_read,
-	.d_write = eno_rdwrt,
+	.d_write = sensors_write,
 	.d_ioctl = eno_ioctl,
 	.d_stop = eno_stop,
 	.d_reset = eno_reset,
@@ -1867,25 +1954,74 @@ send_board_setup(void)
 static char console_cmd[64];
 static void console_do(void);
 
+/* the rate step 6 reads a sensor at: shub_ms, but 200 ms for light, proximity and pressure */
+static uint32_t
+boot_ms(uint8_t id)
+{
+	return id == SSP_LIGHT || id == SSP_PROXIMITY || id == SSP_PRESSURE ? 200 : period_ms;
+}
+
+/*
+ * Carry out the rates user space asked for (sensors_write()): off is the hub's SENSOR_REMOVE, a new period of a sensor
+ * that is on its CHANGE_DELAY (as Samsung's driver does; REMOVE and ADD if the hub does not take it), on is ADD. Only
+ * the sensors step 6 enabled (shub_sensors and found) are touched.
+ */
+static void
+apply_rates(void)
+{
+	uint64_t pending;
+	uint32_t want[SSP_SENSORS];
+
+	lck_mtx_lock(&shub_lock);
+	pending = rate_pending;
+	rate_pending = 0;
+	memcpy(want, rate_ms, sizeof(want));
+	lck_mtx_unlock(&shub_lock);
+	for (uint8_t id = 0; pending != 0 && id < SSP_SENSORS; id++) {
+		uint32_t ms;
+		uint8_t b[10] = { id };
+
+		if (!(pending & (1ull << id))) {
+			continue;
+		}
+		pending &= ~(1ull << id);
+		if (id >= 32 || !(want_sensors & (1u << id)) || !(ssp.found & (1ull << id))) {
+			continue;
+		}
+		ms = want[id] == HAKIOS_SENSOR_RATE_BOOT ? boot_ms(id) : want[id];
+		if (ms == 0) {
+			if ((ssp.enabled & (1ull << id)) && ssp_cmd(SSP_SENSOR_REMOVE, SSP_AP2HUB_WRITE, 0, b, 5)) {
+				ssp.enabled &= ~(1ull << id);
+			}
+			say("shub: sensor %u off (asked by user space)%s\n", id, (ssp.enabled & (1ull << id)) ? ": NOT taken" : "");
+			continue;
+		}
+		if (ssp.enabled & (1ull << id)) {
+			shub_put32(b + 1, ms);
+			if (ssp_cmd(SSP_CHANGE_DELAY, SSP_AP2HUB_WRITE, 0, b, sizeof(b))) {
+				say("shub: sensor %u every %u ms (asked by user space)\n", id, ms);
+				continue;
+			}
+			if (ssp_cmd(SSP_SENSOR_REMOVE, SSP_AP2HUB_WRITE, 0, b, 5)) {
+				ssp.enabled &= ~(1ull << id);
+			}
+		}
+		say("shub: sensor %u every %u ms (asked by user space): %s\n", id, ms, sensor_on(id, ms) ? "on" : "NOT taken");
+	}
+}
+
 static void
 run(void)
 {
-	static const struct { uint8_t id; uint32_t ms; } slow[] = { { SSP_LIGHT, 200 }, { SSP_PROXIMITY, 200 },
-		                                                   { SSP_PRESSURE, 200 } };
 	uint32_t frames_at_time = 0;
 
 	send_calibration();
 	send_board_setup();
 	for (uint8_t id = 0; id < SSP_SENSORS; id++) {
-		uint32_t ms = period_ms;
+		uint32_t ms = boot_ms(id);
 
 		if (id >= 32 || !(want_sensors & (1u << id)) || !(ssp.found & (1ull << id))) {
 			continue;
-		}
-		for (unsigned i = 0; i < sizeof(slow) / sizeof(slow[0]); i++) {
-			if (slow[i].id == id) {
-				ms = slow[i].ms;
-			}
 		}
 		say("shub: 6: sensor %u on, every %u ms: %s\n", id, ms, sensor_on(id, ms) ? "taken" : "NOT taken");
 	}
@@ -1909,6 +2045,9 @@ run(void)
 					say("shub: sensor %u off\n", id);
 				}
 			}
+		}
+		if (rate_pending) {
+			apply_rates();
 		}
 		if (console_cmd_pending) {
 			console_do();
