@@ -36,6 +36,10 @@
  *            by 4 again in the SPI, about 5.5 MHz; Samsung runs it up to 25 MHz). 255 leaves it as found.
  *   shub_chub_on=1       at step 2, power the CHUB domain on if step 1 found it off, using the PMU's chub_on sequence
  *            from Samsung's flexpmu tables. Default: stop.
+ *   shub_ap_awake=0      do not tell the hub that the AP is awake (default 1: WAKEUP and RESUME after the setup, as
+ *                        Samsung's sensor HAL and resume path do; a hub that thinks the AP asleep keeps parts down)
+ *   shub_mag=N           the magnetometer's PDC matrix of the S9+'s board (Samsung's ssp-mag-array): 1 the SM-G965F
+ *                        (eur_open_26), 2 the Korean SM-G965N (kor_26); 0 (default): none sent
  *   shub_cold=0          leave LDO37 on at a warm start (default 1: off for 100 ms, so a hub that stopped answering
  *                        starts again from cold)
  *   shub_keep=0          power the hub off again (NSTDBY low) when the steps end or one fails. Default 1: leave it
@@ -203,6 +207,8 @@ static struct hakios_exynos_spi bus = {
 static vm_offset_t pmu, cmu_top, cmu_chub, gpio_chub, alive, peric0;
 static uint32_t steps, keep = 1, log_frames, div_ratio = 15, chub_on_ok;
 static uint32_t cold_start = 1;                 /* shub_cold: LDO37 off and on at a warm start */
+static uint32_t ap_awake = 1;                   /* shub_ap_awake: WAKEUP and RESUME after the setup */
+static uint32_t mag_board;                      /* shub_mag: 1 G965F, 2 G965N: which PDC matrix */
 static uint32_t want_sensors = 0x2b3, period_ms = 20, req_rpc = SHUB_RPC_SENSOR_REQ, req_len = 1;
 static uint32_t acc_position = ACC_POSITION_S9; /* hakios_ssp_init(): by HAKIOS_DEVICE, or shub_acc_pos= */
 static bool acc_cal_given, gyro_cal_given;      /* shub_acc_cal=, shub_gyro_cal= */
@@ -1817,6 +1823,47 @@ make_gnss_device(void)
 
 static volatile uint64_t console_want_on, console_want_off;
 static volatile bool console_cmd_pending;
+/*
+ * What Samsung's driver tells the hub after its own setup that ours had not (initialize_mcu(), ssp_late_resume() and
+ * the sensor HAL's notices, Apollo drivers/sensorhub/brcm): the board's thermistor thresholds, the magnetometer's PDC
+ * matrix of the board, and that the AP is awake. Values from Samsung's star2lte device trees.
+ */
+static const uint8_t mag_matrix_g965f[27] = { 0xc6, 0x52, 0x7a, 0xd0, 0x93, 0x80, 0xff, 0x29, 0xd1, 0x37, 0xe9, 0x30, 0x68,
+	                                      0x1e, 0xff, 0xaa, 0xff, 0xbd, 0x02, 0xfc, 0xbd, 0xfc, 0x7c, 0xb1, 0x0a, 0x97,
+	                                      0x94 };
+static const uint8_t mag_matrix_g965n[27] = { 0x97, 0x57, 0xf2, 0xd6, 0xd5, 0x7c, 0x00, 0xf7, 0xd4, 0x37, 0xc2, 0x4b, 0x34,
+	                                      0xe2, 0xff, 0x83, 0x00, 0xf1, 0x1d, 0x3e, 0xbf, 0x01, 0x61, 0x6f, 0x09, 0x2f,
+	                                      0xdc };
+
+static void
+send_board_setup(void)
+{
+	uint8_t b[27];
+
+	if (strcmp(HAKIOS_DEVICE, "star2lte") == 0) {
+		/* ssp-thermi-up[18] 0x03eb and ssp-thermi-sub[18] 0x03ec, the same in both S9+ trees; thermistor.c sends them as is */
+		b[0] = 0xeb;
+		b[1] = 0x03;
+		b[2] = 0xec;
+		b[3] = 0x03;
+		say("shub: 6: the thermistor thresholds (up 0x03eb, sub 0x03ec): %s\n",
+		    ssp_cmd(SSP_SET_THERMISTOR, SSP_AP2HUB_WRITE, 0, b, 4) ? "taken" : "NOT taken");
+		if (mag_board == 1 || mag_board == 2) {
+			/* only with a magnetometer found, as set_pdc_matrix() (uSensorState & 0x04) */
+			memcpy(b, mag_board == 1 ? mag_matrix_g965f : mag_matrix_g965n, sizeof(b));
+			say("shub: 6: the magnetometer's matrix of the %s: %s\n", mag_board == 1 ? "SM-G965F" : "SM-G965N",
+			    !(ssp.found & 0x04) ? "no magnetometer found, not sent" :
+			    ssp_cmd(SSP_SET_MAG_MATRIX, SSP_AP2HUB_WRITE, 0, b, sizeof(b)) ? "taken" : "NOT taken");
+		}
+	}
+	if (ap_awake) {
+		bool w = ssp_cmd(SSP_AP_STATUS_WAKEUP, SSP_AP2HUB_WRITE, 0, NULL, 0);
+		bool r = ssp_cmd(SSP_AP_STATUS_RESUME, SSP_AP2HUB_WRITE, 0, NULL, 0);
+
+		say("shub: 6: the AP is awake: WAKEUP %s, RESUME %s\n", w ? "taken" : "NOT taken", r ? "taken" : "NOT taken");
+	}
+}
+
 static char console_cmd[64];
 static void console_do(void);
 
@@ -1828,6 +1875,7 @@ run(void)
 	uint32_t frames_at_time = 0;
 
 	send_calibration();
+	send_board_setup();
 	for (uint8_t id = 0; id < SSP_SENSORS; id++) {
 		uint32_t ms = period_ms;
 
@@ -2139,6 +2187,8 @@ hakios_ssp_init(void)
 	}
 	PE_parse_boot_argn("shub_keep", &keep, sizeof(keep));
 	PE_parse_boot_argn("shub_cold", &cold_start, sizeof(cold_start));
+	PE_parse_boot_argn("shub_ap_awake", &ap_awake, sizeof(ap_awake));
+	PE_parse_boot_argn("shub_mag", &mag_board, sizeof(mag_board));
 	PE_parse_boot_argn("shub_log", &log_frames, sizeof(log_frames));
 	PE_parse_boot_argn("shub_div", &div_ratio, sizeof(div_ratio));
 	PE_parse_boot_argn("shub_chub_on", &chub_on_ok, sizeof(chub_on_ok));

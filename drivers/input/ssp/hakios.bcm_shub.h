@@ -446,6 +446,10 @@ shub_patch_check(const uint8_t *p, size_t len, struct shub_patch_info *info)
 #define SSP_GET_ACCEL_RANGE     0xE1    /* read 1 */
 #define SSP_SET_GYRO_CAL        0xCD    /* write 12: s32 x, y, z (MSG2SSP_AP_MCU_SET_GYRO_CAL) */
 #define SSP_SET_ACCEL_CAL       0xCE    /* write 6: s16 x, y, z (MSG2SSP_AP_MCU_SET_ACCEL_CAL) */
+#define SSP_SET_THERMISTOR      0xB3    /* write 4: u16 up[18], u16 sub[18] of the board's tables (MSG2SSP_AP_SET_THERMISTOR_TABLE) */
+#define SSP_SET_MAG_MATRIX      0xFD    /* write 27: the AK09916's PDC matrix, the board's ssp-mag-array (MSG2SSP_AP_SET_MAGNETIC_STATIC_MATRIX) */
+#define SSP_AP_STATUS_WAKEUP    0xD1    /* write 0: the AP's screen is on (MSG2SSP_AP_STATUS_WAKEUP) */
+#define SSP_AP_STATUS_RESUME    0xD3    /* write 0: the AP is running (MSG2SSP_AP_STATUS_RESUME) */
 #define SSP_SENSOR_ADD          0xA1    /* write 10: [id][s32 period ms][s32 max latency ms][s8 flags] */
 #define SSP_SENSOR_REMOVE       0xA2    /* write 5: [id][s32 period ms] */
 #define SSP_CHANGE_DELAY        0xA4    /* write 10, as ADD */
