@@ -54,6 +54,7 @@ apfs_par	k
 apfs_root_c	k
 apfs_root_v	k
 apfs_round	k
+apfs_shared_space	k
 apfs_skip	k
 apfs_sparse	k
 apfs_store_len	k
@@ -465,6 +466,7 @@ shub	k
 shub_acc_cal	k
 shub_acc_pos	k
 shub_chub_on	k
+shub_cold	k
 shub_div	k
 shub_gyro_cal	k
 shub_hello	k

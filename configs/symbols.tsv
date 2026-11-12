@@ -53,6 +53,7 @@ APFS_PAR	arg	apfs_par	Storage and APFS	k	apfs_vfsops.c	at most N threads on one 
 APFS_ROOT_C	arg	apfs_root_c	Storage and APFS	k	apfs_vfsops.c	
 APFS_ROOT_V	arg	apfs_root_v	Storage and APFS	k	apfs_vfsops.c	
 APFS_ROUND	arg	apfs_round	Storage and APFS	k	apfs_vfsops.c	
+APFS_SHARED_SPACE	arg	apfs_shared_space	CPU, memory and boot	k	(patch)	
 APFS_SKIP	arg	apfs_skip	Storage and APFS	k	hakios.apfs_check.c	directories not to go into, as paths inside the volume, comma separated
 APFS_SPARSE	arg	apfs_sparse	Storage and APFS	k	hakios.sparse.c	
 APFS_STORE_LEN	arg	apfs_store_len	Storage and APFS	k	hakios.apfs_check.c	how many bytes of payload (default 40000)
@@ -439,6 +440,7 @@ SHUB	arg	shub	Sensors	k	hakios.ssp.c
 SHUB_ACC_CAL	arg	shub_acc_cal	Sensors	k	hakios.ssp.c	the accelerometer's factory offsets, sent to the hub before the sensors go on, as Samsung does
 SHUB_ACC_POS	arg	shub_acc_pos	Sensors	k	hakios.ssp.c	the accelerometer's (and gyroscope's) position in the formation of step 5
 SHUB_CHUB_ON	arg	shub_chub_on	Sensors	k	hakios.ssp.c	at step 2, power the CHUB domain on if step 1 found it off, using the PMU's chub_on sequence
+SHUB_COLD	arg	shub_cold	Sensors	k	hakios.ssp.c	
 SHUB_DIV	arg	shub_div	Sensors	k	hakios.ssp.c	
 SHUB_GYRO_CAL	arg	shub_gyro_cal	Sensors	k	hakios.ssp.c	the same for the gyroscope (gyro_lsm6dsl.c set_gyro_cal(): SSP 0xCD, s32 x, y, z), the three
 SHUB_HELLO	arg	shub_hello	Sensors	k	hakios.ssp.c	wait for MCU_RESP before every exchange, as Samsung's driver does
