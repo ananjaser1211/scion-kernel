@@ -451,6 +451,59 @@ Still to read before a phone test: the exact header byte order, the CRC algorith
 `bri_wait4*` expect (in `Bri_CheckForReceivedPacket_*`), the ASIC mode the 4775 uses, and how the bytes travel inside
 PASS_THRU (raw, or framed by `GlMeSrdPacketManager`).
 
+**The bri protocol, decoded** (gpsd `GlMeSrdAsicinit`, ASIC type 3 = Pike, the 4775's; the type must be 2 or 3, and
+mode 1 is another layout that is not used here):
+- **Transport.** CONTROL(PASSTHROUGH) (state 10) is accepted from SETUP or ERROR. The chip answers ACK, opens the GNSS core
+  (`AcquireGnssCore`), and reports `-> PASSTHROUGH`. From then on, each MEIF 0x8002 PASS_THRU
+  `[u16 n][n bytes]` (MEIF len = n + 8, plus one pad byte if odd) is handed to the baseband **raw**
+  (`GlMeCallBacks::OnAsicData`). The baseband's bytes come back the same way in 0x8002 messages. The bri bytes
+  are not wrapped by `GlMeSrdPacketManager`, which is the ESW's protocol. PASS_THRU messages are counted by the serial
+  gate. CONTROL messages are not, so after a RESET the first PASS_THRU carries serial 1. One framed MEIF message can be
+  split over several RPCs 0x1E (at most 998 bytes each).
+- **Byte stuffing** only with software flow control (`E0` -> `E0 02`, XON -> `E0 03`, XOFF -> `E0 04`). The 4775 uses
+  hardware flow control, so bytes go as they are.
+- **Requests** `ff|fe <n> fd <cmd> <args> fc`. **Answers** start `fe 00 fd` (the parser syncs on `fe`) and are 9 or 13
+  bytes:
+
+| Step (gpsd state) | Sent | Answer |
+|---|---|---|
+| autobaud (`bri_startup_asic`) | 16 x `80` | none |
+| HW flow control (`bri_wait4flowcontrol`) | `ff 00 fd 0f 01 33 0e 10 fc`, then `fe 01 fd 43 30 01 00 c0 01 00 80 80 80 80 80 80 fc` (write at 0xC0000130) | `fe 00 fd 0f 01 33 0e 10 fc` (echo) |
+| SW flow control instead | `ff 00 fd 0f 02 a b c fc`, XON = (a&15)+b, XOFF = (a>>4)+c | echo |
+| HW version (`bri_wait4version`) | read 0xC0000000: `ff 00 fd 09 00 00 00 c0 fc` | `fe 00 fd x9 <addr LE> <data LE> fc`; ours **0x3000000F** |
+| debug register (`bri_wait4asic_ready`) | read 0xC0000A54: `ff 00 fd 09 54 0a 00 c0 fc` | bit 2 of the data = debugger. Clear (ours) + LoadEsw -> load |
+| clock doubler on/off (optional) | `ff 00 fd 86 ff 00 aa 55 fc` / `ff 00 fd 06 ff 00 aa 55 fc` | 9 bytes, cmd 0x86 / 0x06 (gpsd goes on after a 500 ms timeout) |
+| block write (`Bri_EswLoadBlockAndRequestCrc`) | `fe <words-1> fd 4c <addr LE> <data> fc` (data a multiple of 4; a ragged end is rewritten as the last whole word with `fe 00 fd 4c`) | none |
+| block check | `fe 00 fd 4a <addr LE> <u16 size LE> fc` | `fe 00 fd xa <addr LE> <u24 byte sum LE> <crc8> fc` |
+| GetOutOfLegacy | `ff 00 fd 05 55 aa 00 ff fc` | the ESW starts and speaks its packet protocol (`e0 ...`) |
+
+- **Check**: the byte sum of the block (24 bits) and **CRC-8, polynomial 0x4D, MSB first, initial value 0, no final
+  XOR** (`GlUtlCrc`, table at gpsd 0x1562a6). The address must match too.
+- **Blocks**: 1020 bytes (the patch loader's size without retention), or 1016 when fewer than 4 bytes would be left.
+  Segments in table order, `a4775_B0_ImageSegments` = {0x5fdf0, 528}, {0x78000, 25844}, then index 2 = the 12-byte word
+  at 0x5fff0. Two variants of that word exist: gpsd 0x1abfc0 (`...00 00 00 01`, the same bytes seg0 already has there)
+  and 0x1abfe4 (`00 00 00 00 00 00 00 03 00 00 00 01`, chosen by the patch loader's retention/jump flag). The local
+  `stub_5fff0.bin` is the second one, and the load worked with it.
+
+**Phone test (build 33, 22:00, indoors).** `gnsstool esw -r -x -l 4 seg0_5fdf0.bin@5fdf0 seg1_78000.bin@78000
+stub_5fff0.bin@5fff0`:
+- RESET -> SETUP, then PASSTHROUGH -> `RESET -> PASSTHROUGH`.
+- Flow control answer `01 33 0e 10` (set), HW version 0x3000000F, debug register 0 (no debugger).
+- **26384 bytes in 28 blocks, every sum and CRC matching, 1.3 s.**
+- GetOutOfLegacy: the baseband sent 17 bytes `e0 00 00 00 07 10 02 01 84 03 30 00 00 0f a9 e0 01`, the ESW's first
+  packet.
+
+**Handover to the on-chip engine works.**
+1. `meif 3 0000` (RESET).
+2. `MEIF_SERIAL=1 meif 10` with `lte_band_13:0;esw_ctrl:1,1,0;` (retain).
+3. `MEIF_SERIAL=2 meif 6` logging sub-block.
+4. `MEIF_SERIAL=3 meif 3 0400` (IDLE).
+
+The MiniMe went through bri again: the RESET put the baseband back in its boot ROM, but the RAM kept the overlay. Its
+log shows "HW Flow Control Set", "Received HW Version 47752 B0", "Exiting Legacy", then **"INIT_STAGE A: DONE.
+Version received: Asic 0x3000000F, IFC 132, Radio 0x03"**, then **STATE_REPORT SETUP -> IDLE**, followed by MEIF ASIC
+(0x15) messages. The engine stayed in IDLE.
+
 **Integration, when it works.**
 - **Firmware**: `devices/star2lte/firmware/gnss/` holds a README and SHA256SUMS only. `tools/fetch-firmware.sh`
   extracts the three 4775_B0 segments from the user's own gpsd: `--from DIR`, or the pinned vendor tree if it has
@@ -472,7 +525,8 @@ PASS_THRU (raw, or framed by `GlMeSrdPacketManager`).
   `shub: 4: shub_peek: the memory reader (SSP 0xEC) added (26 of 26 bytes as expected)`.
 - `gnsstool` (`userland/src/gnsstool.c`, in `/redwood/bin` or built by hand):
   `listen [S]`, `rpc ID [HEX] [S]`, `prpc ...`, `ssp CMD OPTS ARG LEN [HEX]`, `peek ADDR [LEN]`,
-  `dump ADDR LEN FILE [CHUNK]`.
+  `dump ADDR LEN FILE [CHUNK]`, `meif ID [HEX] [S]`, `esw [-r] [-n] [-2] [-x] [-l S] [FILE@ADDR ...]` (PASSTHROUGH,
+  bri handshake, checked ESW load, GetOutOfLegacy), `bri HEX [S]` (raw PASS_THRU bytes).
 
 ## Next steps
 
