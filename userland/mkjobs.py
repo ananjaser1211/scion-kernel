@@ -216,12 +216,20 @@ import sys
 # (locationd is no longer among them: the system image carries it (sysimage/select-system.py BIG_KEEP),
 # and with nothing to locate by here it answers with no position rather than a failed lookup; Scion is
 # to give it the phone's.)
+# mobileassetd is IN now, on demand like the rest. It was out only for what it cost QEMU ("tried too, and they
+# behave: no crash in a seven-minute session, each spawned once on demand and stayed", with cloudd), and that
+# stall was cloudd spinning on the missing nsurlsessiond, found later (above). Without it the phone pays in
+# lookups: com.apple.mobileassetd.v2 was the most-missed service of build28b, 374 failed lookups in its first
+# four minutes, 293 of them geod's (Maps', Weather's and the clock's map tiles and resources) in one burst,
+# 43 bluetoothd's, the rest from 17 more clients (corespeechd, suggestd, WiFiCloudAssets, kbd, triald,
+# mediaserverd, ...); 382 in build26b, 123 in build27. It needs no hardware: it answers from its catalogue
+# on /private/var/MobileAsset and downloads over nsurlsessiond.
 DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'softwareupdate',
         'datamigrator', 'backupd', 'thermalmonitord', 'keybagd', 'nfcd', 'biometrickitd', 'pearld',
         'obliterat', 'storage_mounter', 'com.apple.fud', 'sepd', 'seputil', 'camera', 'ReportCrash',
         'osanalytics', 'lockdown', 'audio', 'jetsamproperties',
         'purplebuddy', 'restore', 'usb', 'accessoryd',
-        'mobileassetd', 'bird',
+        'bird',
         # these start, crash and are asked for again, over and over. (aggregated, which was among them, is where
         # Darwin userland 16 keeps its power log -- com.apple.powerlog.plxpclogger.xpc and the rest -- that Settings > Battery
         # waits for; it now runs through a session.)
