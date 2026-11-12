@@ -134,6 +134,66 @@ meif_state(unsigned s)
 	return s < sizeof(n) / sizeof(n[0]) ? n[s] : "?";
 }
 
+/*
+ * Masks what could be a position in a line of the chip's text, in place: every number with four or more decimals
+ * (except in the engine's noise statistics), and the latitude and longitude fields of an NMEA GGA, RMC, GLL or GNS sentence, whatever their precision.
+ */
+static void
+mask_position(char *t)
+{
+	size_t k = strlen(t);
+	/* the measurement engine's noise and gain statistics are not positions, and they say whether the RF path works */
+	int stats = (strstr(t, "NoiseStats") != NULL || strstr(t, "DagcStats") != NULL) && strchr(t, '$') == NULL &&
+	    strstr(t, "Lat") == NULL && strstr(t, "Lon") == NULL && strstr(t, "LLA") == NULL && strstr(t, "NMEA") == NULL;
+
+	for (size_t i = 0; i < k && !stats; i++) {
+		if (t[i] == '.' && i > 0 && t[i - 1] >= '0' && t[i - 1] <= '9') {
+			size_t j = i + 1;
+
+			while (j < k && t[j] >= '0' && t[j] <= '9') {
+				j++;
+			}
+			if (j - i - 1 >= 4) {
+				size_t b = i;
+
+				while (b > 0 && ((t[b - 1] >= '0' && t[b - 1] <= '9') || t[b - 1] == '-')) {
+					b--;
+				}
+				for (size_t x = b; x < j; x++) {
+					t[x] = '#';
+				}
+			}
+			i = j;
+		}
+	}
+	for (char *d = strchr(t, '$'); d; d = strchr(d + 1, '$')) {
+		int from;
+
+		if (strlen(d) < 7) {
+			break;
+		}
+		/* the fields after the sentence name: GGA, GNS time, lat, N/S, lon, E/W; GLL lat, ...; RMC time, status, lat, ... */
+		if (strncmp(d + 3, "GGA", 3) == 0 || strncmp(d + 3, "GNS", 3) == 0) {
+			from = 2;
+		} else if (strncmp(d + 3, "GLL", 3) == 0) {
+			from = 1;
+		} else if (strncmp(d + 3, "RMC", 3) == 0) {
+			from = 3;
+		} else {
+			continue;
+		}
+		int f = 0;
+
+		for (char *c = d + 1; *c && *c != '*' && *c != '$'; c++) {
+			if (*c == ',') {
+				f++;
+			} else if (f >= from && f < from + 4) {
+				*c = '#';
+			}
+		}
+	}
+}
+
 /* one MEIF message, unframed: ids, lengths and states only */
 static void
 meif_print(const uint8_t *m, unsigned n)
@@ -163,26 +223,7 @@ meif_print(const uint8_t *m, unsigned n)
 			t[k++] = m[i] >= 0x20 && m[i] < 0x7f ? (char)m[i] : m[i] == 0 ? ' ' : '.';
 		}
 		t[k] = 0;
-		for (unsigned i = 0; i < k; i++) {
-			if (t[i] == '.' && i > 0 && t[i - 1] >= '0' && t[i - 1] <= '9') {
-				unsigned j = i + 1;
-
-				while (j < k && t[j] >= '0' && t[j] <= '9') {
-					j++;
-				}
-				if (j - i - 1 >= 4) {
-					unsigned b = i;
-
-					while (b > 0 && ((t[b - 1] >= '0' && t[b - 1] <= '9') || t[b - 1] == '-')) {
-						b--;
-					}
-					for (unsigned x = b; x < j; x++) {
-						t[x] = '#';
-					}
-				}
-				i = j;
-			}
-		}
+		mask_position(t);
 		printf(" \"%s\"\n", t);
 		return;
 	}
@@ -272,11 +313,15 @@ print_rec(const struct rec *r)
 		return;
 	}
 	if (text) {
-		printf(" \"");
+		static char t[65536];
+		unsigned k = 0;
+
 		for (unsigned i = 2; i < r->len; i++) {
-			putchar(r->data[i] >= 0x20 ? r->data[i] : r->data[i] == 0 ? ' ' : '.');
+			t[k++] = r->data[i] >= 0x20 ? (char)r->data[i] : r->data[i] == 0 ? ' ' : '.';
 		}
-		printf("\"\n");
+		t[k] = 0;
+		mask_position(t);
+		printf(" \"%s\"\n", t);
 		return;
 	}
 	for (unsigned i = 0; i < r->len && i < 96; i++) {
