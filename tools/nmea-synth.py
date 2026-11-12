@@ -4,6 +4,8 @@
 A made-up NMEA 0183 stream for testing gnssd without the receiver (docs/gnssd.md): one epoch a second of RMC, GGA,
 GSA and GSV, by default at the Null Island test point (0.001 N, 0.001 E, in the Gulf of Guinea; locationd treats
 exactly 0,0 as "no position"), drifting slowly east. Never use a real place of anyone's here.
+For gnssd parse and for a FIFO nobody feeds to locationd: never give a made-up position to the live locationd (it
+takes the local Wi-Fi access points for moved and Wi-Fi positioning dies; docs/gnssd.md).
 """
 import argparse, datetime, math
 
