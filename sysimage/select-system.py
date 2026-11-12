@@ -115,6 +115,18 @@ KEEP_METALLIB = ('System/Library/Frameworks/QuartzCore.framework/default.metalli
 # kind (the _mail pair for mail), so all three -- 26 MB. An instruction to extract, not Apple's bytes here.
 KEEP_MODELS = tuple(f'System/Library/PrivateFrameworks/SpotlightServices.framework/{name}.mlmodelc/'
                     for name in ('spotlight_l2', 'spotlight_l2_mail', 'spotlight_l2_recency_mail'))
+# ... and two daemons that live inside their frameworks and are bigger than SMALL, wanted by name. Both were
+# run on the phone from /var (build30, 12 November) for a quarter of an hour: no crash, a second of CPU each,
+# and the lookups they answer stopped.
+#   passd (PassKitCore, 6.6 MB): the Wallet and its library -- com.apple.passd.library and .payment were
+#     14 failed lookups in six minutes (Settings, SpringBoard, destinationd, wifid, coreidvd), none after;
+#     Settings' Wallet pane opens with it.
+#   identityservicesd (IDS, 11.5 MB): the identity service the account stack, iMessage and FaceTime,
+#     Screen Time, Find My and a dozen more ask for once each -- com.apple.identityservicesd.embedded.auth
+#     from 30 different clients a boot, none after.
+# userland/mkjobs.py runs them on demand like the rest (their jobs carry no DENY word).
+KEEP_DAEMONS = ('System/Library/PrivateFrameworks/PassKitCore.framework/passd',
+                'System/Library/PrivateFrameworks/IDS.framework/identityservicesd.app/identityservicesd')
 # ... and '.dat' and '.bin' are also what these keep the tables in that the user interface is made with:
 # the layouts of the on-screen keyboard, the emoji, the list of public domain suffixes
 DATA_FRAMEWORKS = tuple(f'System/Library/{name}.framework/' for name in (
@@ -216,7 +228,7 @@ def wanted_file(path, size):
     if path.startswith(FRAMEWORKS):
         if path in KEEP_METALLIB or (path.endswith('.metallib') and size <= MAX_METALLIB):
             return True
-        if path.startswith(KEEP_MODELS):
+        if path.startswith(KEEP_MODELS) or path in KEEP_DAEMONS:
             return True
         if re.search(r'/(XPCServices|Support|Helpers)/', path):
             return size <= 32 << 20 and not path.lower().endswith(('.png', '.car', '.loctable', '.caml'))
