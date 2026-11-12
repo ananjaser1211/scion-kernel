@@ -210,7 +210,28 @@ cannot work: RESET is what starts the ME and the baseband, and it is RESET that 
 likeliest reading is that the baseband's own RPCs, on the chip's internal link to the ME, do not match the ME's decoder.
 That would happen if the baseband runs its bare ROM where Android has loaded a patch. gpsd embeds a Pike baseband patch
 ("esw3_dev:4775_FF", `GetPatchSegmentPike`, `GlMeSrdAsicInitPatchLoader`); how it reaches the chip is the next thing to
-read.
+read. Correction: the hub firmware carries its own Pike ESW (`esw3_dev:4775_B0@292538`) and the ME code that loads it
+(`bri_wait4patchload`, `esw_wait4version`, `GlMeSrdAsicConfig::SetConfigParameters` with `esw_ctrl:` Load/Retain/
+DynPwr options). gpsd's own copy is for its host-ME mode.
+
+**RESET, second try (cold-started chip, build 31): no assert.** The order was `rpc 34 1101`,
+`rpc 401 enable_log_to_host_LOG_DEBUG_Overwrite`, `rpc 1c 01`, `meif 3 0000`. The chip sent ACK (id 0), then STATE_REPORT
+**RESET -> SETUP**. The hub stayed fine. (With two readers on `/dev/hakios-gnss`, each record goes to one of them only.)
+The differences from the first try are the cold start of the chip, the LNA pin mux sent first, and the debug-log request.
+Which of them mattered is not known. After that:
+- CONTROL(IDLE) got **NACK** (`00 03`: reason 0, serial 3). The state stays SETUP.
+- CONFIG_SET was sent as gpsd builds it, with the settings-derived fields set to 0 or to the chip's own values:
+  `meif 6 0700 05001000e8030100000306000a000a00 0a000c0000000000ffff0000 0800080000020100 0280100001000000 0000000000000000
+  0680080000000000 0700080000000000 018010000000000000000000000000000`, 92 bytes. It also got **NACK** (`00 05`).
+- The hub's control handler (0x0081b214) NACKs ("MEIF:Trans in progress(%d->%d),control_msg(%d) rejected!") while a
+  state transition is pending (`[ME+8]`, its target, non-zero). So the ME is most likely stuck in a transition out of
+  SETUP, probably waiting for the baseband (ESW load). The chip's own log never reached the host. `enable_log_to_host` did
+  not route the ME's log, which probably needs MEIF LOGGING / DEBUG_CONFIG (0x8000 / 0x8003, gpsd's
+  `ConfigureMeLogging`).
+- The config strings: the chip knows only `lte_band_13:` and `esw_ctrl:` (its strings). gpsd's
+  `lna_mask/rf_mode/gps_carrier_type` string is the ONCHIP config message (id 0x17:
+  `[u16 n][string][zero pad to 4]`), and SW_UPLOAD (0x10) is `[u16 type][u32 arg][data][1-4 zero bytes]`, type 0x8000
+  for `lte_band_13:%d;%s`.
 
 ## The tools (kernel and userland)
 
