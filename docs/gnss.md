@@ -543,6 +543,32 @@ Version received: Asic 0x3000000F, IFC 132, Radio 0x03"**, then **STATE_REPORT S
   `ProcessPowerCycleLogic` (around 0x00804e00-0x00805330) to find what turns the ASIC on. With logs, use only
   `pvt enable_log_to_host_LOG_INFO_Overwrite` and a few 0x2B facilities, 2 s apart.
 
+**What turns the ASIC on** (hub patch, read offline after the 22:25 test).
+- `GlOnChipReqMgr` (object at GlMe_PeIfImpl + 0x1cf0) keeps **3 request slots of 28 bytes at +0x610**: slot 0 batching
+  (host), slot 1 geofence, slot 2 **on-chip** (`GetReportReqIds (B, G, O, GE)`). Slot layout: `[+0] active`, `[+2] id`,
+  `[+4] period s`, `[+6] flags`, `[+8]`, `[+10]`, `[+12] base time`, `[+16] next deadline`, `[+20]`, `[+24]`.
+- `ProcessPowerCycleLogic(this, timer, x)` (0x00804fc2) computes the time to the next update over the active slots
+  (`GetTimeToNextUpdateMs`, 0x008051ac):
+  - With no slot active, the result is 0x2FFFFFFF, which is the 805306367 seen in the log.
+  - If the time is 0x2FFFFFFF, or larger than the warm-up `[+0x688]` (13000 ms, the second number in the log): **Asic
+    Off**, and a timer is set.
+  - Otherwise: **Asic On**.
+  - A slot counts only if its base time `[+12]` is non-zero. The exception is the on-chip slot 2 and timer runs, where it
+    counts as base + period × 1000 (or 600 s).
+- **Slot 0 (batching, MEIF 0x818E)** takes its base time from the last-location time (`m_ulSystemTimeOfLastLms`,
+  [+0x6ac]). If g is non-zero, it is now + g with a base of 0. On a receiver that has never fixed, the base stays 0, so
+  **the 0x818E request can never turn the ASIC on**. That fits the silent 10 minutes.
+- **Slot 2 (on-chip)** is set by `UpdateOnchipRequest(on, period)` (0x00804c2c): `[+0]=on`, `[+4]=period`,
+  `[+16]=0`, then `ProcessPowerCycleLogic(1, 0)`. With an empty base, the deadline has already passed, the time to the
+  next update is about 1 s (< 13 s), and the result is **Asic On**. This is the path to use.
+- Its only caller is GlMe_PeIfImpl 0x00813c30 (`UpdateOnchipRequest(period != 0, period)`), reached from 0x00818de0
+  (vtable 0x0082ec78). That one is called by a decoder at 0x008100b2, which reads **three u32** (period first) from an
+  RPC or message stream, with log tag 15. Still to find: which RPC id or MEIF message reaches 0x008100b2. Candidates are
+  the patch's own PVT RPC decoders next to it (0x0080fd5e-0x00810200). `BrcmGnssStart` (`gnss_start`) only sends the
+  `$pglirm` text and never calls it, so on Android this "start on-chip PVT" call comes from the host.
+- Next step, offline: identify the RPC or MEIF behind 0x008100b2. It may be a TxNav or PVT RPC that lhd sends on gpsd's
+  behalf (lhd's encoders do not include it), or a MEIF/PEX message. Then send `period = 1` after ON on a cold chip.
+
 **Integration, when it works.**
 - **Firmware**: `devices/star2lte/firmware/gnss/` holds a README and SHA256SUMS only. `tools/fetch-firmware.sh`
   extracts the three 4775_B0 segments from the user's own gpsd: `--from DIR`, or the pinned vendor tree if it has
