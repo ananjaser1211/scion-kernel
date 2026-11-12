@@ -24,6 +24,18 @@
  *   latitude, longitude     double, only with fixType >= 2
  *   altitude float m, speed float m/s, course float deg, utc string
  *   ttffSeconds  float (optional), receiverOnSeconds float
+ *   DIAGNOSTICS (all optional; docs/gnssd.md):
+ *   step, stepError        string  the bring-up step gnssd is at ("waiting for the hub (N s more)",
+ *                          "AR table cut", "ESW load", "IDLE", "searching" ...) and why it failed
+ *   engineState  string    the measurement engine's last MEIF state (IDLE, ON, ...)
+ *   eswLoaded bool, eswBlocks int, arTableCut bool
+ *   detections, attempts   dict GPS / GLONASS / Galileo -> int, summed over the engine's
+ *                          statistics tables (statsTables int: how many)
+ *   agcGps, agcGlonass     float dB;  noiseGps, noiseExpected  float
+ *   oscOffsetPpb, oscUncertaintyPpb  float;  cntin  string
+ *   searchSeconds float    since gnss_start
+ *   hubLog       array of string: the last relevant hub log lines, masked by gnssd
+ *   sessionLog   string    the session log's path (Copy log, Share)
  *   demo         bool (optional): true when the file is made up (tools/gps_status_demo.c).
  *                The application then puts a big "DEMO DATA, not the receiver" banner
  *                above everything and prefixes the badge with DEMO, so a fake fix cannot
@@ -44,7 +56,9 @@
  * application leaves the foreground.
  *
  * PRIVACY. The position is drawn on the screen and copied to the pasteboard when the Copy
- * button is pressed, and goes nowhere else: it is not logged, not stored, not sent.
+ * button is pressed, and goes nowhere else: it is not logged, not stored, not sent. It is
+ * at the bottom, under the diagnostics, so a screenshot of the first screen has none. The
+ * session log (Copy log, Share) is gnssd's and holds no position.
  *
  * All UIKit by hand -- no storyboard, no asset catalog -- because this is built on Linux
  * with xnu-clang and the iPhoneOS 16.5 SDK (userland/build.sh). ARC.
@@ -53,7 +67,8 @@
 #import <notify.h>
 #import <sys/stat.h>
 
-#define GPS_STATUS_PATH   "/var/mobile/Library/Caches/com.hakios.gnssd/status.plist"
+#define GPS_STATUS_DIR    "/var/mobile/Library/Caches/com.hakios.gnssd"
+#define GPS_STATUS_PATH   GPS_STATUS_DIR "/status.plist"
 #define GPS_NOTE_STATUS   "com.hakios.gnssd.status"
 #define GPS_NOTE_START    "com.hakios.gnssd.start"
 #define GPS_NOTE_PAUSE    "com.hakios.gnssd.pause"
@@ -74,6 +89,12 @@ gps_str(NSDictionary *d, NSString *k)
 {
 	id v = d[k];
 	return [v isKindOfClass:[NSString class]] ? v : nil;
+}
+
+static NSString *
+gps_fmt(NSNumber *n, NSString *fmt)
+{
+	return n ? [NSString stringWithFormat:fmt, n.doubleValue] : @"—";
 }
 
 static UIColor *
@@ -216,7 +237,8 @@ gps_text(NSString *s, CGPoint centre, UIFont *font, UIColor *color)
 	(void)rect;
 	CGContextRef c = UIGraphicsGetCurrentContext();
 	CGRect b = self.bounds;
-	CGFloat R = MIN(b.size.width, b.size.height) / 2 - 22;
+	BOOL tiny = MIN(b.size.width, b.size.height) < 240;
+	CGFloat R = MIN(b.size.width, b.size.height) / 2 - (tiny ? 13 : 22);
 	CGPoint o = CGPointMake(CGRectGetMidX(b), CGRectGetMidY(b));
 	UIColor *grid = [UIColor secondaryLabelColor];
 
@@ -237,15 +259,16 @@ gps_text(NSString *s, CGPoint centre, UIFont *font, UIColor *color)
 	UIFont *small = [UIFont systemFontOfSize:10];
 	gps_text(@"30°", CGPointMake(o.x + 12, o.y - R * 60 / 90.0 + 7), small, grid);
 	gps_text(@"60°", CGPointMake(o.x + 12, o.y - R * 30 / 90.0 + 7), small, grid);
-	UIFont *card = [UIFont boldSystemFontOfSize:14];
+	UIFont *card = [UIFont boldSystemFontOfSize:tiny ? 11 : 14];
 	UIColor *label = [UIColor labelColor];
-	gps_text(@"N", CGPointMake(o.x, o.y - R - 11), card, label);
-	gps_text(@"S", CGPointMake(o.x, o.y + R + 11), card, label);
-	gps_text(@"E", CGPointMake(o.x + R + 11, o.y), card, label);
-	gps_text(@"W", CGPointMake(o.x - R - 11, o.y), card, label);
+	CGFloat cm = tiny ? 7 : 11;
+	gps_text(@"N", CGPointMake(o.x, o.y - R - cm), card, label);
+	gps_text(@"S", CGPointMake(o.x, o.y + R + cm), card, label);
+	gps_text(@"E", CGPointMake(o.x + R + cm, o.y), card, label);
+	gps_text(@"W", CGPointMake(o.x - R - cm, o.y), card, label);
 
 	if (self.sats.count == 0) {
-		gps_text(@"no satellites", o, [UIFont systemFontOfSize:13], grid);
+		gps_text(@"no satellites", o, [UIFont systemFontOfSize:tiny ? 10 : 13], grid);
 		return;
 	}
 	UIFont *prnFont = [UIFont monospacedDigitSystemFontOfSize:10 weight:UIFontWeightSemibold];
@@ -259,7 +282,7 @@ gps_text(NSString *s, CGPoint centre, UIFont *font, UIColor *color)
 		CGPoint p = CGPointMake(o.x + r * sin(a), o.y - r * cos(a));
 		UIColor *col = gps_rgb(sys->rgb);
 		BOOL used = [gps_num(s, @"used") boolValue];
-		gps_path_shape(c, sys->shape, p, 7);
+		gps_path_shape(c, sys->shape, p, tiny ? 5 : 7);
 		if (used) {
 			CGContextSetFillColorWithColor(c, col.CGColor);
 			CGContextFillPath(c);
@@ -270,7 +293,7 @@ gps_text(NSString *s, CGPoint centre, UIFont *font, UIColor *color)
 			CGContextDrawPath(c, kCGPathFillStroke);
 		}
 		NSString *prn = [NSString stringWithFormat:@"%@", gps_num(s, @"prn") ?: @"?"];
-		gps_text(prn, CGPointMake(p.x + 15, p.y - 9), prnFont, label);
+		gps_text(prn, CGPointMake(p.x + (tiny ? 11 : 15), p.y - (tiny ? 7 : 9)), prnFont, label);
 	}
 }
 
@@ -382,6 +405,10 @@ gps_text(NSString *s, CGPoint centre, UIFont *font, UIColor *color)
 	GPSBarsView *_bars;
 	UILabel *_legend;
 	NSMutableDictionary *_values;   /* detail key -> value label */
+	NSMutableDictionary *_diag;     /* diagnostics key -> value label */
+	UITextView *_hubLog;
+	NSString *_hubText, *_sessionLog;
+	UIButton *_copyLogButton, *_shareButton;
 	UIButton *_copyButton, *_startButton, *_pauseButton;
 	NSString *_latlonText;           /* only ever on the screen or the pasteboard */
 	NSString *_pending;              /* @"start" / @"pause" / nil */
@@ -409,20 +436,20 @@ gps_text(NSString *s, CGPoint centre, UIFont *font, UIColor *color)
 	card.layer.cornerRadius = 14;
 	UIStackView *v = [[UIStackView alloc] init];
 	v.axis = UILayoutConstraintAxisVertical;
-	v.spacing = 8;
+	v.spacing = 5;
 	v.translatesAutoresizingMaskIntoConstraints = NO;
 	if (title) {
-		UILabel *t = [self label:13 weight:UIFontWeightSemibold color:[UIColor secondaryLabelColor]];
+		UILabel *t = [self label:11 weight:UIFontWeightSemibold color:[UIColor secondaryLabelColor]];
 		t.text = title.uppercaseString;
 		[v addArrangedSubview:t];
 	}
 	[v addArrangedSubview:content];
 	[card addSubview:v];
 	[NSLayoutConstraint activateConstraints:@[
-		[v.topAnchor constraintEqualToAnchor:card.topAnchor constant:12],
-		[v.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-12],
-		[v.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:14],
-		[v.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
+		[v.topAnchor constraintEqualToAnchor:card.topAnchor constant:8],
+		[v.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-8],
+		[v.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:10],
+		[v.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-10],
 	]];
 	return card;
 }
@@ -477,11 +504,61 @@ gps_text(NSString *s, CGPoint centre, UIFont *font, UIColor *color)
 	return rows;
 }
 
+/* the diagnostics beside the sky plot: small, monospaced, one line each */
+- (UIView *)diagGrid
+{
+	_diag = [NSMutableDictionary dictionary];
+	UIStackView *rows = [[UIStackView alloc] init];
+	rows.axis = UILayoutConstraintAxisVertical;
+	rows.spacing = 1;
+	NSArray *keys = @[ @"Step", @"Error", @"Engine", @"ESW", @"Search", @"Det/att",
+	    @"AGC", @"Noise", @"Osc", @"CNTIN" ];
+	for (NSString *k in keys) {
+		UILabel *l = [self label:10.5 weight:UIFontWeightRegular color:[UIColor labelColor]];
+		l.font = [UIFont monospacedSystemFontOfSize:10.5 weight:UIFontWeightRegular];
+		l.numberOfLines = [k isEqualToString:@"Error"] ? 3 : 1;
+		l.adjustsFontSizeToFitWidth = YES;
+		l.minimumScaleFactor = 0.6;
+		[rows addArrangedSubview:l];
+		_diag[k] = l;
+	}
+	return rows;
+}
+
+- (UIView *)hubLogView
+{
+	_hubLog = [[UITextView alloc] init];
+	_hubLog.editable = NO;
+	_hubLog.font = [UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightRegular];
+	_hubLog.textColor = [UIColor labelColor];
+	_hubLog.backgroundColor = [UIColor tertiarySystemBackgroundColor];
+	_hubLog.layer.cornerRadius = 8;
+	_hubLog.textContainerInset = UIEdgeInsetsMake(4, 2, 4, 2);
+	_hubLog.text = @"(no hub lines yet)";
+	[_hubLog.heightAnchor constraintEqualToConstant:96].active = YES;
+
+	_copyLogButton = [UIButton buttonWithType:UIButtonTypeSystem];
+	[_copyLogButton setTitle:@"Copy log" forState:UIControlStateNormal];
+	_copyLogButton.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+	[_copyLogButton addTarget:self action:@selector(copyLog) forControlEvents:UIControlEventTouchUpInside];
+	_shareButton = [UIButton buttonWithType:UIButtonTypeSystem];
+	[_shareButton setTitle:@"Share log…" forState:UIControlStateNormal];
+	_shareButton.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+	[_shareButton addTarget:self action:@selector(shareLog) forControlEvents:UIControlEventTouchUpInside];
+	UIStackView *b = [[UIStackView alloc] initWithArrangedSubviews:@[ _copyLogButton, _shareButton ]];
+	b.axis = UILayoutConstraintAxisHorizontal;
+	b.distribution = UIStackViewDistributionFillEqually;
+	UIStackView *v = [[UIStackView alloc] initWithArrangedSubviews:@[ _hubLog, b ]];
+	v.axis = UILayoutConstraintAxisVertical;
+	v.spacing = 6;
+	return v;
+}
+
 - (NSAttributedString *)legendText
 {
 	NSMutableAttributedString *s = [[NSMutableAttributedString alloc] init];
 	NSArray *glyphs = @[ @"●", @"■", @"◆", @"▲", @"⬢" ];
-	UIFont *f = [UIFont systemFontOfSize:12];
+	UIFont *f = [UIFont systemFontOfSize:10];
 	for (size_t i = 0; i < GPS_NSYSTEMS; i++) {
 		[s appendAttributedString:[[NSAttributedString alloc]
 		    initWithString:[NSString stringWithFormat:@"%@ ", glyphs[i]]
@@ -494,7 +571,7 @@ gps_text(NSString *s, CGPoint centre, UIFont *font, UIColor *color)
 			NSForegroundColorAttributeName: [UIColor secondaryLabelColor] }]];
 	}
 	[s appendAttributedString:[[NSAttributedString alloc]
-	    initWithString:@"\nfilled = used in the fix, hollow = in view only"
+	    initWithString:@"  (filled: used)"
 	    attributes:@{ NSFontAttributeName: f,
 		NSForegroundColorAttributeName: [UIColor tertiaryLabelColor] }]];
 	return s;
@@ -506,17 +583,17 @@ gps_text(NSString *s, CGPoint centre, UIFont *font, UIColor *color)
 	self.view.backgroundColor = [UIColor systemBackgroundColor];
 
 	/* header: the badge, the times, the counts */
-	_badge = [self label:30 weight:UIFontWeightHeavy color:[UIColor whiteColor]];
+	_badge = [self label:22 weight:UIFontWeightHeavy color:[UIColor whiteColor]];
 	_badge.textAlignment = NSTextAlignmentCenter;
 	_badge.numberOfLines = 2;
-	_badge.layer.cornerRadius = 14;
+	_badge.layer.cornerRadius = 12;
 	_badge.layer.masksToBounds = YES;
-	[_badge.heightAnchor constraintGreaterThanOrEqualToConstant:64].active = YES;
-	_subtitle = [self label:16 weight:UIFontWeightMedium color:[UIColor labelColor]];
-	_subtitle.font = [UIFont monospacedDigitSystemFontOfSize:16 weight:UIFontWeightMedium];
+	[_badge.heightAnchor constraintGreaterThanOrEqualToConstant:40].active = YES;
+	_subtitle = [self label:14 weight:UIFontWeightMedium color:[UIColor labelColor]];
+	_subtitle.font = [UIFont monospacedDigitSystemFontOfSize:14 weight:UIFontWeightMedium];
 	_subtitle.textAlignment = NSTextAlignmentCenter;
-	_counts = [self label:20 weight:UIFontWeightSemibold color:[UIColor labelColor]];
-	_counts.font = [UIFont monospacedDigitSystemFontOfSize:20 weight:UIFontWeightSemibold];
+	_counts = [self label:16 weight:UIFontWeightSemibold color:[UIColor labelColor]];
+	_counts.font = [UIFont monospacedDigitSystemFontOfSize:16 weight:UIFontWeightSemibold];
 	_counts.textAlignment = NSTextAlignmentCenter;
 
 	/* what shows instead of everything else when gnssd is silent */
@@ -536,28 +613,36 @@ gps_text(NSString *s, CGPoint centre, UIFont *font, UIColor *color)
 	[_demoBanner.heightAnchor constraintGreaterThanOrEqualToConstant:84].active = YES;
 	_demoBanner.hidden = YES;
 
+	/* one screen for a screenshot: the sky beside the diagnostics, the bars, the hub's lines */
 	_sky = [[GPSSkyView alloc] init];
 	[_sky.heightAnchor constraintEqualToAnchor:_sky.widthAnchor].active = YES;
-	_legend = [self label:12 weight:UIFontWeightRegular color:[UIColor secondaryLabelColor]];
+	UIView *diag = [self diagGrid];
+	UIStackView *skyRow = [[UIStackView alloc] initWithArrangedSubviews:@[ _sky, diag ]];
+	skyRow.axis = UILayoutConstraintAxisHorizontal;
+	skyRow.alignment = UIStackViewAlignmentCenter;
+	skyRow.spacing = 8;
+	[_sky.widthAnchor constraintEqualToAnchor:skyRow.widthAnchor multiplier:0.44].active = YES;
+	_legend = [self label:10 weight:UIFontWeightRegular color:[UIColor secondaryLabelColor]];
 	_legend.attributedText = [self legendText];
 	_legend.textAlignment = NSTextAlignmentCenter;
-	UIStackView *skyStack = [[UIStackView alloc] initWithArrangedSubviews:@[ _sky, _legend ]];
+	UIStackView *skyStack = [[UIStackView alloc] initWithArrangedSubviews:@[ skyRow, _legend ]];
 	skyStack.axis = UILayoutConstraintAxisVertical;
-	skyStack.spacing = 6;
+	skyStack.spacing = 4;
 
 	_bars = [[GPSBarsView alloc] init];
-	[_bars.heightAnchor constraintEqualToConstant:190].active = YES;
+	[_bars.heightAnchor constraintEqualToConstant:84].active = YES;
 
-	UIView *skyCard = [self card:@"Sky" content:skyStack];
+	UIView *skyCard = [self card:@"Sky · Diagnostics" content:skyStack];
 	UIView *barsCard = [self card:@"Signal  C/N0 dB-Hz" content:_bars];
-	UIView *detailsCard = [self card:@"Position" content:[self detailsGrid]];
+	UIView *logCard = [self card:@"Hub log (masked) · session log" content:[self hubLogView]];
+	UIView *detailsCard = [self card:@"Position (screen only)" content:[self detailsGrid]];
 	_dataViews = @[ skyCard, barsCard, detailsCard ];
 
 	_stack = [[UIStackView alloc] initWithArrangedSubviews:@[ _demoBanner, _badge, _subtitle, _counts,
-	    _staleCard, skyCard, barsCard, detailsCard ]];
+	    _staleCard, skyCard, barsCard, logCard, detailsCard ]];
 	_stack.axis = UILayoutConstraintAxisVertical;
-	_stack.spacing = 12;
-	[_stack setCustomSpacing:4 afterView:_subtitle];
+	_stack.spacing = 8;
+	[_stack setCustomSpacing:2 afterView:_subtitle];
 	_stack.translatesAutoresizingMaskIntoConstraints = NO;
 
 	_scroll = [[UIScrollView alloc] init];
@@ -640,6 +725,120 @@ gps_text(NSString *s, CGPoint centre, UIFont *font, UIColor *color)
 	});
 }
 
+/* ---- the session log: gnssd's (no positions in it) */
+
+/* the current session's log, or the newest one there is */
+- (NSString *)sessionLogPath
+{
+	NSFileManager *fm = [NSFileManager defaultManager];
+	if (_sessionLog && [fm isReadableFileAtPath:_sessionLog])
+		return _sessionLog;
+	NSString *newest = nil;
+	for (NSString *n in [fm contentsOfDirectoryAtPath:@GPS_STATUS_DIR error:nil])
+		if ([n hasPrefix:@"session-"] && [n hasSuffix:@".log"] &&
+		    (!newest || [n compare:newest] == NSOrderedDescending))
+			newest = n;
+	return newest ? [@GPS_STATUS_DIR stringByAppendingPathComponent:newest] : nil;
+}
+
+- (void)flash:(UIButton *)b title:(NSString *)t back:(NSString *)orig
+{
+	[b setTitle:t forState:UIControlStateNormal];
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
+	    dispatch_get_main_queue(), ^{ [b setTitle:orig forState:UIControlStateNormal]; });
+}
+
+- (void)copyLog
+{
+	NSString *p = [self sessionLogPath];
+	NSString *s = p ? [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil] : nil;
+	if (!s) {
+		[self flash:_copyLogButton title:@"No log yet" back:@"Copy log"];
+		return;
+	}
+	[UIPasteboard generalPasteboard].string = s;
+	NSUInteger lines = [s componentsSeparatedByString:@"\n"].count;
+	[self flash:_copyLogButton title:[NSString stringWithFormat:@"Copied (%lu lines)",
+	    (unsigned long)lines] back:@"Copy log"];
+}
+
+- (void)shareLog
+{
+	NSString *p = [self sessionLogPath];
+	if (!p) {
+		[self flash:_shareButton title:@"No log yet" back:@"Share log…"];
+		return;
+	}
+	/* a copy of our own to hand over: the share targets read it, not gnssd's file */
+	NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:p.lastPathComponent];
+	NSFileManager *fm = [NSFileManager defaultManager];
+	[fm removeItemAtPath:tmp error:nil];
+	NSURL *url = [fm copyItemAtPath:p toPath:tmp error:nil] ? [NSURL fileURLWithPath:tmp] :
+	    [NSURL fileURLWithPath:p];
+	UIActivityViewController *a = [[UIActivityViewController alloc] initWithActivityItems:@[ url ]
+	    applicationActivities:nil];
+	a.popoverPresentationController.sourceView = _shareButton;
+	a.popoverPresentationController.sourceRect = _shareButton.bounds;
+	[self presentViewController:a animated:YES completion:nil];
+}
+
+static NSString *
+gps_pair(NSDictionary *a, NSDictionary *b, NSString *k)
+{
+	NSNumber *x = [a isKindOfClass:[NSDictionary class]] ? gps_num(a, k) : nil;
+	NSNumber *y = [b isKindOfClass:[NSDictionary class]] ? gps_num(b, k) : nil;
+	return x && y ? [NSString stringWithFormat:@"%@ / %@", x, y] : @"—";
+}
+
+- (void)fillDiagnostics:(NSDictionary *)d
+{
+	NSString *(^line)(NSString *, NSString *) = ^NSString *(NSString *k, NSString *v) {
+		return [NSString stringWithFormat:@"%-7s %@", k.UTF8String, v ?: @"—"];
+	};
+	NSString *err = gps_str(d, @"stepError");
+	NSNumber *blocks = gps_num(d, @"eswBlocks"), *search = gps_num(d, @"searchSeconds");
+	NSNumber *ag = gps_num(d, @"agcGps"), *ar = gps_num(d, @"agcGlonass");
+	NSNumber *ng = gps_num(d, @"noiseGps"), *ne = gps_num(d, @"noiseExpected");
+	NSNumber *oo = gps_num(d, @"oscOffsetPpb"), *ou = gps_num(d, @"oscUncertaintyPpb");
+	NSDictionary *det = d[@"detections"], *att = d[@"attempts"];
+	BOOL esw = [gps_num(d, @"eswLoaded") boolValue];
+
+	((UILabel *)_diag[@"Step"]).text = line(@"Step", gps_str(d, @"step"));
+	((UILabel *)_diag[@"Error"]).text = err ? [@"FAILED: " stringByAppendingString:err] : nil;
+	((UILabel *)_diag[@"Error"]).textColor = gps_rgb(0xff453a);
+	((UILabel *)_diag[@"Error"]).hidden = err == nil;
+	((UILabel *)_diag[@"Engine"]).text = line(@"Engine", gps_str(d, @"engineState"));
+	((UILabel *)_diag[@"ESW"]).text = line(@"ESW", !d ? nil : [NSString stringWithFormat:@"%@ · AR cut %@",
+	    esw ? (blocks ? [NSString stringWithFormat:@"%@ blk", blocks] : @"yes") : @"no",
+	    [gps_num(d, @"arTableCut") boolValue] ? @"yes" : @"no"]);
+	((UILabel *)_diag[@"Search"]).text = line(@"Search", search ? gps_duration(search.doubleValue) : nil);
+	((UILabel *)_diag[@"Det/att"]).text = line(@"Det/att", [det isKindOfClass:[NSDictionary class]] ?
+	    [NSString stringWithFormat:@"G %@ R %@", gps_pair(det, att, @"GPS"),
+	    gps_pair(det, att, @"GLONASS")] : nil);
+	((UILabel *)_diag[@"AGC"]).text = line(@"AGC", ag || ar ? [NSString stringWithFormat:@"G %@ R %@ dB",
+	    gps_fmt(ag, @"%.1f"), gps_fmt(ar, @"%.1f")] : nil);
+	((UILabel *)_diag[@"Noise"]).text = line(@"Noise", ng ? [NSString stringWithFormat:@"%@ (exp %@)",
+	    gps_fmt(ng, @"%.3f"), gps_fmt(ne, @"%.3f")] : nil);
+	((UILabel *)_diag[@"Osc"]).text = line(@"Osc", oo ? [NSString stringWithFormat:@"%.0f ± %.0f ppb",
+	    oo.doubleValue, ou.doubleValue] : nil);
+	((UILabel *)_diag[@"CNTIN"]).text = line(@"CNTIN", gps_str(d, @"cntin"));
+
+	NSString *p = gps_str(d, @"sessionLog");
+	if (p)
+		_sessionLog = p;
+	NSArray *hub = [d[@"hubLog"] isKindOfClass:[NSArray class]] ? d[@"hubLog"] : nil;
+	NSString *text = hub.count ? [hub componentsJoinedByString:@"\n"] : @"(no hub lines yet)";
+	if (![text isEqualToString:_hubText]) {
+		/* follow the end, unless the reader has scrolled up */
+		CGFloat bottom = _hubLog.contentSize.height - _hubLog.bounds.size.height;
+		BOOL atEnd = _hubText == nil || _hubLog.contentOffset.y >= bottom - 20;
+		_hubText = text;
+		_hubLog.text = text;
+		if (atEnd && text.length)
+			[_hubLog scrollRangeToVisible:NSMakeRange(text.length - 1, 1)];
+	}
+}
+
 /* ---- the screen's idle timer */
 
 - (void)setKeepAwake:(BOOL)on
@@ -678,12 +877,6 @@ gps_text(NSString *s, CGPoint centre, UIFont *font, UIColor *color)
 	    [NSDate dateWithTimeIntervalSince1970:st.st_mtimespec.tv_sec];
 	*ageOut = -[when timeIntervalSinceNow];
 	return d;
-}
-
-static NSString *
-gps_fmt(NSNumber *n, NSString *fmt)
-{
-	return n ? [NSString stringWithFormat:fmt, n.doubleValue] : @"—";
 }
 
 - (void)refresh
@@ -734,6 +927,9 @@ gps_fmt(NSNumber *n, NSString *fmt)
 		} else if ([state isEqualToString:@"error"]) {
 			badge = [NSString stringWithFormat:@"Error: %@", gps_str(d, @"error") ?: @"unknown"];
 			colour = 0xc0392b;
+		} else if ([state isEqualToString:@"starting"] &&
+		    [gps_str(d, @"step") hasPrefix:@"waiting for the hub"]) {
+			badge = @"Waiting for the hub…"; colour = 0x2f6fb5;
 		} else if ([state isEqualToString:@"starting"]) {
 			badge = @"Starting…"; colour = 0x2f6fb5;
 		} else if ([state isEqualToString:@"loading_esw"]) {
@@ -756,9 +952,9 @@ gps_fmt(NSNumber *n, NSString *fmt)
 			[parts addObject:[NSString stringWithFormat:@"TTFF %.1f s", ttff.doubleValue]];
 		else if (on && ![state isEqualToString:@"off"])
 			[parts addObject:@"TTFF —"];
-		sub = [parts componentsJoinedByString:@"   ·   "];
-		counts = [NSString stringWithFormat:@"%@ used / %@ in view",
-		    gps_num(d, @"satsUsed") ?: @"—", gps_num(d, @"satsInView") ?: @"—"];
+		[parts addObject:[NSString stringWithFormat:@"%@ used / %@ in view",
+		    gps_num(d, @"satsUsed") ?: @"—", gps_num(d, @"satsInView") ?: @"—"]];
+		sub = [parts componentsJoinedByString:@"  ·  "];
 	}
 	BOOL demo = fresh && [gps_num(d, @"demo") boolValue];
 	_demoBanner.hidden = !demo;
@@ -778,6 +974,7 @@ gps_fmt(NSNumber *n, NSString *fmt)
 	_sky.sats = sats;
 	_bars.sats = sats;
 	[self fillDetails:fresh ? d : nil];
+	[self fillDiagnostics:fresh ? d : nil];
 
 	/* awake while the receiver runs (or is being started), never in the background */
 	BOOL running = fresh && ![state isEqualToString:@"off"] && ![state isEqualToString:@"error"];
