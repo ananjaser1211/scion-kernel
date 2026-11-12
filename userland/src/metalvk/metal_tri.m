@@ -261,9 +261,10 @@ judge(const unsigned char *pixels, unsigned n, const double clear[3], unsigned *
  * changing, every frame judged as above and the tally written under it. So the pixels on the panel are Metal's, through the window
  * server's OpenGL ES compositor, which takes the surface as any layer's contents. (A CAMetalLayer and its drawables are the next step:
  * they need the device registered with Metal, MTLAddDevice, which discovery does with boot-arg metal=N.)
- * The plug-in, its runtime, the Vulkan driver and the library are taken from the application's own directory (HakiosMetal.bundle,
- * HakiosMetal.icd naming libvulkan_panfrost.dylib there, HakiosMetal.clients naming metal_tri, metal_tri.metallib), so that the test
- * needs nothing installed in the system image.
+ * The plug-in, its runtime, the Vulkan driver and the library are taken from the application's own directory when it has them
+ * (HakiosMetal.bundle, HakiosMetal.icd naming libvulkan_panfrost.dylib there, HakiosMetal.clients naming metal_tri, metal_tri.metallib:
+ * a hand test that needs nothing in the image), else from the image's (/redwood/lib/HakiosMetal.bundle, /redwood/share/metal_tri.metallib,
+ * userland/build.sh METAL=vk).
  */
 @interface MTApp : UIResponder <UIApplicationDelegate>
 @property (strong) UIWindow *window;
@@ -352,11 +353,16 @@ static struct {
 @implementation MTApp
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)options
 {
-	NSString *here = NSBundle.mainBundle.bundlePath;
+	NSString *here = NSBundle.mainBundle.bundlePath, *plugin = [here stringByAppendingPathComponent:@"HakiosMetal.bundle"],
+		 *metallib = [here stringByAppendingPathComponent:@"metal_tri.metallib"];
+	if (![NSFileManager.defaultManager fileExistsAtPath:plugin]) {         /* the image's (userland/build.sh METAL=vk) */
+		plugin = @"/redwood/lib/HakiosMetal.bundle";
+		metallib = @"/redwood/share/metal_tri.metallib";
+	}
 	app.n = 512;
-	app.device = make_device([here stringByAppendingPathComponent:@"HakiosMetal.bundle"].UTF8String);
+	app.device = make_device(plugin.UTF8String);
 	if (app.device != nil) {
-		app.pipeline = make_pipeline(app.device, [here stringByAppendingPathComponent:@"metal_tri.metallib"].UTF8String);
+		app.pipeline = make_pipeline(app.device, metallib.UTF8String);
 		app.queue = [app.device newCommandQueue];
 		for (int i = 0; i < 2 && app.pipeline != nil; i++) {
 			app.surface[i] = make_surface(app.n);
