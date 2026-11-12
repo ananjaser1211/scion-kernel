@@ -15,3 +15,5 @@
 /redwood/bin/cpu_test 240 &
 # which processes take the processors, every 10 s, one line to the log (src/cputop.c)
 /redwood/bin/cputop 10 &
+# the kept data volume (var_hfs=) to the flash every 5 s: a reset loses no more than that (src/var_sync.c)
+/redwood/bin/var_sync 5 &

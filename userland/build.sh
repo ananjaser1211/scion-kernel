@@ -349,6 +349,8 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 		$DYN -framework IOKit -o obj/mali_test src/mali_test.c
 		# which processes take the processors, every few seconds (src/cputop.c; rc.jobs.cputop)
 		$DYN -o obj/cputop src/cputop.c
+		# the kept data volume to the flash every few seconds: the phone is reset, never shut down (src/var_sync.c)
+		$DYN -o obj/var_sync src/var_sync.c
 		# the wallpaper's second chance on a phone too slow for launchd's 5 s check-in (src/poster_retry.c; rc.jobs)
 		$DYN -o obj/poster_retry src/poster_retry.c
 		$DYN -framework CoreFoundation -framework IOSurface -o obj/cow_test src/cow_test.c
@@ -599,6 +601,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	[ -f obj/jb_seed ] && cp obj/jb_seed root/bin/
 	[ -f obj/passcoded ] && cp obj/passcoded root/bin/
 	[ -f obj/cputop ] && cp obj/cputop root/bin/
+	[ -f obj/var_sync ] && cp obj/var_sync root/bin/
 	[ -f obj/poster_retry ] && cp obj/poster_retry root/bin/
 	[ -f obj/cow_test ] && cp obj/cow_test root/bin/
 	[ -f obj/cg_test ] && cp obj/cg_test root/bin/
