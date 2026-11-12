@@ -676,6 +676,37 @@ Version received: Asic 0x3000000F, IFC 132, Radio 0x03"**, then **STATE_REPORT S
   - Try a wider oscillator uncertainty (item 8, 0x0500 = 5 ppm, or more) to rule out a reference offset beyond 2 ppm.
   - If neither helps, a schematic or hardware check of the GNSS antenna/LNA path is the remaining step.
 
+**gpsd's real CONFIG_SET** (offline, 13 Nov; gpsd `GlPe_MeIfImpl::meif_config_set_msg` 0x47c528, `GlSettingsImpl` at
+`[this+1616]`, `GlSettingsImpl::SetFrequencyPlan` 0x3873b8).
+- gps.xml's `FRQ_PLAN_26MHZ_2PPM_49_152MHZ_300PPB` is enum 47 (name table at gpsd 0x787b60). Its jump-table case (0x387898)
+  sets these fields:
+  - +76 = 3 and +80 = 26000000 (the TCXO).
+  - +88 = 2e-6 (TCXO uncertainty).
+  - +96 = 49152000 (the external oscillator).
+  - +104 = 3e-7 (its uncertainty).
+  - +112 = 1 (an external oscillator is present).
+- Nothing else in gps.xml reaches the CONFIG_SET. `PlatformSpecificFlag` (+32) and `CntinOffsetPpb` (+808) are not in
+  gps.xml, so both are 0. With +808 at 0, the optional 0x8004 item is left out. `RfPathLossDb` does not go into any item.
+- The builder's constants are at gpsd 0xe2b40 and 0xe2a68 (item 5 and the item 10 header), 0xe38a0 (item 8's tail and
+  the 0x8002 header), and 0xe2998 (1e6).
+
+| Item | Bytes gpsd sends (this gps.xml) | Meaning |
+|---|---|---|
+| 5 MEASUREMENT | `0500 1000 e803 0100 0003 0700 0a00 0a00` | fixed; the byte at +8 is 6 + (ext osc present) = **7** (the chip's default is 6) |
+| 10 EXT_OSC | `0a00 0c00 0000ee02 4c00 0100` | u32 49152000 Hz, u16 8.8 ppm = 0.3 (76), u16 1 = present (the chip's default is `00000000 ffff 0000`, i.e. none) |
+| 8 ME_OSC_PARAMS | `0800 0800 0002 0100` | u16 8.8 ppm = 2.0, s16 1 (the same as the chip's default) |
+| 0x8002 MISC | `0280 1000 0100 0000 00000000 00000000` | fixed |
+| 0x8006 PLATFORM_SPECIFIC | `0680 0800 00000000` | PlatformSpecificFlags = 0 |
+| 7 RF_PARAMS | `0700 0800 00000000` | **always zero** in gpsd (written with `stp x12, xzr`). The chip stores the first u16 as RfLoss, whose default is 6 |
+| 0x8001 LOGGINGS | `0180 1000 <u16 pri> 0000 <u32 mask> 00000000` | from the log settings |
+
+So the earlier zeros were right for items 7 and 8. What differs is that gpsd tells the ME about a 49.152 MHz, 300 ppb
+external oscillator, in item 10 and in item 5's flag. The hub stores item 10 (handler 0x0081ceae) as ExtOsc(freq, unc)
+(`IsExtOscAvailable`, `GetExtOscFrqHz`, `GetExtOscUncPPB`). Item 8's ppm becomes `GetMeOscFrqUncPPB`, which is the 2000
+in `GlDineCtrl::SetRefClockParams(26000000, 2000, ...)`. The 26 MHz TCXO frequency is not a CONFIG_SET value: the hub
+patch hard-codes it when it sets up the ME (0x0081022e: literal 0x018cba80 to vfunc +248, then LNA mask 1, RF mode 3,
+RF type 35). gps.xml agrees with it.
+
 **Integration, when it works.**
 - **Firmware**: `devices/star2lte/firmware/gnss/` holds a README and SHA256SUMS only. `tools/fetch-firmware.sh`
   extracts the three 4775_B0 segments from the user's own gpsd: `--from DIR`, or the pinned vendor tree if it has
