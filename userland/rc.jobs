@@ -4,6 +4,7 @@
 /redwood/bin/surf_test
 /bin/ps -A
 /redwood/bin/mg_test
+/redwood/bin/mg_test DiskUsage
 # the processors: how many, and -- once the system has settled -- whether they work at the same time
 /redwood/bin/cpu_test
 # the Galaxy S9's GPU from a program (says one line and stops where there is no HakiosMali: anywhere but mali=9)
