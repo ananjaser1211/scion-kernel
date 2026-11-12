@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.hakios.telephonyd</string>
+	<!-- the stand-in for CommCenter's two client services (src/telephonyd.m, docs/telephonyd.md): CoreTelephony's clients
+	     get "no SIM, no service" instead of a failed lookup, and SpringBoard stops rebuilding its CTServerConnection
+	     (and resetting the idle timer) once a second. Apple's CommCenter stays out (mkjobs.py's DENY), so the label
+	     must not contain that word. Started on demand, by the first lookup of either service. (No UserName: in this
+	     launchd's domain a job that asks for one exits 78 before it runs.) -->
+	<key>ProgramArguments</key>
+	<array>
+		<string>/redwood/bin/telephonyd</string>
+	</array>
+	<key>MachServices</key>
+	<dict>
+		<key>com.apple.commcenter.xpc</key>
+		<true/>
+		<key>com.apple.commcenter.coretelephony.xpc</key>
+		<true/>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>/dev/console</string>
+	<key>StandardErrorPath</key>
+	<string>/dev/console</string>
+</dict>
+</plist>

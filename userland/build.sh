@@ -336,6 +336,9 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 		{ ${LDID:-ldid} -Ssrc/passcoded.entitlements obj/passcoded 2>/dev/null ||
 		  codesign -f -s - --entitlements src/passcoded.entitlements obj/passcoded 2>/dev/null ||
 		  echo "build.sh: no ldid or codesign: passcoded is unsigned, and with keystore_entcheck=2 it cannot change the passcode"; }
+		# the stand-in for CommCenter's client services, com.apple.commcenter.xpc and .coretelephony.xpc: "no SIM, no
+		# service" for CoreTelephony's clients (src/telephonyd.m, com.hakios.telephonyd.plist, docs/telephonyd.md)
+		$DYN -fobjc-arc -framework Foundation -framework CoreTelephony -o obj/telephonyd src/telephonyd.m
 		$DYN -framework CoreFoundation -framework AudioToolbox -framework AVFoundation -lobjc -o obj/sound_test src/sound_test.c
 		$DYN -framework CoreFoundation -lMobileGestalt -o obj/mg_test src/mg_test.c
 		$DYN -framework CoreFoundation -framework AVFoundation -lobjc -o obj/torch_test src/torch_test.c
@@ -639,6 +642,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	[ -f obj/selftest ] && cp obj/selftest root/bin/
 	[ -f obj/jb_seed ] && cp obj/jb_seed root/bin/
 	[ -f obj/passcoded ] && cp obj/passcoded root/bin/
+	[ -f obj/telephonyd ] && cp obj/telephonyd root/bin/
 	[ -f obj/cputop ] && cp obj/cputop root/bin/
 	[ -f obj/var_sync ] && cp obj/var_sync root/bin/
 	[ -f obj/devname ] && cp obj/devname root/bin/
@@ -900,6 +904,8 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	[ ! -f root/bin/selftest ] || cp com.hakios.selftest.plist root/LaunchDaemons/
 	# the GNSS receiver's fixes to locationd (src/gnssd.m, docs/gnssd.md)
 	[ ! -f root/bin/gnssd ] || cp com.hakios.gnssd.plist root/LaunchDaemons/
+	# CoreTelephony's server, saying "no SIM" (src/telephonyd.m, docs/telephonyd.md)
+	[ ! -f root/bin/telephonyd ] || cp com.hakios.telephonyd.plist root/LaunchDaemons/
 	[ -z "$JB_KEPT_ONLY" ] || : > root/etc/jb.kept-only     # init: no graft on a memory filesystem (src/init.c)
 	VOLUME=""
 	[ -n "$FLASHBOOT" ] && [ -f $DARWIN/rootfs.slt ] && VOLUME="--root-volume $DARWIN/rootfs.slt"
