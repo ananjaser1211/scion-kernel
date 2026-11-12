@@ -44,6 +44,14 @@
  *            without it.
  *   shub_req_rpc=<n>     RPC that carries SSP to the hub. Default 0x20: inferred from the hub's answers in RPC 0x21,
  *            not observed (lhd builds it). shub_req_len=0 sends the SSP bytes without the u16 length before them.
+ *   shub_acc_pos=<0-7>   the accelerometer's (and gyroscope's) position in the formation of step 5. Default: the device
+ *            tree's, 4 on the S9 (starlte), 7 on the S9+ (star2lte).
+ *   shub_acc_cal=X,Y,Z   the accelerometer's factory offsets, sent to the hub before the sensors go on, as Samsung does
+ *            (factory/accel_lsm6dsl.c set_accel_cal(): SSP 0xCE, s16 x, y, z). The numbers are the three little-endian
+ *            s32 of /efs/FactoryApp/calibration_data, in counts at the 8 g range (4096 = 1 g), in the hub's output axes
+ *            (so taken with the right shub_acc_pos). Default: none.
+ *   shub_gyro_cal=X,Y,Z  the same for the gyroscope (gyro_lsm6dsl.c set_gyro_cal(): SSP 0xCD, s32 x, y, z), the three
+ *            little-endian s32 of /efs/FactoryApp/gyro_cal_data. Default: none.
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
@@ -138,8 +146,16 @@
 #define GATE_MANUAL             (1u << 20)
 #define GATE_ON                 (1u << 21)
 
-/* sensor formation values sent in step 5, from the device tree */
-#define ACC_POSITION            4
+/*
+ * Sensor formation values sent in step 5, from the device tree (ssp-acc-position, ssp-mag-position; Samsung's
+ * set_sensor_position() sends the accelerometer's twice, for the gyroscope of the same LSM6DSL). The hub turns the
+ * chips' axes into Android's with them, so a wrong one turns every motion sample (and iOS's orientation) by 90 degrees
+ * or mirrors it. The S9 (exynos9810-starlte_*_26.dts) mounts the LSM6DSL at position 4, the S9+
+ * (exynos9810-star2lte_kor_26.dts and _eur_open_26.dts) at 7; the magnetometer is at 5 on both.
+ * shub_acc_pos=<0-7> overrides the accelerometer's.
+ */
+#define ACC_POSITION_S9         4
+#define ACC_POSITION_S9PLUS     7
 #define MAG_POSITION            5
 #define PATCH_ENTRY             0x00800161u     /* <PatchAddress=> of bbd_patch_file_star.h */
 #define PATCH_FILE              "bcm_sensorhub_a1.bin"
@@ -180,6 +196,10 @@ static struct hakios_exynos_spi bus = {
 static vm_offset_t pmu, cmu_top, cmu_chub, gpio_chub, alive, peric0;
 static uint32_t steps, keep = 1, log_frames, div_ratio = 15, chub_on_ok;
 static uint32_t want_sensors = 0x2b3, period_ms = 20, req_rpc = SHUB_RPC_SENSOR_REQ, req_len = 1;
+static uint32_t acc_position = ACC_POSITION_S9; /* hakios_ssp_init(): by HAKIOS_DEVICE, or shub_acc_pos= */
+static bool acc_cal_given, gyro_cal_given;      /* shub_acc_cal=, shub_gyro_cal= */
+static int32_t acc_cal[3], gyro_cal[3];
+static bool acc_cal_subtract;                   /* the hub took no 0xCE: the offsets are taken off here instead */
 static bool powered;
 static const char *state = "off";
 
@@ -1203,11 +1223,14 @@ ssp_init(void)
 		return false;
 	}
 	say("shub: 5: WHOAMI 0x55\n");
-	b[0] = ACC_POSITION;
-	b[1] = ACC_POSITION;
+	b[0] = (uint8_t)acc_position;
+	b[1] = (uint8_t)acc_position;
 	b[2] = MAG_POSITION;
 	if (!ssp_cmd(SSP_SENSOR_FORMATION, SSP_AP2HUB_WRITE, 0, b, 3)) {
 		say("shub: 5: the formation not taken\n");
+	} else {
+		say("shub: 5: the formation: accelerometer and gyroscope at %u, magnetometer at %u (%s)\n", acc_position,
+		    MAG_POSITION, HAKIOS_DEVICE);
 	}
 	memset(b, 0, sizeof(b));
 	if (ssp_cmd(SSP_SENSOR_SCANNING, SSP_AP2HUB_READ, 0, b, 8)) {
@@ -1238,6 +1261,75 @@ sensor_on(uint8_t id, uint32_t ms)
 		return false;
 	}
 	ssp.enabled |= 1ull << id;
+	return true;
+}
+
+/*
+ * The factory calibration, as Samsung's sync_sensor_state() (ssp_debug.c) sends it once the hub is up and before any
+ * sensor is added: the gyroscope's (SSP 0xCD, 12 bytes: s32 x, y, z), then the accelerometer's (SSP 0xCE, 6 bytes: s16
+ * x, y, z; the hub takes them off its samples). Only what shub_acc_cal= / shub_gyro_cal= give. If the hub does not take
+ * the accelerometer's, convert() takes them off the samples to user space instead.
+ */
+static void
+send_calibration(void)
+{
+	uint8_t b[12];
+
+	if (gyro_cal_given) {
+		if (!(ssp.found & (1ull << SSP_GYRO))) {
+			say("shub: 6: no gyroscope found: its calibration not sent\n");
+		} else {
+			for (int i = 0; i < 3; i++) {
+				shub_put32(b + 4 * i, (uint32_t)gyro_cal[i]);
+			}
+			say("shub: 6: gyroscope calibration %d %d %d: %s\n", gyro_cal[0], gyro_cal[1], gyro_cal[2],
+			    ssp_cmd(SSP_SET_GYRO_CAL, SSP_AP2HUB_WRITE, 0, b, 12) ? "taken" : "NOT taken (not applied)");
+		}
+	}
+	if (acc_cal_given) {
+		bool taken;
+
+		for (int i = 0; i < 3; i++) {
+			b[2 * i] = (uint8_t)acc_cal[i];
+			b[2 * i + 1] = (uint8_t)((uint32_t)acc_cal[i] >> 8);
+		}
+		taken = (ssp.found & (1ull << SSP_ACCEL)) && ssp_cmd(SSP_SET_ACCEL_CAL, SSP_AP2HUB_WRITE, 0, b, 6);
+		acc_cal_subtract = !taken;
+		say("shub: 6: accelerometer calibration %d %d %d: %s\n", acc_cal[0], acc_cal[1], acc_cal[2],
+		    taken ? "taken by the hub" : "NOT taken: subtracted from the samples to user space instead");
+	}
+}
+
+/* "X,Y,Z" (a boot-arg's text, empty if absent) into v[3]; false if absent or not three numbers */
+static bool
+parse_triple(const char *name, const char *text, int32_t v[3])
+{
+	const char *p = text;
+
+	if (text[0] == 0) {
+		return false;
+	}
+	for (int i = 0; i < 3; i++) {
+		int sign = 1;
+		int32_t n = 0;
+		bool digits = false;
+
+		if (*p == '-') {
+			sign = -1;
+			p++;
+		} else if (*p == '+') {
+			p++;
+		}
+		while (*p >= '0' && *p <= '9' && n < 100000000) {
+			n = n * 10 + (*p++ - '0');
+			digits = true;
+		}
+		if (!digits || (i < 2 && *p++ != ',') || (i == 2 && *p != 0)) {
+			say("shub: %s=%s: not X,Y,Z: ignored\n", name, text);
+			return false;
+		}
+		v[i] = sign * n;
+	}
 	return true;
 }
 
@@ -1272,6 +1364,11 @@ convert(const struct shub_sample *s, struct hakios_sensor_sample *o)
 		o->v[1] = (int16_t)shub_le16(d + 2);
 		o->v[2] = (int16_t)shub_le16(d + 4);
 		o->scale = ssp.accel_range ? ssp.accel_range : 8;
+		if (acc_cal_subtract) {
+			o->v[0] -= acc_cal[0];
+			o->v[1] -= acc_cal[1];
+			o->v[2] -= acc_cal[2];
+		}
 		if (now_ns() < fake_until_ns) {
 			o->v[0] = fake_v[0];
 			o->v[1] = fake_v[1];
@@ -1422,6 +1519,7 @@ run(void)
 		                                                   { SSP_PRESSURE, 200 } };
 	uint32_t frames_at_time = 0;
 
+	send_calibration();
 	for (uint8_t id = 0; id < SSP_SENSORS; id++) {
 		uint32_t ms = period_ms;
 
@@ -1735,6 +1833,22 @@ hakios_ssp_init(void)
 	PE_parse_boot_argn("shub_ms", &period_ms, sizeof(period_ms));
 	PE_parse_boot_argn("shub_req_rpc", &req_rpc, sizeof(req_rpc));
 	PE_parse_boot_argn("shub_req_len", &req_len, sizeof(req_len));
+	acc_position = strcmp(HAKIOS_DEVICE, "star2lte") == 0 ? ACC_POSITION_S9PLUS : ACC_POSITION_S9;
+	PE_parse_boot_argn("shub_acc_pos", &acc_position, sizeof(acc_position));
+	{
+		char text[48] = "";
+
+		if (PE_parse_boot_arg_str("shub_acc_cal", text, sizeof(text))) {
+			acc_cal_given = parse_triple("shub_acc_cal", text, acc_cal);
+		}
+		text[0] = 0;
+		if (PE_parse_boot_arg_str("shub_gyro_cal", text, sizeof(text))) {
+			gyro_cal_given = parse_triple("shub_gyro_cal", text, gyro_cal);
+		}
+	}
+	if (acc_position > 7) {
+		acc_position = strcmp(HAKIOS_DEVICE, "star2lte") == 0 ? ACC_POSITION_S9PLUS : ACC_POSITION_S9;
+	}
 	{
 		uint32_t h = 0;
 

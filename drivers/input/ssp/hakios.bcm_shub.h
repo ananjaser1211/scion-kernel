@@ -444,6 +444,8 @@ shub_patch_check(const uint8_t *p, size_t len, struct shub_patch_info *info)
 #define SSP_SENSOR_FORMATION    0xF1    /* write 3: accel position, gyro position, mag position */
 #define SSP_SENSOR_SCANNING     0xF4    /* read 8: a bitmap of the sensors found, bit n = sensor n */
 #define SSP_GET_ACCEL_RANGE     0xE1    /* read 1 */
+#define SSP_SET_GYRO_CAL        0xCD    /* write 12: s32 x, y, z (MSG2SSP_AP_MCU_SET_GYRO_CAL) */
+#define SSP_SET_ACCEL_CAL       0xCE    /* write 6: s16 x, y, z (MSG2SSP_AP_MCU_SET_ACCEL_CAL) */
 #define SSP_SENSOR_ADD          0xA1    /* write 10: [id][s32 period ms][s32 max latency ms][s8 flags] */
 #define SSP_SENSOR_REMOVE       0xA2    /* write 5: [id][s32 period ms] */
 #define SSP_CHANGE_DELAY        0xA4    /* write 10, as ADD */
