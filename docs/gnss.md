@@ -529,6 +529,20 @@ Version received: Asic 0x3000000F, IFC 132, Radio 0x03"**, then **STATE_REPORT S
     sensors kept running. Turn on only a few facilities, and never all 256.
   - Without facilities, `enable_log_to_host_LOG_INFO_Overwrite` alone gives only the PVT task's own lines.
 
+**The minimal host request does nothing visible** (22:25 boot, phone at a window).
+- ESW, then RESET, esw_ctrl, IDLE, ON as before (`IDLE -> ON`).
+- Then MEIF 0x818E with a=1, b=1 and the rest 0. It was acknowledged at the RPC level; no MEIF answer came, and nothing else came in 10 minutes.
+- Turning on facilities 0x0E, 0x0C, 0x4B, 0x16, 0x4F and 0x97 one at a time, 2 s apart, kept the hub healthy, but no
+  log line came either. The engine is probably idle with the ASIC off, so there is nothing to log.
+- What gpsd really sends for an on-chip request (`GlPeReqBag::UpdateSensorHubConfig`, gpsd 0x3ac5b0):
+  - the MicroNav config 0x8183, `[u16 0][u32 flags][u16][u16 0]`. The flags are 17 or 529 plus constellation and
+    sensor bits.
+  - the request 0x818E: a = request id, b = the breadcrumb period in s, c = the batch options, e = a constellation
+    setting, h = request field +160, g = ms to the next batch point.
+- **Next**: send 0x8183 before 0x818E with gpsd's flag values, and decode the hub's 0x8183 handler and
+  `ProcessPowerCycleLogic` (around 0x00804e00-0x00805330) to find what turns the ASIC on. With logs, use only
+  `pvt enable_log_to_host_LOG_INFO_Overwrite` and a few 0x2B facilities, 2 s apart.
+
 **Integration, when it works.**
 - **Firmware**: `devices/star2lte/firmware/gnss/` holds a README and SHA256SUMS only. `tools/fetch-firmware.sh`
   extracts the three 4775_B0 segments from the user's own gpsd: `--from DIR`, or the pinned vendor tree if it has
