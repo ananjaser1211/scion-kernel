@@ -56,6 +56,9 @@
 #include <sys/hakios.physmap.h>
 #include <sys/hakios.log.h>
 
+/* a file of the small image (drivers/storage/hakios.image.c), as hakios.bcm4361_bt.c and hakios.ssp.c take theirs */
+extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
+
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern boolean_t pmap_valid_page(ppnum_t);
 
@@ -779,6 +782,38 @@ look(const char *when)
 	    rd(cmu_top, TOP_DIV), rd(cmu_top, TOP_GATE), rd(cmu_busc, 0x30EC), rd(cmu_busc, 0x30F8), rd(cmu_busc, 0x314C));
 }
 
+/*
+ * The memory bus's clock as the CMU has it, read only (12 Nov: MIF and INT were never set by this kernel and the APM's
+ * DVFS "get" answers 0, so the rate S-Boot left was unknown; Samsung's star2 tree boots MIF at 1794000 kHz for 40 s,
+ * devfreq_mif boot_info, then keeps it between 208000 and 2093000). Apollo cal-if exynos9810: CMU_MIF 0x1B800000,
+ * PLL_CON0_PLL_MIF +0x120 (PLL_1050X: P [13:8], M [25:16], S [2:0], ENABLE 31, STABLE 29; rates 4264/3731/2576/1418 MHz,
+ * the bus at about half), CLKMUX_MIF_DDRPHY2X +0x1000 (the PLL, or CMU_TOP's CLKCMU_MIF_SWITCH for the lower levels),
+ * DIV_CLK_MIF_PRE +0x1810, DIV_CLK_MIF_BUSD +0x1800; CMU_TOP's MUX_CLKCMU_MIF_SWITCH +0x10a8.
+ */
+#define CMU_MIF_PA      0x1B800000ULL
+static void
+mif_look(const char *when)
+{
+	static volatile uint8_t *cmu_mif;
+	uint32_t con0, m, p, s;
+
+	if (cmu_mif == NULL) {
+		cmu_mif = (volatile uint8_t *)ml_io_map(CMU_MIF_PA, 0x2000);
+		if (cmu_mif == NULL) {
+			return;
+		}
+	}
+	con0 = rd(cmu_mif, 0x120);
+	m = (con0 >> 16) & 0x3ff;
+	p = (con0 >> 8) & 0x3f;
+	s = con0 & 7;
+	say("exynos_mfc: %s: the memory bus: PLL_MIF CON0 %#x (M %u, P %u, S %u: %u MHz, %s, %s), DDRPHY2X mux %#x, MIF_PRE "
+	    "divider %#x, BUSD divider %#x; CMU_TOP MIF_SWITCH mux %#x\n", when, con0, m, p, s,
+	    p ? (uint32_t)(26ULL * m / ((uint64_t)p << s)) : 0, con0 & (1u << 31) ? "enabled" : "off",
+	    con0 & (1u << 29) ? "stable" : "not stable", rd(cmu_mif, 0x1000), rd(cmu_mif, 0x1810), rd(cmu_mif, 0x1800),
+	    rd(cmu_top, 0x10a8));
+}
+
 static bool
 block_on(void)
 {
@@ -812,6 +847,7 @@ block_on(void)
 		wr(cmu_mfc, q, rd(cmu_mfc, q) | QCH_REQ);
 	}
 	IODelay(100);
+	mif_look("2 (as found)");
 	/* Rates are left alone unless a boot arg asks; CLKCMU_MFC_BUS is in the INT domain. */
 	if (PE_parse_boot_argn("mfc_int_khz", &want, sizeof(want)) && want != 0) {
 		int e = hakios_acpm_dvfs_set(1, want);
@@ -821,6 +857,7 @@ block_on(void)
 		int e = hakios_acpm_dvfs_set(0, want);
 		say("exynos_mfc: 2: MIF asked for %u kHz: %d\n", want, e);
 	}
+	mif_look("2 (after any request)");
 	(void)hakios_acpm_dvfs_get(1, &khz);
 	say("exynos_mfc: 2: INT at %u kHz; ", khz);
 	khz = 0;
@@ -882,13 +919,27 @@ firmware_start(void)
 	uint64_t got = 0;
 	int waited;
 
-	for (waited = 0; waited < 120 && hakios_ufs_read_partition(partition, 0, probe, sizeof(probe), &got) != 0; waited++) {
-		IOSleep(500);
+	/*
+	 * fw/mfc_fw.bin of the small image first (DEVICE=star*lte builds put the vendor's there: a phone whose VENDOR
+	 * partition is another ROM's, or wiped, has none), then the phone's own VENDOR.
+	 */
+	data = hakios_image_file("fw", "mfc_fw.bin", &size, NULL);
+	if (data != NULL && (size == 0 || size > FW_CODE)) {
+		say("exynos_mfc: 3: fw/mfc_fw.bin is %llu bytes (at most %u): not used\n", size, (unsigned)FW_CODE);
+		data = NULL;
 	}
-	say("exynos_mfc: 3: the %s partition answers after %d ms more (%llu bytes)\n", partition, waited * 500, got);
-	if (hakios_partition_file(partition, "/vendor", "/firmware/mfc_fw.bin", FW_CODE, &data, &size) != 0 || data == NULL) {
-		say("exynos_mfc: 3: /firmware/mfc_fw.bin is not on the phone's %s partition: no hardware video\n", partition);
-		return false;
+	if (data != NULL) {
+		say("exynos_mfc: 3: the firmware from fw/mfc_fw.bin of the small image\n");
+	} else {
+		for (waited = 0; waited < 120 && hakios_ufs_read_partition(partition, 0, probe, sizeof(probe), &got) != 0; waited++) {
+			IOSleep(500);
+		}
+		say("exynos_mfc: 3: the %s partition answers after %d ms more (%llu bytes)\n", partition, waited * 500, got);
+		if (hakios_partition_file(partition, "/vendor", "/firmware/mfc_fw.bin", FW_CODE, &data, &size) != 0 || data == NULL) {
+			say("exynos_mfc: 3: mfc_fw.bin is neither in fw/ nor on the phone's %s partition: no hardware video\n",
+			    partition);
+			return false;
+		}
 	}
 	code = mfc_alloc(FW_CODE + DEV_CTX);
 	bzero(code, FW_CODE + DEV_CTX);
