@@ -143,7 +143,9 @@ mask_position(char *t)
 {
 	size_t k = strlen(t);
 	/* the measurement engine's noise and gain statistics are not positions, and they say whether the RF path works */
-	int stats = (strstr(t, "NoiseStats") != NULL || strstr(t, "DagcStats") != NULL) && strstr(t, "$G") == NULL &&
+	/* nor are the oscillator offset and its CNTIN measurement against the external oscillator */
+	int stats = (strstr(t, "NoiseStats") != NULL || strstr(t, "DagcStats") != NULL || strstr(t, "MEIF:OSC") != NULL ||
+	    strstr(t, "Cntin") != NULL || strstr(t, "OscOff") != NULL) && strstr(t, "$G") == NULL &&
 	    strstr(t, "Lat") == NULL && strstr(t, "Lon") == NULL && strstr(t, "LLA") == NULL && strstr(t, "NMEA") == NULL;
 
 	for (size_t i = 0; i < k && !stats; i++) {
