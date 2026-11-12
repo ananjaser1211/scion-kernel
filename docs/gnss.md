@@ -707,6 +707,69 @@ in `GlDineCtrl::SetRefClockParams(26000000, 2000, ...)`. The 26 MHz TCXO frequen
 patch hard-codes it when it sets up the ME (0x0081022e: literal 0x018cba80 to vfunc +248, then LNA mask 1, RF mode 3,
 RF type 35). gps.xml agrees with it.
 
+**Open sky with gpsd's real config, and a wider oscillator window** (TWRP restart at 23:44, phone outdoors and flat on
+open sky, the same build).
+- Sequence (local script): pin mux, `pvt enable_log_to_host_LOG_INFO_Overwrite`, facilities 0x0e/0x16/0x4f/0x97 2 s apart,
+  `1c 01`, ESW load, RESET, then with serials 1-5: esw_ctrl, **gpsd's CONFIG_SET** (92 bytes, the table above, 0x8001 with
+  logging on), EXT_LNA (25), IDLE, ON. Each phase is `pvt disable_indoor` + `pvt gnss_start` + listen + `pvt gnss_stop`.
+  Before each later phase, a one-item CONFIG_SET (item 8, serial 6, 7, 8) changes the ME oscillator's uncertainty.
+- Everything was ACKed. The chip took the values. `SetRefClockParams(26000000, 2000, 296)`: the third number is now the
+  external oscillator's 296 ppb, where it was 59388 with the chip's defaults. At ON the ME calls `IsExtOscAvailable` and
+  `MeasCNTIN`, then `SetCntinMeas(3, ...)`, i.e. it measures the TCXO against the external oscillator. The ME reloads at
+  each `gnss_start`, and every phase logged the new value (`SetRefClockParams(26000000, 5000 / 10000 / 20000, 296)`).
+
+| Phase | ME_OSC uncertainty | Time | GPS detections / attempts | Measured noise GPS_GAL (table 3.825) |
+|---|---|---|---|---|
+| 1 | 2 ppm (gpsd) | 60 s | 0 / 55 | (not printed) |
+| 2 | 5 ppm | 60 s | 0 / 55 | 3.548 |
+| 3 | 10 ppm | 120 s | 0 / 64 | 3.631 |
+| 4 | 20 ppm | 120 s | 0 / 64 | 3.537 |
+
+- AGC: GPS_GAL AAGC 21.62 dB, GLO 30.5-32.1, BDS 34.6, the same in every phase. `Sats(0)` throughout, and no valid
+  pseudorange. With 10 and 20 ppm the attempts per second fall (64 in 120 s against 55 in 60 s), as a wider frequency
+  search would make them. Strong open-sky signals would be found in a 20 ppm window in seconds. So **neither gpsd's
+  CONFIG_SET nor a reference offset up to 20 ppm explains the zero.**
+- Two more phases at 20 ppm, with the ME still ON. A `gnsstool` that leaves the oscillator lines unmasked was used.
+  - 25 s: **1 detection in 49 attempts (2.04%)**, 0 cross-correlations, 0 valid pseudoranges. No satellite ID or C/N0 was
+    logged for it.
+  - 120 s straight after: 0 in 64 (noise 3.740).
+  - A lone detection that never becomes a pseudorange, and does not come back, is most likely a false alarm at the
+    detection threshold, not a satellite.
+- The oscillator offset (`MEIF:OSC GetOscOffset(...)`, `SetCntinMeas(3, ...)`) is logged only at the first IDLE -> ON
+  with the ME loaded. That was before the unmasking, so the value is not known. An IDLE -> ON cycle later, with the ME
+  unloaded, did not log it again. With gnsstool 94a521a it shows on the next cold run. It is the TCXO's offset against
+  the 49.152 MHz reference, in ppm, and it is the one remaining software reading of the reference clock.
+
+**The stock device tree** (owner's backup `backup/2026-11-12-pre-hfs`, offline):
+- `DTB.img` (and `DTBO.img`, the same hash) is **all zeros**, so the stock DTB partition was already blank.
+- The star2 DTBs that do exist are inside `BOOT.img` (two copies, Scion's own boot image, built from Apollo) and
+  `RECOVERY.img` (TWRP).
+- All are "Samsung Star2 rev26", `model_info-hw_rev` 0x1a with `hw_rev_end` 0xff. One DTB covers every board revision
+  from 26 up, so there is no later-revision variant to miss.
+- TWRP's DTB has no `fm-lna-en` and no FM radio node, so it is not the KOR tree (it is EUR/global).
+- Compared without phandles, the GNSS-related nodes are identical in TWRP's DTB and Apollo's `star2lte_kor_26`: `gps`
+  (gpg0-2), `BCM4773@0` (SPI 25 MHz, mode 3, host-req gpa1-7, mcu-req/resp gph0-5/4, batch-wake gpa0-5, shub-int
+  gpa4-0, cs gph0-3, vdd_mcu_1p8), and the `ssp-*` and `ssp-gps-pwr-en` pinctrl. The only difference is
+  `ssp-mag-array` (the compass calibration).
+- No board revision adds a GNSS LNA, TCXO, antenna switch or regulator.
+
+**Where this leaves the zero** (no software lead left from this list):
+- Ruled out in software: gpsd's CONFIG_SET (now sent as gpsd sends it), the external oscillator and the frequency plan
+  as gps.xml gives them, a reference offset up to 20 ppm, the RF type, mode and LNA mask (the chip's own, = gps.xml),
+  EXT_LNA_CONF, the P17 pin mux (set and read back), the device tree, and any AP or modem dependency (previous section).
+- What only the hardware can tell:
+  1. **Whether the antenna's signal reaches the 4775's RF input.** The noise floor and AGC say the receive chain makes
+     normal *noise*. An LNA with nothing on its input makes the same noise floor, so they do not show that the antenna
+     is connected. Check the GNSS antenna feed, its spring contact or coax, and any diplexer or matching parts between
+     the antenna and the LNA. A phone that has been opened is the first suspect.
+  2. **Whether the external LNA is powered and enabled.** The pin mux puts P17 in mode 1, as lhd does (0x40410408 =
+     0x10), but whether P17 is the LNA's enable on this board, and whether the LNA has its supply, can only be measured.
+  3. **The TCXO's real frequency and offset.** The engine assumes 26 MHz, hard-coded in the hub patch, and gps.xml
+     agrees. A window of 20 ppm found nothing. A probe on the TCXO, or the CNTIN number above, settles it.
+- Cheapest decisive test: **does GNSS work on this phone under stock Android?** One cold start outdoors with any GPS app.
+  If it does not, the fault is hardware (1-3). If it does, the difference is still in software. Then capture lhd/gpsd's
+  traffic there (lhd's log with `LogFacMask` widened) and compare it with ours message by message.
+
 **Integration, when it works.**
 - **Firmware**: `devices/star2lte/firmware/gnss/` holds a README and SHA256SUMS only. `tools/fetch-firmware.sh`
   extracts the three 4775_B0 segments from the user's own gpsd: `--from DIR`, or the pinned vendor tree if it has
