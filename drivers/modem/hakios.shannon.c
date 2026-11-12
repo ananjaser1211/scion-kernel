@@ -446,23 +446,51 @@ load_part(volatile uint8_t *cp, uint64_t at, uint64_t from, uint64_t length, con
  * the SMC; EL3 runs the call with them masked anyway) on whatever core the thread is on, if its MPIDR's affinity is not
  * 0; on core 0 the thread sleeps 10 ms and looks again, up to 2 s.
  */
-static uint64_t
-security_request(uint32_t mode, uint32_t size_boot, uint32_t size_main)
+static void
+smc_full(uint64_t function, uint64_t first, uint64_t second, uint64_t third, uint64_t answer[4])
 {
-	uint64_t answer = ~0ull, mpidr = 0;
+	register uint64_t x0 __asm__("x0") = function;
+	register uint64_t x1 __asm__("x1") = first;
+	register uint64_t x2 __asm__("x2") = second;
+	register uint64_t x3 __asm__("x3") = third;
+
+	__asm__ volatile ("dsb sy\n\tsmc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3) : :
+            "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
+	answer[0] = x0;
+	answer[1] = x1;
+	answer[2] = x2;
+	answer[3] = x3;
+}
+
+/*
+ * One security request, as exynos_smc makes it (a dsb, then smc #0; x0 is read back as an int). Every register that
+ * comes back from the clock calls and the request is logged: build 40's secure request answered 0xffffffff82001010,
+ * which is none of smc_err_string's codes. With irqs_off the call is made with interrupts off on a core that is not
+ * CPU 0 (cbd's affinity); without, it is made where the thread is (still not CPU 0) with interrupts on, as Linux
+ * makes it from cbd's ioctl.
+ */
+static uint64_t
+security_call(uint32_t mode, uint32_t size_boot, uint32_t size_main, bool irqs_off)
+{
+	uint64_t clk_on[4] = { 0 }, call[4] = { ~0ull }, clk_off[4] = { 0 }, mpidr = 0;
 	int tries;
 
-	say("shannon: security SMC %#x(mode %#x, %#x, %#x): looking for a core other than CPU 0\n", SMC_CP, mode, size_boot,
-	    size_main);
+	say("shannon: security SMC %#x(mode %#x, %#x, %#x), interrupts %s: looking for a core other than CPU 0\n", SMC_CP,
+	    mode, size_boot, size_main, irqs_off ? "off" : "on");
 	for (tries = 0; tries < 200; tries++) {
 		boolean_t enabled = ml_set_interrupts_enabled(FALSE);
 
 		mpidr = __builtin_arm_rsr64("MPIDR_EL1");
 		if ((mpidr & 0xffffffull) != 0) {
-			(void)smc(SMC_SSS_CLK, 0, 0, 0);
-			answer = smc(SMC_CP, mode, size_boot, size_main);
-			(void)smc(SMC_SSS_CLK, 1, 0, 0);
-			(void)ml_set_interrupts_enabled(enabled);
+			if (!irqs_off) {
+				(void)ml_set_interrupts_enabled(enabled);
+			}
+			smc_full(SMC_SSS_CLK, 0, 0, 0, clk_on);
+			smc_full(SMC_CP, mode, size_boot, size_main, call);
+			smc_full(SMC_SSS_CLK, 1, 0, 0, clk_off);
+			if (irqs_off) {
+				(void)ml_set_interrupts_enabled(enabled);
+			}
 			break;
 		}
 		(void)ml_set_interrupts_enabled(enabled);
@@ -472,8 +500,26 @@ security_request(uint32_t mode, uint32_t size_boot, uint32_t size_main)
 		say("shannon: the thread stayed on CPU 0 for 2 s: the security call was not made\n");
 		return ~0ull;
 	}
-	say("shannon: security SMC %#x(mode %#x, %#x, %#x) from MPIDR %#llx answered %#llx (%s)\n", SMC_CP, mode, size_boot,
-	    size_main, mpidr, answer, answer < sizeof(smc_errors) / sizeof(smc_errors[0]) ? smc_errors[answer] : "unknown");
+	say("shannon:   SSS clock on: x0 %#llx x1 %#llx x2 %#llx x3 %#llx\n", clk_on[0], clk_on[1], clk_on[2], clk_on[3]);
+	say("shannon:   request from MPIDR %#llx: x0 %#llx (as an int %d) x1 %#llx x2 %#llx x3 %#llx (%s)\n", mpidr, call[0],
+	    (int32_t)call[0], call[1], call[2], call[3],
+	    (uint32_t)call[0] < sizeof(smc_errors) / sizeof(smc_errors[0]) ? smc_errors[(uint32_t)call[0]] : "not a CP_ code");
+	say("shannon:   SSS clock off: x0 %#llx x1 %#llx x2 %#llx x3 %#llx\n", clk_off[0], clk_off[1], clk_off[2], clk_off[3]);
+	return (uint64_t)(uint32_t)call[0];
+}
+
+static uint64_t
+security_request(uint32_t mode, uint32_t size_boot, uint32_t size_main)
+{
+	uint32_t again = 1;
+	uint64_t answer = security_call(mode, size_boot, size_main, true);
+
+	(void)PE_parse_boot_argn("shannon_again", &again, sizeof(again));
+	if (answer != 0 && answer >= sizeof(smc_errors) / sizeof(smc_errors[0]) && again) {
+		/* not one of EL3's CP_ codes: once more as Linux makes it, with interrupts on (shannon_again=0: not) */
+		say("shannon: an answer outside the CP_ codes: the same request once more, with interrupts on\n");
+		answer = security_call(mode, size_boot, size_main, false);
+	}
 	return answer;
 }
 
@@ -531,6 +577,24 @@ load_and_verify(void)
 	 */
 	say("shannon: the CP's memory before loading: +0 %#x %#x %#x %#x, +0xa0 %#x, +0x200 %#x, +0x2a0 %#x %#x\n",
 	    rd(cp, 0), rd(cp, 4), rd(cp, 8), rd(cp, 12), rd(cp, 0xa0), rd(cp, 0x200), rd(cp, 0x2a0), rd(cp, 0x2a4));
+	{
+		/*
+		 * The loader keeps its payload at 0xF0000000 before moving it (build 40: "loader.e..." at +0): the boot region
+		 * is zeroed first, so that nothing of it is left between the images (shannon_zero=0: not).
+		 */
+		uint32_t zero = 1;
+		uint64_t began = mach_absolute_time(), ns;
+
+		(void)PE_parse_boot_argn("shannon_zero", &zero, sizeof(zero));
+		if (zero) {
+			for (uint64_t off = 0; off < CP_IPC_OFFSET; off += 8) {
+				*(volatile uint64_t *)(void *)(uintptr_t)(cp + off) = 0;
+			}
+			__builtin_arm_dsb(15);
+			absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+			say("shannon: the boot region (+0 to +%#x) zeroed in %llu ms\n", CP_IPC_OFFSET, ns / 1000000);
+		}
+	}
 	for (unsigned int i = 0; i < sizeof(stages) / sizeof(stages[0]); i++) {
 		const struct toc_entry *entry = toc_find(stages[i]);
 		uint32_t at;
