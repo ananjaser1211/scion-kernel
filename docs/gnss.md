@@ -337,6 +337,33 @@ was dead until a restart. So the assert says nothing about the baseband. `gnssto
 (only RESET and REQ_CURRENT pass), and an IDLE before RESET reports "GPS BB not responding". The baseband never answers
 the ME, and why is still open.
 
+**Two breakthroughs (restart at 21:23).**
+
+1. **Serials restart at 1 after RESET.** The hub's packet gate (0x0081147e-0x008115d8) NACKs every non-control
+   message whose serial is not the last one plus 1. NACK `[u8 reason 0][u8 serial]` means a serial mismatch, not a
+   pending transition. RESET resets the count: the first message after RESET must carry serial 1 (`meif 3 0000` with
+   any serial, then `MEIF_SERIAL=1 meif 7 ...`). With that, CONFIG_GET after RESET is answered, the logging CONFIG_SET is
+   ACKed, and **IDLE is accepted**. It still ends in "GPS BB not responding" -> ERROR, now about 10 s later.
+2. **The chip's log works.** RPC 0x2B is `SetLoggingConfig([u8 on][u8 facility][u32 level mask])`, one facility per
+   RPC. `rpc 2b 01XXffffffff` for every facility 0x00-0xff turns on everything. The lines come as RPC 0x19, and the
+   kernel prints them as `shub: hub log: ...` (format `ffNN QtimeL text`). Some lines are base64-ish binary dumps (`&...W
+   @^@...`); none showed a position, but filter them all the same. The log of RESET -> IDLE shows:
+   - `LoadMeasEngine` -> `AcquireGnssCore` (MicroNav created, core opened, `PvtEngineCb:OnResourceRequest Resource(8)`),
+     `SetRefClockParams(26000000, 2000, 59388)`, `SetPikeLnaMask(1)`, `SetPikeRfMode(3)`, `SetRfType(35)`, "ME Loaded".
+   - `DEF_4755x:T IsPikeAsicType:T`, `GlMeSrdAsicinit::HW Flow Control Set`, **"SetHWAsicVerson: Received HW Version
+     47752 B0 ASIC"**: the baseband answers the boot-ROM interface.
+   - **"GlMeSrdAsicinit::Debbugger detected or run without loading is enabled. Exiting Legacy!"**, then "INIT_STAGE A:
+     Requesting the Asic Version Number trial 1..4", "Resending Bri_GetOutOfLegacy", and finally **"esw_wait4version no
+     version received from ESW, RetainEsw=0, LoadEsw=1... could be Overlay was not retained!"**.
+
+So the ME skips the ESW (baseband firmware) download and leaves legacy mode as though the ESW were already in the
+baseband's RAM, and the baseband then has nothing to run. In the patch's `bri_wait4asic_ready` (0x00857154-0x00857214),
+the baseband's message 12 (`[0x110] == 0x95`) sets flag 16 ("debugger", bit 2 of the next byte set) or flag 17 (bit 2
+clear). Either flag leads to "Exiting Legacy" without `bri_wait4patchload`. Flags are bit sets at `[obj+0xa4+8]`
+(ROM 0x0003c200 set, 0x0003cda0 test). Next: read the ROM's own `bri_wait4asic_ready` (around ROM string 0x000b3fa0),
+see what flag 17 means and what path loads the ESW (`bri_wait4patchload`), and whether `esw_ctrl:` (Retain, Load,
+DynPwr) or the baseband's reported status bit decides it.
+
 ## The tools (kernel and userland)
 
 - `/dev/hakios-gnss` (made at `shub=6`, root only; `drivers/input/ssp/hakios.ssp.c`): every RPC from the hub that is
