@@ -183,7 +183,7 @@ function logs with.
    chunk. VSS is sent only once per Android boot (`vendor.cbd.first_xmit_done`).
 6. **"Request Security : secure mode"** = `std_security_req(0, BOOT.size, MAIN.size)`, i.e. (0, 0x1e40, 0x24075c0),
    again off CPU 0. The kernel ORs the region's base into the mode only if `shm_probe` found a CP memory map at boot.
-   On a cold boot BOOT sits at +0 and the probe looks at +0x2a0, so it finds none: **x1 = 0**.
+   On a cold boot BOOT sits at +0 and the probe looks at +0x2a0, so it finds none: **x1 = 0** in principle, but build 39 showed that EL3 rejects that with CP_INVALID_CP_BASE, so on this firmware the base is evidently passed (see the shannon_base row).
 7. **`get_factory_prop`** reads `/efs/factory.prop` (SIM count) and echoes it to `…/mif_pdata/sim/ds_detect`.
 8. **"MODEM ON : pda_active 1, cp power on"** = `IOCTL_MODEM_ON` (0x6f19, `ss310ap_on`).
 9. **"BOOT ON : change modem state, irq, wait cp state"** = `IOCTL_MODEM_BOOT_ON` (0x6f22). It waits for the CP status
@@ -307,7 +307,7 @@ in `hakios.stubs.c`. It needs UFS (`ufs=2`).
 | `shannon=2` | cbd's order: `cal_cp_init` if the CP was never initialised, SMC(2, 0, 0) (0 or CP_NOT_WORKING accepted), then BOOT/MAIN/VSS/NV at `address & 0x3fffffff` (BOOT +0, MAIN +0x10000, VSS +0x7900000, NV +0x4900000; crc32s logged), then SMC(0, BOOT size, MAIN size). Both SMCs are made off CPU 0, as cbd makes them. Does not start the CP |
 | `shannon_nv=1` | With 2-3: NV from `EFS:/nv_data.bin` if it is exactly the NV entry's size (size logged, never contents). Without it NV is 0xFF, what cbd's `create_empty_nv` writes |
 | `shannon_toc=1` | Experiment only: TOC at +0 and BOOT after it (the layout of `shm_ipc.c`'s memory-map probe), not cbd's |
-| `shannon_base=1` | Experiment only: the region's base ORed into the secure request's mode (Linux does so only after a warm boot) |
+| `shannon_base=0` | The secure request without the region base in its mode. The base (0xF0000000) is ORed in by default since build 39: mode 0 alone, as cbd passes it, got **CP_INVALID_CP_BASE (0x13)** from EL3. Linux ORs it in when shm_ipc.c found the CP memory map at boot (use_cp_memory_map), and this RADIO carries one (MEM0 in BOOT). Step 2 also logs the region first words before loading, to show whether the boot loader left TOC/BOOT there |
 | `shannon_blsize=N` | The boot-loader size for the secure request (default BOOT's TOC size, as cbd) |
 | `shannon=3` | Then cbd steps 8-11: the AP status word, AP2CP_CFG = 1 (only with RESET_SEQUENCER_STATUS 5), up to 2 s for the CP status; DL_START (the legacy IPC map at 0xF8000000 reset, magic 0x424F4F54, AP status 1); the UDL handshake (0x900d to 0xa00d, then 0x9f00 to 0xaf00, as SIPC5 frames FC D7 08 00 + word in the RAW queues, 30 s each); then 60 s of the CP mailbox (PHONE_START, INIT_START, ...). PIF_INIT_DONE / INIT_END (the SBD rings) are next |
 | `shannon_udl_irq=1` | Also rings the mailbox (MASK_SEND_RAW) after each UDL word; Linux xmit_udl does not |

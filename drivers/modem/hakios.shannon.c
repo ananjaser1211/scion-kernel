@@ -43,8 +43,10 @@
  *              mailbox after each UDL word (Linux does not).
  * Other arguments: shannon_sysrev=N (the board revision the AP reports, 0 if not given: Samsung reads it from eight GPIOs),
  * shannon_blsize=N (the boot loader's size for the SMC, BOOT's TOC size if not given, as cbd), shannon_toc=1 (the TOC at
- * +0 and BOOT after it, the layout shm_ipc.c's memory-map probe reads; not what cbd does), shannon_base=1 (the region's
- * base ORed into the verify call's mode, as Linux does only when its boot-time probe found a memory map).
+ * +0 and BOOT after it, the layout shm_ipc.c's memory-map probe reads; not what cbd does), shannon_base=0 (the secure
+ * request's mode without the region's base). The base is ORed in by default: build 39 sent mode 0 alone, as cbd's
+ * ioctl does, and EL3 answered CP_INVALID_CP_BASE (0x13). Linux ORs it in when shm_ipc.c found the CP memory map
+ * (use_cp_memory_map), which this RADIO carries (MEM0 in BOOT), so that is the path Android takes on this firmware.
  *
  * sysctl kern.hakios.shannon_state: 0 nothing, 1 read, 2 loaded and the SMC said CP_NO_ERROR, 3 the CP's status came up,
  * 4 the CP sent PHONE_START or INIT_START. No kern.hakios.cellular_* here yet: those are the redwood modem's
@@ -481,7 +483,7 @@ load_and_verify(void)
 {
 	static const char *const stages[] = { "BOOT", "MAIN", "VSS", "NV" };
 	const struct toc_entry *boot = toc_find("BOOT"), *main_part = toc_find("MAIN");
-	uint32_t with_toc = 0, nv_wanted = 0, with_base = 0, blsize = boot->size;
+	uint32_t with_toc = 0, nv_wanted = 0, with_base = 1, blsize = boot->size;
 	volatile uint8_t *cp;
 	uint64_t answer;
 
@@ -523,6 +525,12 @@ load_and_verify(void)
 		say("shannon: the CP's memory (%#llx, %#llx bytes) could not be mapped\n", CP_PA, CP_SIZE);
 		return false;
 	}
+	/*
+	 * What is in the region before anything is loaded: shm_ipc.c reads a CP memory map at +0x200+0xa0 when Linux starts
+	 * (before cbd), so whether the boot loader left the TOC and BOOT there says which layout EL3 expects.
+	 */
+	say("shannon: the CP's memory before loading: +0 %#x %#x %#x %#x, +0xa0 %#x, +0x200 %#x, +0x2a0 %#x %#x\n",
+	    rd(cp, 0), rd(cp, 4), rd(cp, 8), rd(cp, 12), rd(cp, 0xa0), rd(cp, 0x200), rd(cp, 0x2a0), rd(cp, 0x2a4));
 	for (unsigned int i = 0; i < sizeof(stages) / sizeof(stages[0]); i++) {
 		const struct toc_entry *entry = toc_find(stages[i]);
 		uint32_t at;
