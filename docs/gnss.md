@@ -628,6 +628,35 @@ Version received: Asic 0x3000000F, IFC 132, Radio 0x03"**, then **STATE_REPORT S
   ME prints them when it unloads, so turn indoor detection back on and let the ASIC go off. That shows whether the RF path or the
   external LNA is dead. Aiding (time from the AP's clock, a coarse position) is the step after that.
 
+**Open sky, cold chip** (TWRP restart at 23:09, phone outdoors, the same build 33).
+- Sequence (local script): pin mux `rpc 34 1101` first, `pvt enable_log_to_host_LOG_INFO_Overwrite`, a few 0x2B facilities 2 s
+  apart, `1c 01`, ESW load (28 blocks checked, 0.6 s), RESET, esw_ctrl, logging, IDLE, ON, `pvt disable_indoor`, `pvt gnss_start`.
+  Everything was answered, and the ASIC was on from 23:14.
+- **Log facilities:** the GlOnChipReqMgr / MicroNav / ME lines came only after facilities **0x4f and 0x97** (0x0e and 0x16 alone gave
+  nothing). 0x0c floods the log with `CkgGetRuntimeInfo` once a second. Use 0x0e, 0x16, 0x4f and 0x97, 2 s apart.
+- **External LNA config:** the MEIF CONFIG_SET sub-block **25 = MEIF_EXT_LNA_CONF_SB** (handler 0x0081d1d4: `[u16 25][u16 8][u16 0|1]
+  [u16 0]`, which sets LnaConf and calls the engine's slot 0x44 with value == 1). gpsd's CONFIG_SET does not send it.
+  `meif 6 01001900080001000000` was ACKed ("MEIF_EXT_LNA_CONF_SB"), followed by gnss_stop/gnss_start to reload the ME
+  ("INIT_STAGE: COMPLETE"). It made no visible difference.
+- **Result: no satellites.** The engine's own table when it unloads (printed at `gnss_stop` with indoor detection on):
+  - First 7 minutes: GPS 0 detections in 204 attempts, 0 valid pseudoranges.
+  - 6 more minutes with the external LNA flag set: 0 in 156.
+  - GLONASS made 0 attempts: the request's constellation mask is GPS only.
+  - The serial link to the baseband had no errors (2034 packets received).
+- **The RF front end delivers normal noise:** measured noise GPS_GAL u 3.618 (the GLL table expects 3.825, -5.4%) and GLNS 3.502
+  (3.581, -2.2%). Tracking DAGC: GPS 70.8 and GLNS 79.2. AGC report: GPS_GAL AAGC 17.54 dB, GLO 21.98, BDS 32.08 (on the earlier
+  warm boot, indoors and with no pin mux before the load: GPS 8.00-11.52). So the ADC sees a noise floor about where the
+  engine expects it, but no satellite rises above it.
+- Likely causes, in order:
+  1. Nothing from the antenna reaches the LNA: the external LNA unpowered or not enabled (P17 mode 1 is set, but whether it
+     drives LNA_EN is not proven), or an RF switch or diplexer on the GNSS path that the AP must set.
+  2. A reference-clock error larger than the search window (26 MHz, 2000 ppb uncertainty; gps.xml FrqPlan
+     `FRQ_PLAN_26MHZ_2PPM_49_152MHZ_300PPB`).
+  3. Something gpsd's host side gives the on-chip ME that we do not send (CONFIG_SET items with real values instead of zeros).
+  Next: check the star2lte device tree and schematic for a GNSS LNA supply or enable and for an RF switch on the AP side (Samsung's
+  `sec_gps_bcm4753.c` and the DT `gps` node only show gpg0-2). Compare with a stock Android trace if one can be had. Try a
+  CONFIG_SET with gpsd's real settings values (MEASUREMENT 5, EXT_OSC 10, ME_OSC_PARAMS 8, RF_PARAMS 7 with RfLoss 5).
+
 **Integration, when it works.**
 - **Firmware**: `devices/star2lte/firmware/gnss/` holds a README and SHA256SUMS only. `tools/fetch-firmware.sh`
   extracts the three 4775_B0 segments from the user's own gpsd: `--from DIR`, or the pinned vendor tree if it has
