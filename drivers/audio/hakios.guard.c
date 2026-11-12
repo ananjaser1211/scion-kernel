@@ -12,7 +12,7 @@
  * the only way there is without feedback -- from the samples and the amplifiers' level -- and
  * kept well under what the speakers can take at Android's level:
  *
- *   high-pass  a second-order Butterworth filter at 200 Hz: a phone's speaker gives out next to
+ *   high-pass  a second-order Butterworth filter at 200 Hz (sound_hpf: 150 or 120): a phone's speaker gives out next to
  *              nothing below its resonance (several hundred Hz), and what it is given there only
  *              moves the cone further and heats the coil
  *   power      the power that would reach a speaker, averaged three ways -- over 0.2 s (the
@@ -72,9 +72,27 @@ static const uint32_t eighths[48] = {
 };
 #define SIX_DB                  538145694       /* 10^(-6/20) in Q30 */
 
-/* the high-pass filter, 200 Hz at 48 kHz, Q = 1/sqrt(2): b0, b1, b2, a1, a2 in Q30 (RBJ's cookbook) */
-static const int64_t hpf_b0 = 1054047540, hpf_b1 = -2108095079, hpf_b2 = 1054047540;
-static const int64_t hpf_a1 = -2107733822, hpf_a2 = 1034714513;
+/* the high-pass filter at 48 kHz, Q = 1/sqrt(2): b0, b1, b2, a1, a2 in Q30 (RBJ's cookbook); 200 Hz unless sound_hpf says
+ * 150 or 120 (hakios_guard_tone): lower lets more of the speakers' lowest notes through, and the power limits below see it */
+static const struct { uint32_t hz; int64_t k[5]; } hpfs[] = {
+	{ 120, { 1061881538, -2123763076, 1061881538, -2123632067, 1050152262 } },
+	{ 150, { 1058936991, -2117873982, 1058936991, -2117669842, 1044336297 } },
+	{ 200, { 1054047540, -2108095079, 1054047540, -2107733822, 1034714513 } },
+};
+/* a low shelf at 250 Hz, slope 1, +0 to +6 dB (sound_bass): what a phone's speakers give out least of but can still give,
+ * lifted before the power limits and the peak limiter, so that they hold it as they hold everything else */
+static const int64_t shelves[7][5] = {
+	{ 1073741824, -2097799412, 1025181377, -2097799412, 1025181377 },  /* +0 dB */
+	{ 1075173001, -2099143588, 1025161746, -2099208356, 1026528155 },  /* +1 dB */
+	{ 1076607272, -2100447549, 1025102823, -2100577384, 1027838435 },  /* +2 dB */
+	{ 1078045831, -2101712210, 1025004564, -2101907621, 1029113160 },  /* +3 dB */
+	{ 1079489883, -2102938453, 1024866902, -2103200165, 1030353248 },  /* +4 dB */
+	{ 1080940640, -2104127126, 1024689739, -2104456082, 1031559599 },  /* +5 dB */
+	{ 1082399326, -2105279044, 1024472949, -2105676406, 1032733089 },  /* +6 dB */
+};
+static const int64_t *hpf_k = hpfs[2].k;      /* 200 Hz */
+static const int64_t *shelf_k = shelves[0];    /* the shelf's coefficients, when shelf_on */
+static bool shelf_on;
 
 static struct {
 	bool hpf;
@@ -82,6 +100,7 @@ static struct {
 	volatile uint32_t attenuation;          /* the amplifiers' level under Android's, eighths of a dB; HAKIOS_GUARD_SILENT: off */
 	volatile uint32_t monitor;              /* the monitor's reduction, eighths of a dB */
 	int64_t x1[2], x2[2], y1[2], y2[2];     /* the filter's past, in 1/256 of a sample */
+	int64_t s1[2], s2[2], t1[2], t2[2];     /* the shelf's past (input, output), likewise */
 	uint64_t rms[2], fast[2], slow[2];      /* average powers at each speaker, Q30 of a full-scale square wave at Android's level */
 	uint64_t level;                         /* the power guard's and the monitor's gain at the end of the last block */
 	uint64_t envelope;                      /* the peak limiter's, 1/65536 of a sample */
@@ -140,6 +159,36 @@ hakios_guard_configure(bool hpf, uint32_t gain)
 	guard.gain = (1ull << 60) / amplitude(gain > HAKIOS_GUARD_MAX_GAIN ? HAKIOS_GUARD_MAX_GAIN : gain);
 }
 
+/* the high-pass filter's corner (120, 150 or 200 Hz: the nearest at or above `hpf_hz') and the low shelf (0 to 6 dB); before
+ * the first block, from the feeder's thread (hakios.sound.c) */
+void
+hakios_guard_tone(uint32_t hpf_hz, uint32_t bass_db)
+{
+	unsigned i = 0;
+
+	while (i + 1 < sizeof(hpfs) / sizeof(hpfs[0]) && hpfs[i].hz < hpf_hz) {
+		i++;
+	}
+	hpf_k = hpfs[i].k;
+	shelf_k = shelves[bass_db > 6 ? 6 : bass_db];
+	shelf_on = bass_db != 0;
+	for (unsigned c = 0; c < 2; c++) {
+		guard.x1[c] = guard.x2[c] = guard.y1[c] = guard.y2[c] = 0;
+		guard.s1[c] = guard.s2[c] = guard.t1[c] = guard.t2[c] = 0;
+	}
+}
+
+uint32_t
+hakios_guard_hpf_hz(void)
+{
+	for (unsigned i = 0; i < sizeof(hpfs) / sizeof(hpfs[0]); i++) {
+		if (hpfs[i].k == hpf_k) {
+			return hpfs[i].hz;
+		}
+	}
+	return 0;
+}
+
 void
 hakios_guard_attenuation(uint32_t below)
 {
@@ -174,13 +223,23 @@ block(int16_t *frames, uint32_t count)
 			r->peak_in = level;
 		}
 		if (guard.hpf) {
-			y = (hpf_b0 * x + hpf_b1 * guard.x1[c] + hpf_b2 * guard.x2[c] - hpf_a1 * guard.y1[c] - hpf_a2 * guard.y2[c]) >> 30;
+			y = (hpf_k[0] * x + hpf_k[1] * guard.x1[c] + hpf_k[2] * guard.x2[c] - hpf_k[3] * guard.y1[c] - hpf_k[4] * guard.y2[c]) >> 30;
 			guard.x2[c] = guard.x1[c];
 			guard.x1[c] = x;
 			guard.y2[c] = guard.y1[c];
 			guard.y1[c] = y;
 		} else {
 			y = x;
+		}
+		if (shelf_on) {
+			int64_t z = (shelf_k[0] * y + shelf_k[1] * guard.s1[c] + shelf_k[2] * guard.s2[c] - shelf_k[3] * guard.t1[c] -
+			    shelf_k[4] * guard.t2[c]) >> 30;
+
+			guard.s2[c] = guard.s1[c];
+			guard.s1[c] = y;
+			guard.t2[c] = guard.t1[c];
+			guard.t1[c] = z;
+			y = z;
 		}
 		work[i] = (int32_t)((y + 128) >> 8);
 		sum[c] += (uint64_t)((int64_t)work[i] * work[i]);
