@@ -72,6 +72,7 @@ struct isp {
 	float           wb[3];          /* the white balance's gains, green 1 */
 	float           digital;        /* more gain, for what AE cannot reach with the sensor's */
 	float           zoom;           /* the picture is the middle 1/zoom of the sensor each way (1: the whole of it) */
+	float           lens_zoom;      /* the lens's own over the camera's (the telephoto for the back camera: 2; 0 as 1) */
 	bool            turned;         /* the picture turned half round (a sensor mounted the other way up) */
 	float           ccm[3][3];      /* the colour matrix, camera RGB (white balanced) to linear sRGB; rows sum to 1 */
 	struct isp_lsc  lsc;

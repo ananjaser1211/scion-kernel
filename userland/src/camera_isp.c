@@ -56,6 +56,19 @@ cell(const uint8_t *top, size_t stride, uint32_t cx, int v[4])
 	v[1] = (g0[o + 1] << 2 | (g0[4] >> (o * 2 + 2) & 3)) - 64;
 	v[2] = (g1[o] << 2 | (g1[4] >> (o * 2) & 3)) - 64;
 	v[3] = (g1[o + 1] << 2 | (g1[4] >> (o * 2 + 2) & 3)) - 64;
+	/*
+	 * Signed: not cut off at the black level. Cut there, the noise's lower half was thrown away and its
+	 * upper half kept, a lift of every colour the same; then the white balance's gains (red ~2x, blue
+	 * ~1.5x indoors, green 1x) made that lift purple in every dark and middle part of the picture (12 Nov,
+	 * the S9: both cameras purple at 7-64x gain). The picture's own clamp is at its end (curve()).
+	 */
+}
+
+/* the same, cut off at 0 (statistics that index by value) */
+static inline void
+cell_clamped(const uint8_t *top, size_t stride, uint32_t cx, int v[4])
+{
+	cell(top, stride, cx, v);
 	for (int i = 0; i < 4; i++) {
 		v[i] = v[i] < 0 ? 0 : v[i];
 	}
@@ -86,7 +99,7 @@ isp_sharpness(const struct hakios_camera_frame *f, const uint8_t *raw, float x0,
 	 */
 	for (uint32_t by = cy0; by + BLOCK <= cy1; by += BLOCK, rows++) {
 		for (uint32_t bx = 0; bx < blocks_w; bx++) {
-			uint32_t g = 0;
+			int g = 0;      /* (signed, as cell()'s values: near black, a sum below it wrapped round to 4 billion) */
 
 			for (uint32_t cy = by; cy < by + BLOCK; cy++) {
 				const uint8_t *top = raw + (size_t)cy * 2 * f->stride;
@@ -96,7 +109,7 @@ isp_sharpness(const struct hakios_camera_frame *f, const uint8_t *raw, float x0,
 
 					cell(top, f->stride, cx, v);
 					for (int i = 0; i < 4; i++) {
-						g += i != r && i != b ? (uint32_t)v[i] : 0;
+						g += i != r && i != b ? v[i] : 0;
 					}
 				}
 			}
@@ -154,7 +167,7 @@ isp_measure(const struct isp *isp, const struct hakios_camera_frame *f, const ui
 			 * and one near black, where noise cut off at the black level is all there is.
 			 */
 			if (top_v < WHITE * 9 / 10 && g >= 24) {
-				float cr = (float)v[r], cg = (float)g, cb = (float)v[b];
+				float cr = v[r] > 0 ? (float)v[r] : 0, cg = (float)g, cb = v[b] > 0 ? (float)v[b] : 0;
 
 				/*
 				 * As the picture will have it: the lens shading raises the corners several times, and
@@ -189,7 +202,7 @@ isp_measure(const struct isp *isp, const struct hakios_camera_frame *f, const ui
 					}
 				}
 			}
-			s->hist[g >> 4 > 63 ? 63 : g >> 4]++;
+			s->hist[g < 0 ? 0 : g >> 4 > 63 ? 63 : g >> 4]++;
 			s->cells++;
 		}
 	}
@@ -387,17 +400,31 @@ isp_set_ccm(struct isp *isp, const float m[9])
  * (per 10-bit step above black): out[c] = sum over j of m[c][j] * value[j] (each value lens-shaded).
  */
 struct pipe {
-	float           m[3][3];
+	float           m[3][3];        /* the colour matrix alone */
+	float           wb[3];          /* the white balance's and AE's gains, in the table's steps */
+	float           clip;           /* where the least-gained colour is white: every colour cut there */
 	bool            identity;
 };
 
 static void
 pipe_init(const struct isp *isp, struct pipe *p)
 {
+	float least = isp->wb[0];
+
+	/*
+	 * Highlights: a part of the picture past the sensor's white is white in every colour on the sensor,
+	 * but red and blue then get the white balance's larger gains, and white came out pink (12 Nov, the
+	 * S9's window). Every colour is cut, after its gain, at the white of the least-gained one.
+	 */
 	p->identity = true;
+	for (int j = 0; j < 3; j++) {
+		p->wb[j] = isp->wb[j] * isp->digital * (LUT_WHITE / (float)WHITE);
+		least = isp->wb[j] < least ? isp->wb[j] : least;
+	}
+	p->clip = WHITE * least * isp->digital * (LUT_WHITE / (float)WHITE);
 	for (int c = 0; c < 3; c++) {
 		for (int j = 0; j < 3; j++) {
-			p->m[c][j] = isp->ccm[c][j] * isp->wb[j] * isp->digital * (LUT_WHITE / (float)WHITE);
+			p->m[c][j] = isp->ccm[c][j];
 			p->identity = p->identity && (c == j ? isp->ccm[c][j] == 1 : isp->ccm[c][j] == 0);
 		}
 	}
@@ -414,10 +441,16 @@ curve(const struct isp *isp, float v)
 static inline void
 pixel(const struct isp *isp, const struct pipe *p, float r, float g, float b, uint8_t *rgb)
 {
+	r *= p->wb[0];
+	g *= p->wb[1];
+	b *= p->wb[2];
+	r = r > p->clip ? p->clip : r;
+	g = g > p->clip ? p->clip : g;
+	b = b > p->clip ? p->clip : b;
 	if (p->identity) {
-		rgb[0] = curve(isp, r * p->m[0][0]);
-		rgb[1] = curve(isp, g * p->m[1][1]);
-		rgb[2] = curve(isp, b * p->m[2][2]);
+		rgb[0] = curve(isp, r);
+		rgb[1] = curve(isp, g);
+		rgb[2] = curve(isp, b);
 		return;
 	}
 	rgb[0] = curve(isp, p->m[0][0] * r + p->m[0][1] * g + p->m[0][2] * b);
@@ -473,7 +506,34 @@ render_line(const struct isp *isp, const struct hakios_camera_frame *f, const ui
 		v_at = cells_h > 1 ? (float)cy0 / (cells_h - 1) : 0;
 		const uint8_t *t0 = raw + (size_t)cy0 * 2 * f->stride, *t1 = raw + (size_t)cy1 * 2 * f->stride;
 		float gains[3] = { 1, 1, 1 };
+		/*
+		 * The cells of the two cell rows this line lies between, each unpacked once (R, the greens' mean, B), not four
+		 * times for every pixel: the same sums as before, a quarter of the unpacking (12 Nov: the rear camera's preview
+		 * had all seven cores at 100% with the old way). Only the columns the line reaches are taken.
+		 */
+		enum { MAX_CELLS = 2048 };
+		float row_cells[2][MAX_CELLS][3];
+		float fx_first = x0 + 0.5f * cw / width - 0.5f, fx_last = x0 + (width - 0.5f) * cw / width - 0.5f;
+		uint32_t lo = fx_first < 0 ? 0 : (uint32_t)fx_first, hi = fx_last < 0 ? 0 : (uint32_t)fx_last + 1;
 
+		lo = lo > cells_w - 1 ? cells_w - 1 : lo;
+		hi = hi > cells_w - 1 ? cells_w - 1 : hi;
+		if (hi - lo + 1 > MAX_CELLS) {
+			hi = lo + MAX_CELLS - 1;
+		}
+		for (uint32_t cx = lo; cx <= hi; cx++) {
+			for (int l = 0; l < 2; l++) {
+				int v[4], g = 0;
+
+				cell(l ? t1 : t0, f->stride, cx, v);
+				for (int j = 0; j < 4; j++) {
+					g += j != r && j != b ? v[j] : 0;
+				}
+				row_cells[l][cx - lo][0] = (float)v[r];
+				row_cells[l][cx - lo][1] = g * 0.5f;
+				row_cells[l][cx - lo][2] = (float)v[b];
+			}
+		}
 		for (uint32_t x = 0; x < width; x++) {
 			float fx = x0 + (x + 0.5f) * cw / width - 0.5f, tx, c[3] = { 0, 0, 0 };
 			uint32_t cx0 = fx < 0 ? 0 : (uint32_t)fx, cx1;
@@ -481,16 +541,15 @@ render_line(const struct isp *isp, const struct hakios_camera_frame *f, const ui
 			cx0 = cx0 > cells_w - 1 ? cells_w - 1 : cx0;
 			cx1 = cx0 + 1 > cells_w - 1 ? cells_w - 1 : cx0 + 1;
 			tx = fx < (float)cx0 ? 0 : fx - cx0;
+			cx0 = cx0 < lo ? lo : cx0 > hi ? hi : cx0;
+			cx1 = cx1 < lo ? lo : cx1 > hi ? hi : cx1;
 			for (int k = 0; k < 4; k++) {
-				int v[4];
+				const float *v = row_cells[k & 2 ? 1 : 0][(k & 1 ? cx1 : cx0) - lo];
 				float w = (k & 1 ? tx : 1 - tx) * (k & 2 ? ty : 1 - ty);
 
-				cell(k & 2 ? t1 : t0, f->stride, k & 1 ? cx1 : cx0, v);
-				c[0] += w * v[r];
-				c[2] += w * v[b];
-				for (int j = 0; j < 4; j++) {
-					c[1] += j != r && j != b ? w * v[j] * 0.5f : 0;
-				}
+				c[0] += w * v[0];
+				c[1] += w * v[1];
+				c[2] += w * v[2];
 			}
 			if (isp->lsc.on) {
 				lsc_at(isp, cells_w > 1 ? (float)cx0 / (cells_w - 1) : 0, v_at, gains);
@@ -560,6 +619,141 @@ nv12_pair(const uint8_t *rgb0, const uint8_t *rgb1, uint32_t width, uint8_t *y0,
 	}
 }
 
+/*
+ * The magnified preview, fast (12 Nov, the S9: mediaserverd took 350% of a core for the front camera's 1504x1128
+ * preview, all seven cores at 100% and the big ones throttled at 83 C). The picture is the cells blown up (816x612 or
+ * 1008x756 cells to 1504x1128): render_line() ran the colour pipeline -- the white balance, the colour matrix, three
+ * gamma lookups -- for every pixel of the picture, 1.7 million a frame, each from a float blend of four cells. Here the
+ * pipeline runs once per cell of the band (a third as many and fewer still at the edges), to 8-bit R, G, B with the lens
+ * shading at each cell's own place, and the picture is those blown up by an integer bilinear blend (weights in 1/256ths,
+ * the columns' cells and weights worked out once per call). The blend is in the gamma's space rather than in light's: for
+ * a preview made bigger by less than 2x the difference is a fraction of a step at edges, and nothing elsewhere.
+ */
+static bool
+render_nv12_magnified(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, uint8_t *y,
+    size_t y_stride, uint8_t *uv, size_t uv_stride, uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row,
+    bool video_range)
+{
+	static __thread uint32_t *col_cell;     /* per picture column: its left cell (relative to lo) */
+	static __thread uint16_t *col_w;        /* and the right cell's weight, 0-256 */
+	static __thread uint8_t *cells, *line[2];
+	static __thread size_t cells_have;
+	static __thread uint32_t cols_have;
+	uint32_t x0, y0, cw, ch, cells_w = f->width / 2, cells_h = f->height / 2, lo = ~0u, hi = 0, ylo = ~0u, yhi = 0;
+	int r, b;
+	struct pipe p;
+
+	crop(isp, f, width, height, &x0, &y0, &cw, &ch);
+	if (!(cw < width && ch < height) || cells_w < 2 || cells_h < 2) {
+		return false;
+	}
+	if (width > cols_have) {
+		free(col_cell);
+		free(col_w);
+		free(line[0]);
+		free(line[1]);
+		col_cell = malloc(sizeof(uint32_t) * width);
+		col_w = malloc(sizeof(uint16_t) * width);
+		line[0] = malloc(3 * (size_t)width);
+		line[1] = malloc(3 * (size_t)width);
+		cols_have = col_cell && col_w && line[0] && line[1] ? width : 0;
+		if (cols_have == 0) {
+			return false;
+		}
+	}
+	/* the columns: each picture column's two cells and the blend between them (the same sums as render_line's) */
+	for (uint32_t x = 0; x < width; x++) {
+		float fx = x0 + (x + 0.5f) * cw / width - 0.5f;
+		uint32_t c0 = fx < 0 ? 0 : (uint32_t)fx;
+
+		c0 = c0 > cells_w - 2 ? cells_w - 2 : c0;
+		float t = fx - c0;
+
+		t = t < 0 ? 0 : t > 1 ? 1 : t;
+		col_cell[x] = c0;
+		col_w[x] = (uint16_t)(t * 256 + 0.5f);
+		lo = c0 < lo ? c0 : lo;
+		hi = c0 + 1 > hi ? c0 + 1 : hi;
+	}
+	/* the band's cell rows (the picture's rows map to the sensor's in order, or in reverse when turned) */
+	first_row &= ~1u;
+	end_row = end_row < height ? end_row : height;
+	if (first_row >= end_row) {
+		return true;
+	}
+	for (int e = 0; e < 2; e++) {
+		uint32_t row = e ? end_row - 1 : first_row, src = isp->turned ? height - 1 - row : row;
+		float fy = y0 + (src + 0.5f) * ch / height - 0.5f;
+		uint32_t c0 = fy < 0 ? 0 : (uint32_t)fy;
+
+		c0 = c0 > cells_h - 2 ? cells_h - 2 : c0;
+		ylo = c0 < ylo ? c0 : ylo;
+		yhi = c0 + 1 > yhi ? c0 + 1 : yhi;
+	}
+	uint32_t ncols = hi - lo + 1, nrows = yhi - ylo + 1;
+	size_t need = (size_t)ncols * nrows * 3;
+
+	if (need > cells_have) {
+		free(cells);
+		cells = malloc(need);
+		cells_have = cells ? need : 0;
+		if (cells == NULL) {
+			return false;
+		}
+	}
+	/* every cell of the band through the pipeline, once */
+	cell_places(f->bayer, &r, &b);
+	pipe_init(isp, &p);
+	for (uint32_t cy = ylo; cy <= yhi; cy++) {
+		const uint8_t *top = raw + (size_t)cy * 2 * f->stride;
+		uint8_t *out = cells + (size_t)(cy - ylo) * ncols * 3;
+		float v_pos = (float)cy / (cells_h - 1), gains[3] = { 1, 1, 1 };
+
+		for (uint32_t cx = lo; cx <= hi; cx++, out += 3) {
+			int v[4], g = 0;
+
+			cell(top, f->stride, cx, v);
+			for (int j = 0; j < 4; j++) {
+				g += j != r && j != b ? v[j] : 0;
+			}
+			if (isp->lsc.on) {
+				lsc_at(isp, (float)cx / (cells_w - 1), v_pos, gains);
+			}
+			pixel(isp, &p, v[r] * gains[0], g * 0.5f * gains[1], v[b] * gains[2], out);
+		}
+	}
+	/* the picture's rows: two cell rows blended, then the columns */
+	for (uint32_t row = first_row; row < end_row; row += 2) {
+		bool second = row + 1 < height;
+
+		for (int l = 0; l < (second ? 2 : 1); l++) {
+			uint32_t src = isp->turned ? height - 1 - (row + l) : row + l;
+			float fy = y0 + (src + 0.5f) * ch / height - 0.5f;
+			uint32_t c0 = fy < 0 ? 0 : (uint32_t)fy;
+
+			c0 = c0 > cells_h - 2 ? cells_h - 2 : c0;
+			float t = fy - c0;
+			uint32_t wy = (uint32_t)((t < 0 ? 0 : t > 1 ? 1 : t) * 256 + 0.5f), wy0 = 256 - wy;
+			const uint8_t *a = cells + (size_t)(c0 - ylo) * ncols * 3, *bl = a + (size_t)ncols * 3;
+			uint8_t *o = line[l];
+
+			for (uint32_t x = 0; x < width; x++) {
+				uint32_t i = (col_cell[x] - lo) * 3, wx = col_w[x], wx0 = 256 - wx;
+				uint8_t *d = o + 3 * (isp->turned ? width - 1 - x : x);
+
+				for (int c = 0; c < 3; c++) {
+					uint32_t top_v = a[i + c] * wx0 + a[i + 3 + c] * wx, bot_v = bl[i + c] * wx0 + bl[i + 3 + c] * wx;
+
+					d[c] = (uint8_t)((top_v * wy0 + bot_v * wy + 32768) >> 16);
+				}
+			}
+		}
+		nv12_pair(line[0], second ? line[1] : line[0], width, y + (size_t)row * y_stride,
+		    second ? y + (size_t)(row + 1) * y_stride : NULL, uv + (size_t)(row / 2) * uv_stride, video_range);
+	}
+	return true;
+}
+
 void
 isp_render_nv12(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, uint8_t *y, size_t y_stride,
     uint8_t *uv, size_t uv_stride, uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row, bool video_range)
@@ -567,6 +761,10 @@ isp_render_nv12(const struct isp *isp, const struct hakios_camera_frame *f, cons
 	uint8_t line[2][3 * 8192];
 
 	if (width > 8192) {
+		return;
+	}
+	if (getenv("HAKIOS_ISP_SLOW") == NULL &&
+	    render_nv12_magnified(isp, f, raw, y, y_stride, uv, uv_stride, width, height, first_row, end_row, video_range)) {
 		return;
 	}
 	for (uint32_t row = first_row & ~1u; row < end_row && row < height; row += 2) {
@@ -626,9 +824,8 @@ unpack_line(const struct hakios_camera_frame *f, const uint8_t *raw, int y, int 
 		const uint8_t *g = line + (x >> 2) * 5;
 
 		for (int i = 0; i < 4 && x + i < f->width; i++) {
-			int v = (g[i] << 2 | (g[4] >> (i * 2) & 3)) - (int)f->black;
-
-			out[x + i] = v < 0 ? 0 : v;
+			/* signed, as cell()'s: the noise below black cancels the noise above it */
+			out[x + i] = (g[i] << 2 | (g[4] >> (i * 2) & 3)) - (int)f->black;
 		}
 	}
 }
@@ -834,7 +1031,7 @@ isp_lsc_from_flat(struct isp *isp, const struct hakios_camera_frame *f, const ui
 					if (cx < 0 || cy < 0 || cx >= (int)cells_w || cy >= (int)cells_h) {
 						continue;
 					}
-					cell(raw + (size_t)cy * 2 * f->stride, f->stride, (uint32_t)cx, v);
+					cell_clamped(raw + (size_t)cy * 2 * f->stride, f->stride, (uint32_t)cx, v);
 					sum[0] += v[r];
 					sum[2] += v[b];
 					for (int j = 0; j < 4; j++) {

@@ -49,6 +49,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/sysctl.h>
+#include <execinfo.h>
+#include <signal.h>
+#include <sys/ucontext.h>
 #include <unistd.h>
 
 static void
@@ -72,6 +75,76 @@ extern const void *_dyld_get_shared_cache_range(size_t *length);
 #define CACHE_BASE 0x180000000UL                /* where the cache was built to be, before the slide */
 
 static uintptr_t slide;
+
+/*
+ * The daemon's last words. There is no crash reporter in this system: a mediaserverd that dies says only "exited due
+ * to SIGSEGV" in launchd's log. Here a fatal signal says where: the PC, the LR, the fault address and the stack, each
+ * as image+offset (dladdr) and, for the shared cache, unslid (`ipsw dyld a2s <cache> <address>` names it). Then the
+ * signal is taken again as it would have been.
+ */
+static void
+crash_addr(char *line, size_t room, int *k, const char *label, uintptr_t a)
+{
+	Dl_info info;
+
+	if (*k >= (int)room - 96) {
+		return;
+	}
+	if (a != 0 && dladdr((const void *)a, &info) != 0 && info.dli_fname != NULL) {
+		const char *base = strrchr(info.dli_fname, '/');
+
+		*k += snprintf(line + *k, room - (size_t)*k, " %s%s+%#lx(%#lx)", label, base ? base + 1 : info.dli_fname,
+		    (unsigned long)(a - (uintptr_t)info.dli_fbase), (unsigned long)(a - slide));
+	} else {
+		*k += snprintf(line + *k, room - (size_t)*k, " %s%#lx", label, (unsigned long)a);
+	}
+}
+
+static void
+crashed(int number, siginfo_t *info, void *context)
+{
+	void *frames[40];
+	char line[2400];
+	int n = backtrace(frames, 40), k;
+	ucontext_t *uc = context;
+	uintptr_t pc = 0, lr = 0, far = 0;
+
+	if (uc != NULL && uc->uc_mcontext != NULL) {
+		pc = (uintptr_t)uc->uc_mcontext->__ss.__pc;
+		lr = (uintptr_t)uc->uc_mcontext->__ss.__lr;
+		far = (uintptr_t)uc->uc_mcontext->__es.__far;
+	}
+	k = snprintf(line, sizeof(line), "hakios: mediaserverd: SIGNAL %d (address %p, fault %#lx; the cache's slide %#lx):",
+	    number, info != NULL ? info->si_addr : NULL, (unsigned long)far, (unsigned long)slide);
+	crash_addr(line, sizeof(line), &k, "pc ", pc);
+	crash_addr(line, sizeof(line), &k, "lr ", lr);
+	k += snprintf(line + k, sizeof(line) - (size_t)k, "; the stack:");
+	for (int i = 0; i < n; i++) {
+		crash_addr(line, sizeof(line), &k, "", (uintptr_t)frames[i]);
+	}
+	if (k > (int)sizeof(line) - 2) {
+		k = (int)sizeof(line) - 2;
+	}
+	line[k++] = '\n';
+	write(2, line, (size_t)k);
+	signal(number, SIG_DFL);
+	raise(number);
+}
+
+static void
+crash_watch(void)
+{
+	static const int fatal[] = { SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGABRT, SIGFPE };
+	struct sigaction sa;
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_sigaction = crashed;
+	sa.sa_flags = SA_SIGINFO;
+	sigemptyset(&sa.sa_mask);
+	for (size_t i = 0; i < sizeof(fatal) / sizeof(fatal[0]); i++) {
+		sigaction(fatal[i], &sa, NULL);
+	}
+}
 
 /* +[BWCoreImageFilterRenderer prewarmPortraitFilterVersion:semanticStyleFilters:] */
 static void
@@ -657,6 +730,229 @@ image_added(__unused const struct mach_header *header, __unused intptr_t image_s
 	}
 }
 
+/*
+ * The front camera's focus. D22's AVCaptureSession.plist (CMCapture's FigCaptureSourceUtilities reads it here, in
+ * mediaserverd) is the iPhone X's, whose front camera has a fixed focus: no hasAutoFocus, no AutoFocusSystem in its
+ * formats, so AVFoundation says it cannot focus and Camera.app sends a tap there nowhere. The S9+'s front S5K3H1 has a
+ * lens motor (an AK737x on USI09, exynos_camera.c) and camera_device.c focuses it as the back one, by contrast: the
+ * plist is given to CMCapture with the front camera's focus as the back camera's (its window sizes and timeouts) and
+ * AutoFocusSystem 1 (contrast detection) in each of its formats. Found by the loaders Foundation has for a file's
+ * dictionary; the one used says so. cam_front_af=0: the plist as it is.
+ */
+static const char *const front_af_keys[] = {
+	"hasAutoFocus", "FocusCenterWindowSize", "FocusPointOfInterestWindowSize", "ContinuousAutoFocusWindowHeightOverride",
+	"ContinuousAutoFocusWindowWidthOverride", "smoothAutoFocusSupported", "stillImageCaptureNowAfterAutofocusTimeout",
+	"stillImageContrastBasedAutofocusTimeout", "autoFocusPositionSensorMode",
+};
+
+static bool
+capture_plist_path(CFTypeRef where, char *path, size_t size)
+{
+	CFStringRef s = NULL;
+	bool ok;
+
+	if (where == NULL) {
+		return false;
+	}
+	if (CFGetTypeID(where) == CFURLGetTypeID()) {
+		s = CFURLCopyFileSystemPath((CFURLRef)where, kCFURLPOSIXPathStyle);
+	} else if (CFGetTypeID(where) == CFStringGetTypeID()) {
+		s = CFRetain(where);
+	}
+	if (s == NULL) {
+		return false;
+	}
+	ok = CFStringGetCString(s, path, (CFIndex)size, kCFStringEncodingUTF8);
+	CFRelease(s);
+	return ok && strstr(path, "AVCaptureSession.plist") != NULL;
+}
+
+static CFMutableDictionaryRef
+device_with_id(CFArrayRef devices, const char *id)
+{
+	CFStringRef want = CFStringCreateWithCString(NULL, id, kCFStringEncodingUTF8);
+	CFMutableDictionaryRef found = NULL;
+
+	for (CFIndex i = 0; devices != NULL && i < CFArrayGetCount(devices) && found == NULL; i++) {
+		CFDictionaryRef d = CFArrayGetValueAtIndex(devices, i);
+		CFTypeRef u = CFGetTypeID(d) == CFDictionaryGetTypeID() ? CFDictionaryGetValue(d, CFSTR("uniqueID")) : NULL;
+
+		found = u != NULL && CFEqual(u, want) ? (CFMutableDictionaryRef)d : NULL;
+	}
+	CFRelease(want);
+	return found;
+}
+
+/* the plist with the front camera focusing (a new dictionary, +1), or NULL to keep it as it is */
+static CFDictionaryRef
+capture_plist_patched(CFDictionaryRef plist, const char *path)
+{
+	CFMutableDictionaryRef copy, back, front, multi, formats = NULL;
+	CFArrayRef devices;
+	CFNumberRef contrast;
+	int one = 1, n = 0;
+
+	if (plist == NULL || CFGetTypeID(plist) != CFDictionaryGetTypeID() || strstr(path, "/D22/") == NULL ||
+	    boot_arg("cam_front_af=0")) {
+		return NULL;
+	}
+	copy = (CFMutableDictionaryRef)CFPropertyListCreateDeepCopy(NULL, plist, kCFPropertyListMutableContainersAndLeaves);
+	devices = copy ? CFDictionaryGetValue(copy, CFSTR("AVCaptureDevices")) : NULL;
+	back = device_with_id(devices, "com.apple.avfoundation.avcapturedevice.built-in_video:0");
+	front = device_with_id(devices, "com.apple.avfoundation.avcapturedevice.built-in_video:1");
+	if (back == NULL || front == NULL) {
+		say("hakios: camera: %s: no back or front camera in it: left as it is\n", path);
+		if (copy != NULL) {
+			CFRelease(copy);
+		}
+		return NULL;
+	}
+	for (size_t i = 0; i < sizeof(front_af_keys) / sizeof(front_af_keys[0]); i++) {
+		CFStringRef k = CFStringCreateWithCString(NULL, front_af_keys[i], kCFStringEncodingUTF8);
+		CFTypeRef v = CFDictionaryGetValue(back, k);
+
+		if (v != NULL) {
+			CFDictionarySetValue(front, k, v);
+		}
+		CFRelease(k);
+	}
+	contrast = CFNumberCreate(NULL, kCFNumberIntType, &one);
+	multi = (CFMutableDictionaryRef)CFDictionaryGetValue(front, CFSTR("MultiStream"));
+	if (multi != NULL && CFGetTypeID(multi) == CFDictionaryGetTypeID()) {
+		formats = (CFMutableDictionaryRef)CFDictionaryGetValue(multi, CFSTR("FigCaptureStreamFormats"));
+	}
+	if (formats != NULL && CFGetTypeID(formats) == CFDictionaryGetTypeID()) {
+		CFIndex count = CFDictionaryGetCount(formats);
+		const void **values = calloc((size_t)count, sizeof(void *));
+
+		CFDictionaryGetKeysAndValues(formats, NULL, values);
+		for (CFIndex i = 0; i < count; i++) {
+			if (values[i] != NULL && CFGetTypeID(values[i]) == CFDictionaryGetTypeID()) {
+				CFDictionarySetValue((CFMutableDictionaryRef)values[i], CFSTR("AutoFocusSystem"), contrast);
+				n++;
+			}
+		}
+		free(values);
+	}
+	CFRelease(contrast);
+	say("hakios: camera: %s: the front camera focuses (the back camera's focus keys; AutoFocusSystem 1 in %d formats)\n",
+	    path, n);
+	return copy;
+}
+
+static IMP original_dict_url_class, original_dict_file_class, original_dict_url_error_class;
+static IMP original_dict_url_init, original_dict_file_init, original_dict_url_error_init;
+
+static id
+dict_url_class(id self, SEL selector, id url)
+{
+	id d = ((id (*)(id, SEL, id))original_dict_url_class)(self, selector, url);
+	char path[512];
+	CFDictionaryRef p;
+
+	if (capture_plist_path((CFTypeRef)url, path, sizeof(path)) && (p = capture_plist_patched((CFDictionaryRef)d, path))) {
+		return (id)CFAutorelease(p);
+	}
+	return d;
+}
+
+static id
+dict_file_class(id self, SEL selector, id file)
+{
+	id d = ((id (*)(id, SEL, id))original_dict_file_class)(self, selector, file);
+	char path[512];
+	CFDictionaryRef p;
+
+	if (capture_plist_path((CFTypeRef)file, path, sizeof(path)) && (p = capture_plist_patched((CFDictionaryRef)d, path))) {
+		return (id)CFAutorelease(p);
+	}
+	return d;
+}
+
+static id
+dict_url_error_class(id self, SEL selector, id url, id *error)
+{
+	id d = ((id (*)(id, SEL, id, id *))original_dict_url_error_class)(self, selector, url, error);
+	char path[512];
+	CFDictionaryRef p;
+
+	if (capture_plist_path((CFTypeRef)url, path, sizeof(path)) && (p = capture_plist_patched((CFDictionaryRef)d, path))) {
+		return (id)CFAutorelease(p);
+	}
+	return d;
+}
+
+static id
+dict_url_init(id self, SEL selector, id url)
+{
+	id d = ((id (*)(id, SEL, id))original_dict_url_init)(self, selector, url);
+	char path[512];
+	CFDictionaryRef p;
+
+	if (capture_plist_path((CFTypeRef)url, path, sizeof(path)) && (p = capture_plist_patched((CFDictionaryRef)d, path))) {
+		CFRelease((CFTypeRef)d);
+		return (id)p;
+	}
+	return d;
+}
+
+static id
+dict_file_init(id self, SEL selector, id file)
+{
+	id d = ((id (*)(id, SEL, id))original_dict_file_init)(self, selector, file);
+	char path[512];
+	CFDictionaryRef p;
+
+	if (capture_plist_path((CFTypeRef)file, path, sizeof(path)) && (p = capture_plist_patched((CFDictionaryRef)d, path))) {
+		CFRelease((CFTypeRef)d);
+		return (id)p;
+	}
+	return d;
+}
+
+static id
+dict_url_error_init(id self, SEL selector, id url, id *error)
+{
+	id d = ((id (*)(id, SEL, id, id *))original_dict_url_error_init)(self, selector, url, error);
+	char path[512];
+	CFDictionaryRef p;
+
+	if (capture_plist_path((CFTypeRef)url, path, sizeof(path)) && (p = capture_plist_patched((CFDictionaryRef)d, path))) {
+		if (d != NULL) {
+			CFRelease((CFTypeRef)d);
+		}
+		return (id)p;
+	}
+	return d;
+}
+
+static void
+hook_one(const char *class_name, bool instance, const char *selector, IMP replacement, IMP *original)
+{
+	Class cls = objc_getClass(class_name);
+	Method m = cls == NULL ? NULL : instance ? class_getInstanceMethod(cls, sel_registerName(selector)) :
+	    class_getClassMethod(cls, sel_registerName(selector));
+
+	if (m == NULL) {
+		say("hakios: camera: %c[%s %s]: not there\n", instance ? '-' : '+', class_name, selector);
+		return;
+	}
+	*original = method_setImplementation(m, replacement);
+}
+
+/* (Foundation is in mediaserverd before this library: it links it) */
+static void
+front_camera_focus_hooks(void)
+{
+	hook_one("NSDictionary", false, "dictionaryWithContentsOfURL:", (IMP)dict_url_class, &original_dict_url_class);
+	hook_one("NSDictionary", false, "dictionaryWithContentsOfFile:", (IMP)dict_file_class, &original_dict_file_class);
+	hook_one("NSDictionary", false, "dictionaryWithContentsOfURL:error:", (IMP)dict_url_error_class,
+	    &original_dict_url_error_class);
+	hook_one("NSDictionary", true, "initWithContentsOfURL:", (IMP)dict_url_init, &original_dict_url_init);
+	hook_one("NSDictionary", true, "initWithContentsOfFile:", (IMP)dict_file_init, &original_dict_file_init);
+	hook_one("NSDictionary", true, "initWithContentsOfURL:error:", (IMP)dict_url_error_init, &original_dict_url_error_init);
+}
+
 __attribute__((constructor))
 static void
 hakios_media_init(void)
@@ -668,6 +964,7 @@ hakios_media_init(void)
 		return;
 	}
 	slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - CACHE_BASE;
+	crash_watch();
 	metal_left_alone = boot_arg("mediamtl=1");
 	if (metal_left_alone) {
 		say("hakios: mediaserverd: mediamtl=1: the capture stack may have the Metal device (it "
@@ -685,6 +982,7 @@ hakios_media_init(void)
 	if (camera) {
 		say("hakios: mediaserverd: the kernel has a camera (/dev/hakios-camera)\n");
 		register_hevc_encoder();
+		front_camera_focus_hooks();
 	}
 	if (boot_arg("mfc=")) {
 		pthread_t waiter;

@@ -1,6 +1,7 @@
 /*
  * The phone's cameras as Darwin's capture stack wants them: a FigCaptureDevice with two FigCaptureStreams,
- * the wide camera as the back camera and the front one as the front camera, made for mediaserverd's
+ * the wide camera as the back camera and the front one as the front camera (and on Star2 a third, the
+ * telephoto as the back telephoto camera, where the kernel offers it: tele_offered()), made for mediaserverd's
  * BWFigCaptureDeviceVendor in place of the device Apple's H10ISP.mediacapture makes of the iPhone's ISP
  * (part of libhakios.media.dylib; inject_media.c gives the vendor our device's create function when
  * the kernel has a camera: cam=5).
@@ -45,6 +46,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 #include "camera_isp.h"
 
@@ -115,6 +117,7 @@ static CMBaseClassID (*device_class_id)(void);
 static CMBaseClassID (*stream_class_id)(void);
 static CFStringRef port_back;           /* kFigCapturePortType_BackFacingCamera */
 static CFStringRef port_front;          /* kFigCapturePortType_FrontFacingCamera */
+static CFStringRef port_tele;           /* kFigCapturePortType_BackFacingTelephotoCamera (none: no telephoto stream) */
 
 /*
  * The frames' metadata: what H10ISP's stream attaches to every frame (a dictionary under
@@ -162,6 +165,8 @@ find_functions(void)
 	port_back = port != NULL ? *port : NULL;
 	port = dlsym(RTLD_DEFAULT, "kFigCapturePortType_FrontFacingCamera");
 	port_front = port != NULL ? *port : NULL;
+	port = dlsym(RTLD_DEFAULT, "kFigCapturePortType_BackFacingTelephotoCamera");
+	port_tele = port != NULL ? *port : NULL;
 	port = dlsym(RTLD_DEFAULT, "kFigCaptureSampleBufferAttachmentKey_MetadataDictionary");
 	md_attachment = port != NULL ? *port : NULL;
 	for (int i = 0; i < MD_KEYS; i++) {
@@ -430,12 +435,69 @@ static const struct camera {
 	bool            turned;         /* its sensor the other way up from the iPhone's: the pictures turned half round */
 	double          focal_length, f_number, pixel_size, fov;
 	int             formats[2][3];  /* sensor width, height, frames a second of "Photo" and of a video format */
-} cameras[2] = {
+	uint32_t        fallback;       /* the sensor whose frames stand in when the kernel's is gone (0: none) ... */
+	float           fallback_zoom;  /* ... zoomed this much more, so that the picture is the same part of the scene */
+} cameras[3] = {
 	{ 1, "Back Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:0", false, 4.0, 1.8, 1.22, 65.0,
-	  { { 4032, 3024, 30 }, { 4224, 2376, 60 } } },        /* "Photo", "Video-60" */
-	{ 2, "Front Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:1", true, 2.87, 2.2, 1.0, 70.0,
-	  { { 3088, 2320, 30 }, { 3840, 2160, 30 } } },        /* "Photo", "Video-30" */
+	  { { 4032, 3024, 30 }, { 4224, 2376, 60 } }, 0, 1 },  /* "Photo", "Video-60" */
+	{ 2, "Front Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:1", false, 2.87, 2.2, 1.0, 70.0,
+	  { { 3088, 2320, 30 }, { 3840, 2160, 30 } }, 0, 1 },  /* "Photo", "Video-30" */
+	/*
+	 * Star2's telephoto (the kernel's sensor 4, S5K3M3 on CSIS2) as D22's "Back Telephoto Camera" (built-in_video:2,
+	 * whose baseCaptureDeviceUniqueID is the back camera's: its formats are named from the back camera's
+	 * FigCaptureStreamFormats, so they are the back camera's here too). The iPhone X's telephoto: 6 mm, f/2.4, 1.0 um.
+	 * If the kernel's telephoto fails (kern.hakios.camera_tele = 0), the wide camera's frames at twice the zoom.
+	 */
+	{ HAKIOS_CAMERA_SENSOR_TELE, "Back Telephoto Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:2", false,
+	  6.0, 2.4, 1.0, 35.0, { { 4032, 3024, 30 }, { 4224, 2376, 60 } }, 1, 2 },
 };
+#define CAMERAS (sizeof(cameras) / sizeof(cameras[0]))
+
+/* kern.hakios.camera_tele (hakios.exynos_camera.c): 0 no telephoto (or it failed), 1 offered, 2 offered and answered */
+static uint32_t
+tele_state(void)
+{
+	uint32_t v = 0;
+	size_t n = sizeof(v);
+
+	return sysctlbyname("kern.hakios.camera_tele", &v, &n, NULL, 0) == 0 && n == sizeof(v) ? v : 0;
+}
+
+static bool
+tele_offered(void)
+{
+	return port_tele != NULL && tele_state() >= 1;
+}
+
+/*
+ * The back camera zoomed to 2x and more takes the telephoto's frames (twice the focal length: the S9+'s 26 and
+ * 52 mm), its zoom halved, as D22's Dual Camera switches over -- Camera.app's 2x, Portrait and pinch zoom
+ * all set the back camera's ZoomFactor, as there is no Dual Camera device here. Only with the telephoto there
+ * and answering (kern.hakios.camera_tele 2); back to the wide camera below 1.9x (no flapping at 2x).
+ * HAKIOS_CAMERA_NO_TELE_ZOOM in mediaserverd's environment: the wide camera's frames, zoomed, as before.
+ */
+#define TELE_ZOOM_ON    2.0f
+#define TELE_ZOOM_OFF   1.9f
+#define TELE_LENS_ZOOM  2.0f
+
+static bool
+tele_for_zoom(const struct camera *c, float zoom, bool on_tele, uint32_t tele)
+{
+	if (c->sensor != 1 || tele < 2 || getenv("HAKIOS_CAMERA_NO_TELE_ZOOM") != NULL) {
+		return false;
+	}
+	return zoom >= (on_tele ? TELE_ZOOM_OFF : TELE_ZOOM_ON);
+}
+
+/* the sensor whose frames a camera's stream takes now: its own, or (its own gone in the kernel) its stand-in's */
+static uint32_t
+wanted_sensor(const struct camera *c)
+{
+	if (c->sensor == HAKIOS_CAMERA_SENSOR_TELE && c->fallback != 0 && tele_state() == 0) {
+		return c->fallback;
+	}
+	return c->sensor;
+}
 
 struct stream {
 	CFArrayRef      formats;
@@ -459,6 +521,7 @@ struct stream {
 	volatile bool   graph_running;  /* the capture graph has started this stream: frames may be given out */
 	bool            worker_started;
 	int             torch;
+	float           torch_level;    /* TorchLevel as last taken by the kernel (0 to 1) */
 	uint64_t        frames, stills_given;
 };
 
@@ -486,6 +549,7 @@ stream_copy_property(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef allocato
 	CFTypeRef value = NULL;
 
 	(void)allocator;
+	say_once("stream: asked for", key, NULL);       /* (once each: what FigFlashlight and the graph read) */
 	if (key_is(key, "PortType")) {
 		value = CFRetain(s->port);
 	} else if (key_is(key, "UniqueID") || key_is(key, "ModelID")) {
@@ -504,7 +568,9 @@ stream_copy_property(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef allocato
 		value = number_f(s->max_fps);
 	} else if (key_is(key, "Clock")) {
 		value = CFRetain(CMClockGetHostTimeClock());
-	} else if (key_is(key, "TorchLevel") || key_is(key, "ExposureBias")) {
+	} else if (key_is(key, "TorchLevel")) {
+		value = number_f(s->torch_level);
+	} else if (key_is(key, "ExposureBias")) {
 		value = number_f(0);
 	} else if (key_is(key, "VideoOutputConfigurations") || key_is(key, "VideoOutputsEnabled")) {
 		/*
@@ -801,9 +867,12 @@ torch_set(struct stream *s, CFTypeRef value)
 		s->torch = open("/dev/hakios-torch", O_WRONLY);
 	}
 	if (s->torch < 0 || write(s->torch, &thousandths, sizeof(thousandths)) != (ssize_t)sizeof(thousandths)) {
-		say("the flashlight at %u of 1000 NOT TAKEN (no /dev/hakios-torch)", thousandths);
+		say("the flashlight at %u of 1000 NOT TAKEN (%s)", thousandths, s->torch < 0 ? "no /dev/hakios-torch" :
+		    strerror(errno));
+		s->torch_level = 0;
 	} else {
 		say("the flashlight at %u of 1000", thousandths);
+		s->torch_level = level;
 	}
 }
 
@@ -952,7 +1021,7 @@ frame_metadata(const struct isp *isp, const struct hakios_camera_frame *f, const
 	 * (-[BWMultiStreamCameraSourceNode _ispAppliedZoomFactorFromSampleBufferMetadataDictionary:outputIndex:])
 	 * and would make up the rest of what was asked for itself; without it, a zoomed preview stood still.
 	 */
-	md_put(m, MD_ZOOM, number_f(isp->zoom));
+	md_put(m, MD_ZOOM, number_f(isp->zoom * (isp->lens_zoom > 0 ? isp->lens_zoom : 1)));
 	return m;
 }
 
@@ -1285,13 +1354,27 @@ af_frame(int device, struct af *af, const struct hakios_camera_frame *f, const u
 static void
 load_tuning(struct isp *isp, uint32_t sensor)
 {
-	static const char *const names[] = { "ov02b10", "s5khm2sd", "ov16a1q", "s5k4h7" };
+	static const char *const names[] = { "ov02b10", "s5khm2sd", "ov16a1q", "s5k4h7", "s5k3m3" };
+	/*
+	 * The same numbers on the Galaxy S9 / S9+ (hakios.exynos_camera.c: 1 the rear S5K2L3, 2 the front S5K3H1, 4 Star2's
+	 * telephoto S5K3M3): their tunings are made from Samsung's own setfiles and RTA (tools/camtuning-exynos.py), tried when
+	 * the POCO's name has none.
+	 */
+	static const char *const s9_names[] = { NULL, "s5k2l3", "s5k3h1", NULL, "s5k3m3" };
 	char path[96];
 
 	if (sensor >= sizeof(names) / sizeof(names[0])) {
 		return;
 	}
 	snprintf(path, sizeof(path), "/redwood/fw/camera-%s.isp", names[sensor]);
+	if (access(path, R_OK) != 0 && s9_names[sensor] != NULL) {
+		char s9[96];
+
+		snprintf(s9, sizeof(s9), "/redwood/fw/camera-%s.isp", s9_names[sensor]);
+		if (access(s9, R_OK) == 0) {
+			memcpy(path, s9, sizeof(path));
+		}
+	}
 	if (isp_load_tuning(isp, path)) {
 		say("the %s's colour tuning from %s: %u colour matrices' lights, %u lens shadings'", names[sensor], path,
 		    isp->tuning->ccm.lights, isp->tuning->lsc.lights);
@@ -1312,8 +1395,9 @@ worker(void *context)
 	struct isp_stats st;
 	uint8_t *buffer = NULL;
 	size_t bytes = 0;
-	uint32_t tuned_for = ~0u;
-	bool switched = false;
+	uint32_t tuned_for = ~0u, want = wanted_sensor(s->camera), tele = tele_state();
+	bool switched = false, on_tele = tele_for_zoom(s->camera, s->zoom, false, tele);
+
 	float lux = -1, cct = -1;
 	struct af af = { 0 };
 	int device = open(HAKIOS_CAMERA_DEVICE, O_RDWR), failures = 0;
@@ -1337,13 +1421,17 @@ worker(void *context)
 				}
 				continue;
 			}
-			if (head.sensor != s->camera->sensor) {
+			on_tele = tele_for_zoom(s->camera, s->zoom, on_tele, tele);
+			want = on_tele ? HAKIOS_CAMERA_SENSOR_TELE : wanted_sensor(s->camera);
+			if (head.sensor != want) {
 				/* another camera's frames (the kernel's last sensor): changed, and the next ones are this one's */
 				if (!switched) {
-					struct hakios_camera_command c = { .command = HAKIOS_CAMERA_SENSOR, .a = s->camera->sensor, .b = ~0u };
+					struct hakios_camera_command c = { .command = HAKIOS_CAMERA_SENSOR, .a = want, .b = ~0u };
 
 					switched = true;
-					say("the kernel's frames are camera %u's: to %u, the %s", head.sensor, s->camera->sensor, s->camera->name);
+					say("the kernel's frames are camera %u's: to %u, the %s%s", head.sensor, want, s->camera->name,
+					    want != s->camera->sensor ? " (its own is gone in the kernel: the wide camera's, zoomed, stand in)" :
+					    "");
 					(void)write(device, &c, sizeof(c));
 				}
 				continue;
@@ -1354,6 +1442,27 @@ worker(void *context)
 			continue;
 		}
 		n = read(device, buffer, bytes);
+
+		const struct hakios_camera_frame *f = (const void *)buffer;
+		const uint8_t *raw = buffer + sizeof(head);
+		struct hakios_camera_command c;
+
+		/*
+		 * Every frame is checked against the one the buffer was made for, before its length: the kernel changes sensors
+		 * when any stream asks (the other camera's frames are another size), and a frame taken as this one's then had
+		 * isp_measure() read past the buffer's end (mediaserverd's SIGSEGV, 12 Nov); a smaller one came short and, five
+		 * times over, ended the worker. Another sensor's, or another size: the buffer goes, and the next header says
+		 * again what the frames are.
+		 */
+		if (n >= (ssize_t)sizeof(head) && (f->header_bytes != sizeof(head) || f->sensor != want ||
+		    f->width != head.width || f->height != head.height || f->stride != head.stride)) {
+			say("the frames changed (sensor %u, %ux%u, now %u, %ux%u): the buffer made again", head.sensor, head.width,
+			    head.height, f->sensor, f->width, f->height);
+			free(buffer);
+			buffer = NULL;
+			switched = false;
+			continue;
+		}
 		if (n != (ssize_t)bytes) {
 			if (n < 0 && errno == EIO) {
 				say("the kernel's camera has had a fault: no more frames");
@@ -1363,10 +1472,16 @@ worker(void *context)
 			continue;
 		}
 		failures = 0;
-
-		const struct hakios_camera_frame *f = (const void *)buffer;
-		const uint8_t *raw = buffer + f->header_bytes;
-		struct hakios_camera_command c;
+		if (tele_for_zoom(s->camera, s->zoom, on_tele, tele) != on_tele) {
+			/* zoomed across 2x: the other lens's frames from the next header on (see above) */
+			say("zoom %.2fx: the back camera to the %s", s->zoom, on_tele ? "wide lens" : "telephoto");
+			free(buffer);
+			buffer = NULL;
+			switched = false;
+			af.state = AF_STEADY;
+			af.now = true;
+			continue;
+		}
 
 		isp_measure(&isp, f, raw, &st);
 		isp_awb(&isp, &st);
@@ -1382,6 +1497,15 @@ worker(void *context)
 		cct = cct < 0 ? colour_temperature(&isp) : cct * 0.97f + colour_temperature(&isp) * 0.03f;
 		isp_tune(&isp, lux, cct);
 		isp.zoom = s->zoom;
+		isp.lens_zoom = 0;
+		if (on_tele) {
+			/* the telephoto's frames are already twice the wide camera's zoom */
+			isp.lens_zoom = TELE_LENS_ZOOM;
+			isp.zoom = s->zoom / TELE_LENS_ZOOM < 1 ? 1 : s->zoom / TELE_LENS_ZOOM;
+		} else if (want != s->camera->sensor) {
+			/* (the stand-in's frames: the same part of the scene as the telephoto's would be) */
+			isp.zoom = s->zoom * s->camera->fallback_zoom > MAX_ZOOM ? MAX_ZOOM : s->zoom * s->camera->fallback_zoom;
+		}
 		isp.turned = s->camera->turned;
 		if (isp_ae(&isp, f, &st, &c)) {
 			(void)write(device, &c, sizeof(c));
@@ -1458,7 +1582,14 @@ worker(void *context)
  * takes a moment to settle and the exposure longer), the second only when the graph starts the
  * stream itself (`graph` true, the FigCaptureStream start method).
  */
-static CMBaseObjectRef all_streams[2];  /* the device's, back and front */
+/*
+ * The newest device's streams, back and front. The capture stack makes and frees devices (a prewarm's, the
+ * flashlight's, the camera's): a stream that is freed is taken out of here first (stream_finalize), and the table is
+ * only read under its lock, or stream_begin() would look at a freed stream's `running' (mediaserverd's SIGSEGV at boot,
+ * 12 Nov, once there were two streams).
+ */
+static CMBaseObjectRef all_streams[CAMERAS];
+static pthread_mutex_t all_streams_lock = PTHREAD_MUTEX_INITIALIZER;
 static OSStatus stream_stop(CMBaseObjectRef o);
 
 static OSStatus
@@ -1475,13 +1606,18 @@ stream_begin(CMBaseObjectRef o, bool graph)
 	if (s->running) {
 		return 0;
 	}
-	/* one camera at a time: the kernel gives one sensor's frames (the other stream's worker stopped first) */
-	for (int i = 0; i < 2; i++) {
+	/*
+	 * one camera at a time: the kernel gives one sensor's frames (the other stream's worker stopped first). The lock is
+	 * held through the stop, so that the other stream cannot be freed meanwhile (its worker does not take this lock)
+	 */
+	pthread_mutex_lock(&all_streams_lock);
+	for (unsigned i = 0; i < CAMERAS; i++) {
 		if (all_streams[i] != NULL && all_streams[i] != o && stream_of(all_streams[i])->running) {
 			say("stream: the %s's frames stop for the %s's", stream_of(all_streams[i])->camera->name, s->camera->name);
 			(void)stream_stop(all_streams[i]);
 		}
 	}
+	pthread_mutex_unlock(&all_streams_lock);
 	s->running = true;
 	s->frames = 0;
 	say("stream: frames begin (format %d)", s->format_index);
@@ -1589,6 +1725,13 @@ stream_finalize(CMBaseObjectRef o)
 {
 	struct stream *s = stream_of(o);
 
+	pthread_mutex_lock(&all_streams_lock);
+	for (unsigned i = 0; i < CAMERAS; i++) {
+		if (all_streams[i] == o) {
+			all_streams[i] = NULL;
+		}
+	}
+	pthread_mutex_unlock(&all_streams_lock);
 	(void)stream_stop(o);
 	for (int i = 0; i < OUTPUTS; i++) {
 		if (s->out[i].config) {
@@ -1790,8 +1933,9 @@ OSStatus
 hakios_camera_device_create(CFAllocatorRef allocator, CFDictionaryRef options, CMBaseObjectRef *out)
 {
 	static bool found, usable;
-	CMBaseObjectRef device = NULL, stream[2];
+	CMBaseObjectRef device = NULL, stream[CAMERAS] = { NULL };
 	struct device *d;
+	unsigned count = 2;
 
 	(void)options;
 	if (!found) {
@@ -1801,6 +1945,13 @@ hakios_camera_device_create(CFAllocatorRef allocator, CFDictionaryRef options, C
 	if (!usable || out == NULL) {
 		return ERR_UNSUPPORTED;
 	}
+	/*
+	 * Both streams, the back camera first. The back one is also the flashlight's: with a camera, FigFlashlight
+	 * (Control Center's button) asks this device for its back-facing stream and sets that stream's TorchLevel, so
+	 * without it there is no flashlight in iOS at all. Its frames are the kernel's sensor 1 (Star2's S5K2L3 with
+	 * cam_s9_rear=1); where the kernel has no rear camera it keeps giving the front one's, which this stream does not
+	 * show (worker(): another sensor's frames are skipped).
+	 */
 	if ((stream[0] = stream_create(allocator, &cameras[0], port_back)) == NULL) {
 		return ERR_UNSUPPORTED;
 	}
@@ -1808,21 +1959,45 @@ hakios_camera_device_create(CFAllocatorRef allocator, CFDictionaryRef options, C
 		CFRelease(stream[0]);
 		return ERR_UNSUPPORTED;
 	}
+	/*
+	 * The telephoto, a third stream, only where the kernel offers it (Star2 with cam_s9_tele=1, and its probe at the
+	 * start not failed): elsewhere, or if it cannot be made, the device is the two streams it always was. A separate
+	 * camera only (AVCaptureDeviceTypeBuiltInTelephotoCamera): the device gives no synchronized streams group, so D22's
+	 * "Back Dual Camera" (built-in_video:3, wide and tele switched over by zoom) is not made of it
+	 */
+	if (tele_offered()) {
+		if ((stream[2] = stream_create(allocator, &cameras[2], port_tele)) != NULL) {
+			count = 3;
+		} else {
+			say("the telephoto's stream cannot be made: the back and front cameras only");
+		}
+	}
 	if (derived_create(allocator, &device_vtable, device_class_id(), &device) != 0 || device == NULL) {
-		CFRelease(stream[0]);
-		CFRelease(stream[1]);
+		for (unsigned i = 0; i < count; i++) {
+			CFRelease(stream[i]);
+		}
 		say("the device cannot be made");
 		return ERR_UNSUPPORTED;
 	}
 	d = derived_storage(device);
 	memset(d, 0, sizeof(*d));
-	d->streams = CFArrayCreate(NULL, (const void **)stream, 2, &kCFTypeArrayCallBacks);
-	all_streams[0] = stream[0];             /* (kept by the device's array) */
-	all_streams[1] = stream[1];
+	d->streams = CFArrayCreate(NULL, (const void **)stream, count, &kCFTypeArrayCallBacks);
+	pthread_mutex_lock(&all_streams_lock);
+	for (unsigned i = 0; i < CAMERAS; i++) {
+		all_streams[i] = i < count ? stream[i] : NULL;  /* (kept by the device's array; taken out again when freed) */
+	}
+	pthread_mutex_unlock(&all_streams_lock);
 	d->supported = supported(device_props, sizeof(device_props) / sizeof(device_props[0]));
-	CFRelease(stream[0]);
-	CFRelease(stream[1]);
+	for (unsigned i = 0; i < count; i++) {
+		CFRelease(stream[i]);
+	}
 	*out = device;
-	say("the device made: two streams, the back camera and the front one");
+	if (count == 3) {
+		say("the device made: three streams, the back camera (also the flashlight's), the front one and the back "
+		    "telephoto (kern.hakios.camera_tele %u)", tele_state());
+	} else {
+		say("the device made: two streams, the back camera (also the flashlight's) and the front one%s",
+		    port_tele == NULL ? "" : " (no telephoto: kern.hakios.camera_tele is 0)");
+	}
 	return 0;
 }
