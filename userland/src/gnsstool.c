@@ -147,7 +147,7 @@ meif_print(const uint8_t *m, unsigned n)
 	}
 	if (id <= 2 || id == 4 || id == 8) {
 		printf(" :");
-		for (unsigned i = 6; i + 2 < n && i < 40; i++) {
+		for (unsigned i = 6; i + 2 < n && i < (id == 8 || id == 2 ? 400u : 40u); i++) {
 			printf(" %02x", m[i]);
 		}
 	}
