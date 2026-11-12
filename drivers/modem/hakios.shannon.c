@@ -2,19 +2,24 @@
  * The Galaxy S9/S9+'s cellular modem: Samsung's Shannon, the "CP" inside the Exynos 9810, brought up one step at a time
  * (shannon=N, off unless asked). docs/cellular-star2lte.md is the plan and the evidence; this file is its step 1.
  *
- * What Samsung's kernel does (Apollo: drivers/misc/modem_v1, drivers/misc/mcu_ipc, drivers/soc/samsung/pmu-cp.c and
- * cal-if/exynos9810/pmucal_cp_exynos9810.h), with cbd, Samsung's closed boot daemon, driving it through /dev/umts_boot0:
- *   1. the RADIO partition's images go into the CP's reserved memory (modem_if, 0xF0000000 + 0x9200000; the CP sees it at
- *      0x40000000): the TOC and BOOT at the start (shm_ipc.c reads the memory map at +0x200+0xa0), MAIN, VSS and NV at
- *      their load addresses (IOCTL_MODEM_XMIT_BOOT, shmem_xmit_boot);
- *   2. IOCTL_SECURITY_REQ: on the 9810 the PMU's CP sequence first if the CP has never been initialised (cal_cp_init:
- *      CP_CTRL_NS bit 1, CP_CTRL_S bit 3, RESET_SEQUENCER_STATUS == 5), then SMC 0x82000700 (mode | the base, the boot
- *      loader's size, MAIN's size): EL3 checks Samsung's signatures and closes the memory to this side;
- *   3. IOCTL_MODEM_ON (ss310ap_on): the mailbox's status words cleared, the AP's status (sys_rev, ds_det, pda_active),
- *      then AP2CP_CFG (0x14820000) = 1: "CP_CPU will work right now";
- *   4. IOCTL_MODEM_BOOT_ON: the CP's status (mailbox word 3, bits 4:1) leaves 0 within a second;
- *   5. the CP sends CMD_PHONE_START and CMD_INIT_START through mailbox word 1; the AP lays out the shared-buffer rings
- *      (SBD) in the IPC region and answers PIF_INIT_DONE, then INIT_END once rild's channels are open.
+ * What Android does on a cold boot: Samsung's cbd (vendor/bin/cbd, "cbd -d -tss310 -bm -mm -P .../RADIO -n
+ * /mnt/vendor/efs", start_shannon310_boot) through /dev/umts_boot0, and Apollo's modem_v1 behind each ioctl
+ * (docs/cellular-star2lte.md has the annotated sequence):
+ *   1. waits for vendor.cbd.rfs_check_done (the RIL's RFS side validated NV), reads RADIO's TOC, opens
+ *      /mnt/vendor/efs/nv_data.bin (creating it 0xFF-filled, the NV entry's size, if missing);
+ *   2. IOCTL_MODEM_STATUS, IOCTL_MODEM_RESET (a no-op while the CP is offline);
+ *   3. IOCTL_SECURITY_REQ(mode 2, 0, 0) "non-secure mode", with cbd's own CPU affinity taken off CPU 0: the kernel
+ *      runs cal_cp_init first (CP_CTRL_NS |= PWRON, CP_CTRL_S |= CP_START, RESET_SEQUENCER_STATUS == 5), then
+ *      SMC 0x82000700(2, 0, 0); CP_NOT_WORKING (0xb) is taken as success for mode 2;
+ *   4. IOCTL_MODEM_XMIT_BOOT for TOC entries 1..4 (BOOT, MAIN, VSS once per boot, NV from the NV file), each
+ *      in 0xf800-byte chunks to boot_base + (address & 0x3fffffff): BOOT at +0, MAIN +0x10000, VSS +0x7900000,
+ *      NV +0x4900000. TOC and OFFSET are not sent;
+ *   5. IOCTL_SECURITY_REQ(mode 0, BOOT's size, MAIN's size) "secure mode", off CPU 0: SMC 0x82000700(0 | base only if
+ *      shm_ipc found a CP memory map at boot -- on a cold boot it has not, so 0, BOOT size, MAIN size);
+ *   6. ds_detect; IOCTL_MODEM_ON (mailbox words cleared, AP status word, AP2CP_CFG = 1, 300 ms);
+ *   7. IOCTL_MODEM_BOOT_ON (CP status word non-zero within 100 tries); IOCTL_MODEM_DL_START (the IPC map reset, the
+ *      boot magic, AP status 1); the UDL handshake on umts_boot0 (stage done, then command 0xf);
+ *      IOCTL_MODEM_BOOT_OFF (waits for the CP's init); IOCTL_MODEM_GET_CP_BOOTLOG.
  *
  * The steps here:
  *   shannon=1  read only: CP_CTRL_NS/_S through the read SMC, the four PMU words Samsung's exynos_print_cp_status reads
@@ -27,14 +32,16 @@
  *              the CP never initialised is a synchronous external abort (build 35: panic in log_cp_registers, FAR at
  *              that page's offset 0). Samsung's kernel touches it only in ss310ap_on, after the security request has
  *              run cal_cp_init; so does this driver (step 3, RESET_SEQUENCER_STATUS == 5 and the verify call passed).
- *   shannon=2  ... and steps 1 and 2: the images loaded, the CP initialised if it is not, and the SMC; its answer logged
- *              by name. The CP is not started. shannon_nv=1 loads EFS:/nv_data.bin into NV (its size is logged, never
- *              its contents); without it NV is left zero and the CP is expected to rebuild its defaults.
+ *   shannon=2  ... and cbd's 3 to 5: cal_cp_init and SMC(2, 0, 0), the four images, SMC(0, BOOT, MAIN), both SMCs
+ *              made off CPU 0 as cbd makes them; the answers logged by name. The CP is not started. shannon_nv=1 loads
+ *              EFS:/nv_data.bin into NV (its size is logged, never its contents); without it NV is 0xFF, what cbd's
+ *              create_empty_nv writes, and the CP is expected to rebuild its defaults.
  *   shannon=3  ... and steps 3 and 4, then 60 s of the CP's mailbox: each message it sends is logged with its command
  *              (PHONE_START, INIT_START, ...). Nothing is answered yet: the SBD rings are the next step.
  * Other arguments: shannon_sysrev=N (the board revision the AP reports, 0 if not given: Samsung reads it from eight GPIOs),
- * shannon_blsize=N (the boot loader's size for the SMC, BOOT's TOC size if not given), shannon_toc=0 (BOOT at +0 instead
- * of the TOC then BOOT).
+ * shannon_blsize=N (the boot loader's size for the SMC, BOOT's TOC size if not given, as cbd), shannon_toc=1 (the TOC at
+ * +0 and BOOT after it, the layout shm_ipc.c's memory-map probe reads; not what cbd does), shannon_base=1 (the region's
+ * base ORed into the verify call's mode, as Linux does only when its boot-time probe found a memory map).
  *
  * sysctl kern.hakios.shannon_state: 0 nothing, 1 read, 2 loaded and the SMC said CP_NO_ERROR, 3 the CP's status came up,
  * 4 the CP sent PHONE_START or INIT_START. No kern.hakios.cellular_* here yet: those are the redwood modem's
@@ -411,53 +418,69 @@ load_part(volatile uint8_t *cp, uint64_t at, uint64_t from, uint64_t length, con
 	return true;
 }
 
-/* Steps 1 and 2 of the header: the images, the CP's init, the verify call. */
+/*
+ * cbd makes both security requests with CPU 0 taken out of its affinity (std_security_req: sched_setaffinity with
+ * bit 0 cleared, restored after). The SMC is made here from a core whose MPIDR is not 0, bound for the call.
+ */
+static bool
+bind_off_core0(void)
+{
+	const ml_topology_info_t *topology = ml_get_topology_info();
+
+	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+		int cpu = (int)topology->cpus[i].cpu_id;
+		processor_t processor = cpu_to_processor(cpu);
+
+		if (processor == NULL) {
+			continue;
+		}
+		(void)thread_bind(processor);
+		(void)thread_block(NULL);
+		if ((__builtin_arm_rsr64("MPIDR_EL1") & 0xffffffull) != 0) {
+			return true;
+		}
+	}
+	(void)thread_bind(NULL);
+	(void)thread_block(NULL);
+	return false;
+}
+
+static uint64_t
+security_request(uint32_t mode, uint32_t size_boot, uint32_t size_main)
+{
+	uint64_t answer, mpidr;
+
+	if (!bind_off_core0()) {
+		say("shannon: no core but CPU 0 to make the security call from: not made\n");
+		return ~0ull;
+	}
+	mpidr = __builtin_arm_rsr64("MPIDR_EL1");
+	(void)smc(SMC_SSS_CLK, 0, 0, 0);
+	answer = smc(SMC_CP, mode, size_boot, size_main);
+	(void)smc(SMC_SSS_CLK, 1, 0, 0);
+	(void)thread_bind(NULL);
+	(void)thread_block(NULL);
+	say("shannon: security SMC %#x(mode %#x, %#x, %#x) from MPIDR %#llx answered %#llx (%s)\n", SMC_CP, mode, size_boot,
+	    size_main, mpidr, answer, answer < sizeof(smc_errors) / sizeof(smc_errors[0]) ? smc_errors[answer] : "unknown");
+	return answer;
+}
+
+/* cbd's steps 3 to 5 (the header): the CP's init and the non-secure request, the images, the secure request. */
 static bool
 load_and_verify(void)
 {
-	const struct toc_entry *boot = toc_find("BOOT"), *main_part = toc_find("MAIN"), *vss = toc_find("VSS"), *nv = toc_find("NV");
-	uint32_t with_toc = 1, nv_wanted = 0, blsize = boot->size;
+	static const char *const stages[] = { "BOOT", "MAIN", "VSS", "NV" };
+	const struct toc_entry *boot = toc_find("BOOT"), *main_part = toc_find("MAIN");
+	uint32_t with_toc = 0, nv_wanted = 0, with_base = 0, blsize = boot->size;
 	volatile uint8_t *cp;
 	uint64_t answer;
 
 	(void)PE_parse_boot_argn("shannon_toc", &with_toc, sizeof(with_toc));
 	(void)PE_parse_boot_argn("shannon_nv", &nv_wanted, sizeof(nv_wanted));
 	(void)PE_parse_boot_argn("shannon_blsize", &blsize, sizeof(blsize));
-	if (boot->address != CP_VIEW || main_part->address < CP_VIEW || main_part->address - CP_VIEW + main_part->size > CP_IPC_OFFSET) {
-		say("shannon: BOOT at the CP's %#x and MAIN at %#x (%#x bytes) are not where this driver expects: not loaded\n",
-		    boot->address, main_part->address, main_part->size);
-		return false;
-	}
-	cp = (volatile uint8_t *)hakios_physmap_wc(CP_PA, CP_SIZE);
-	if (cp == NULL) {
-		say("shannon: the CP's memory (%#llx, %#llx bytes) could not be mapped\n", CP_PA, CP_SIZE);
-		return false;
-	}
-	if (!(with_toc ? load_part(cp, 0, 0, boot->offset + boot->size, "TOC+BOOT") :
-	    load_part(cp, 0, boot->offset, boot->size, "BOOT")) ||
-	    !load_part(cp, main_part->address - CP_VIEW, main_part->offset, main_part->size, "MAIN") ||
-	    (vss != NULL && vss->size != 0 && !load_part(cp, vss->address - CP_VIEW, vss->offset, vss->size, "VSS"))) {
-		return false;
-	}
-	if (nv != NULL && nv->address >= CP_VIEW && nv->address - CP_VIEW + nv->size <= CP_IPC_OFFSET) {
-		volatile uint8_t *to = cp + (nv->address - CP_VIEW);
-		const uint8_t *data = NULL;
-		uint64_t size = 0;
+	(void)PE_parse_boot_argn("shannon_base", &with_base, sizeof(with_base));
 
-		for (uint32_t i = 0; i < nv->size; i++) {
-			to[i] = 0;
-		}
-		if (nv_wanted && hakios_partition_file("EFS", "/efs", "/nv_data.bin", nv->size, &data, &size) == 0 && data != NULL) {
-			for (uint64_t i = 0; i < size; i++) {
-				to[i] = data[i];
-			}
-			say("shannon: NV: the phone's own, %llu bytes (not shown)\n", size);
-		} else {
-			say("shannon: NV: %#x bytes of zeroes at +%#x (%s)\n", nv->size, nv->address - CP_VIEW,
-			    nv_wanted ? "EFS:/nv_data.bin not read" : "shannon_nv=1 not given");
-		}
-		__builtin_arm_dsb(15);
-	}
+	/* 3: IOCTL_SECURITY_REQ(2, 0, 0): on the 9810, cal_cp_init first if the CP has never been initialised */
 	if ((rd(pmu, PMU_RESET_SEQ_STATUS) & 7) != 5) {
 		volatile uint8_t *gicd = (volatile uint8_t *)ml_io_map(GICD_PENDING_PA, 0x1000);
 
@@ -465,19 +488,78 @@ load_and_verify(void)
 		(void)cp_ctrl_set(CP_CTRL_NS, 1u << 1);
 		(void)cp_ctrl_set(CP_CTRL_S, 1u << 3);
 		delay(1024);
-		(void)wait_field(pmu, PMU_RESET_SEQ_STATUS, 7, 5, 100, "RESET_SEQUENCER_STATUS");
+		if (!wait_field(pmu, PMU_RESET_SEQ_STATUS, 7, 5, 100, "RESET_SEQUENCER_STATUS")) {
+			say("shannon: the CP's init did not complete: stopping before any image is loaded\n");
+			return false;
+		}
 		if (gicd != NULL) {
 			(void)wait_field(gicd, GICD_PENDING_OFF, 1u << 28, 1u << 28, 100, "the GIC's pending word (0x10101238)");
 		}
 	} else {
 		say("shannon: the CP was initialised before (RESET_SEQUENCER_STATUS %#x)\n", rd(pmu, PMU_RESET_SEQ_STATUS));
 	}
-	(void)smc(SMC_SSS_CLK, 0, 0, 0);
-	answer = smc(SMC_CP, 0 | (uint32_t)CP_PA, blsize, main_part->size);
-	(void)smc(SMC_SSS_CLK, 1, 0, 0);
-	say("shannon: verify SMC %#x(mode 0 | %#llx, boot loader %#x, main %#x) answered %#llx (%s)\n", SMC_CP, CP_PA, blsize,
-	    main_part->size, answer, answer < sizeof(smc_errors) / sizeof(smc_errors[0]) ? smc_errors[answer] : "unknown");
-	log_cp_registers("after the verify call");
+	answer = security_request(2, 0, 0);
+	if (answer != 0 && answer != 11) {
+		say("shannon: the non-secure request failed (cbd takes only 0 or CP_NOT_WORKING): no image loaded\n");
+		return false;
+	}
+	log_cp_registers("after the non-secure request");
+
+	/* 4: IOCTL_MODEM_XMIT_BOOT, TOC entries BOOT, MAIN, VSS, NV, each to (address & 0x3fffffff) */
+	cp = (volatile uint8_t *)hakios_physmap_wc(CP_PA, CP_SIZE);
+	if (cp == NULL) {
+		say("shannon: the CP's memory (%#llx, %#llx bytes) could not be mapped\n", CP_PA, CP_SIZE);
+		return false;
+	}
+	for (unsigned int i = 0; i < sizeof(stages) / sizeof(stages[0]); i++) {
+		const struct toc_entry *entry = toc_find(stages[i]);
+		uint32_t at;
+
+		if (entry == NULL) {
+			say("shannon: RADIO has no %s entry: stopping\n", stages[i]);
+			return false;
+		}
+		at = entry->address & 0x3fffffffu;
+		if ((uint64_t)at + entry->size > CP_IPC_OFFSET) {
+			say("shannon: %s (%#x bytes at +%#x) runs past the boot region: stopping\n", entry->name, entry->size, at);
+			return false;
+		}
+		if (strcmp(entry->name, "NV") == 0) {
+			volatile uint8_t *to = cp + at;
+			const uint8_t *data = NULL;
+			uint64_t size = 0;
+
+			if (nv_wanted && hakios_partition_file("EFS", "/efs", "/nv_data.bin", entry->size, &data, &size) == 0 &&
+			    data != NULL && size == entry->size) {
+				for (uint64_t k = 0; k < size; k++) {
+					to[k] = data[k];
+				}
+				say("shannon: NV: the phone's own nv_data.bin, %llu bytes, to +%#x (contents not shown)\n", size, at);
+			} else {
+				for (uint32_t k = 0; k < entry->size; k++) {
+					to[k] = 0xff;
+				}
+				say("shannon: NV: %#x bytes of 0xFF at +%#x, cbd's create_empty_nv (%s)\n", entry->size, at,
+				    !nv_wanted ? "shannon_nv=1 not given" : data == NULL ? "EFS:/nv_data.bin not read" :
+				    "EFS:/nv_data.bin is not the NV entry's size");
+			}
+			__builtin_arm_dsb(15);
+			continue;
+		}
+		if (entry == boot && with_toc) {
+			if (!load_part(cp, 0, 0, boot->offset + boot->size, "TOC+BOOT (shannon_toc=1)")) {
+				return false;
+			}
+			continue;
+		}
+		if (!load_part(cp, at, entry->offset, entry->size, entry->name)) {
+			return false;
+		}
+	}
+
+	/* 5: IOCTL_SECURITY_REQ(0, BOOT's size, MAIN's size) */
+	answer = security_request(with_base ? (uint32_t)CP_PA : 0, blsize, main_part->size);
+	log_cp_registers("after the secure request");
 	return answer == 0;
 }
 
