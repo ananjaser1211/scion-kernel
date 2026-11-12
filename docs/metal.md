@@ -236,3 +236,112 @@ GL=1 PANVK_DIR=$PWD/xnu-deps/build/panvk/out RC_JOBS=rc.jobs.vksmoke userland/bu
 ```
 
 `vk_smoke [--mali-v6] [--api 1.2] [driver.dylib]`: `--mali-v6` sets PanVK's gate for this program only.
+
+## On the phone (13 November 2026): phase 1 passes, and a Metal triangle draws on the Mali-G72
+
+**Where it stands.** On the Galaxy S9+ (star2lte, iOS 16.5, kernels of builds 36 to 40, `mali=9`, no new boot-arg), every piece was run by
+hand from `/var/root/metal` and `/var/jb/Applications/MetalTri.app` while the OpenGL ES compositor kept running:
+
+- **`vk_smoke --mali-v6` on the real G72: 8 of 8 steps passed.** The clear read back 4096 of 4096 pixels `0xff4080ff`, the timeline
+  semaphore counted to 7, and the compute shader wrote 4096 of 4096 words `2i+1`. PanVK's jobs went through HakiosMali beside the
+  compositor's.
+- **`metal_tri` (`userland/src/metalvk/metal_tri.m`) through the Metal API.** It opens the METAL=vk plug-in by hand
+  (`-initWithAcceleratorPort:`), gets an `MTLDevice` called "Mali-G72", loads a library from a `.metallib` and builds a render pipeline (AIR
+  to SPIR-V to Bifrost in 47 to 61 ms). Then come a queue, a render pass and a read-back. A 256x256 triangle had **0 wrong pixels**:
+  19 602 inside and 43 486 outside were judged. It was read both with `getBytes:` and from an IOSurface's own memory (`--surface`).
+- **`MetalTri.app`, the same program as an application.** Metal renders into two 512x512 IOSurfaces in turn, and the window server shows
+  them as a layer's contents. Every frame is judged. On the panel: 29 frames, 29 right, about 5.6 ms a frame.
+
+The shaders were written by hand as AIR (`tools/metal/air/tri_*.ll`, assembled with `llvm-as`). `tools/metal/mkmetallib.py` puts them in a
+library, so nothing in this chain needs Xcode. PanVK (Mesa 25.0.7) and `libmetal2vulkan.dylib` (Rust 1.98.1, `aarch64-apple-ios`) were
+both built on the Linux build host.
+
+### What the iOS 27 port's Metal was
+
+It ran on **this same GPU**: iOS 27.0.1 on the Galaxy S9 (`profiles/ios-27.conf`, [ios27/METAL.md](ios27/METAL.md)). The stack was
+Starbite's:
+
+- Mesa **26.2.6** PanVK on the Mali-G72, with `PAN_I_WANT_A_BROKEN_VULKAN_DRIVER=1` and `MESA_VK_VERSION_OVERRIDE=1.2`;
+- metal2vulkan's runtime with the bridge;
+- the HotMetal2 frontend (from IOS-26-Hot, after AdrenoMetal);
+
+all of it in `StarbiteMetal.bundle`. The kernel's StarbiteAccelerator published `IOAcceleratorES` with `MetalPluginName` behind
+boot-arg `sbmtl=1`, so apps got their device the ordinary way: `MTLCreateSystemDefaultDevice()` loaded the plug-in. There was no AGX
+emulation and no MTLCompilerService; AIR was translated inside the process.
+
+What ran there:
+
+- `mtl27test`: the device "Mali-G72 MC18", the clear and the IOSurface render exact.
+- PosterBoard got a device, which took 20 s to open.
+- CoreAnimation in backboardd ran on Metal, with failures (XR10 sampling, no-copy buffers).
+
+The compositor stayed on OpenGL ES there too. The Adreno port's Metal ([metal-plan.md](metal-plan.md): hakios-metal, and metal2vulkan
+over Turnip) is a separate, earlier effort.
+
+**Reused here:**
+
+- the METAL=vk plug-in (`userland/src/metalvk/`: AdrenoMetal's frontend and the same bridge);
+- metal2vulkan at the same pin, with the same patches;
+- PanVK;
+- the kernel's existing `metal=N` switch on `IOAcceleratorES` (`MiniIOMobileFramebuffer.cpp`).
+
+**Not taken:** Mesa 26.2.6, which needs a host `mesa_clc`; 25.0.7 has been enough so far. `HakiosMetalVK.mm` now sets PanVK's two
+variables itself, only for that driver and only in a process the device is shown to.
+
+### The Astronomy wallpaper (AegirPoster)
+
+- **Why it aborts.** AegirPoster throws `NSInvalidArgumentException: -[__NSArrayM insertObject:atIndex:]: object cannot be nil` during
+  renderer setup. The throw stack, unslid against the 20F66 cache, goes from PosterKit through ClockKitUI
+  (+0x2973c, +0x8ad0, +0x29a6c, +0x2a558, +0x2b1d4) into NanoUniverse (+0xa7b4, beside `NUNILoadMtlTextureFromMemory`; then +0x168b0,
+  +0x15f3c, +0x14b74, +0x14b28), which throws. NanoUniverse puts a Metal object it never got (there is no device) into an array.
+- **Why it loops.** PosterBoard's gallery snapshotter (`GALLERY-(AegirPoster)-(Earth-Full)` and others) starts the extension, the extension
+  aborts, and the snapshot is retried. That was 23 aborts in 4 minutes after boot (two about every 10 s), plus the lock screen's.
+- **What it needs from Metal:**
+  - NanoUniverse's `default.metallib`, which is AIR that metal2vulkan can translate: 27 functions, the `aegir_*` earth, luna, saturn,
+    gaseous, starfield, sprite and post shaders;
+  - textures loaded from memory (its asset formats are still to be checked against what PanVK takes: the Mali has ASTC and ETC2, not
+    PVRTC);
+  - a CAMetalLayer in an extension process (drawables are IOSurfaces, which `--surface` shows work);
+  - XR10 formats on the layer (iOS 27 needed `supportsExtendedXR10Formats`);
+  - a device registered with Metal (discovery with `metal=2`) rather than opened by hand.
+- **Stopping the loop without Metal: there is no proper way.** The retries are PosterBoard's own, and they end only when a snapshot
+  succeeds. Hiding the extension (LaunchServices or PlugInKit) or planting snapshots would each be a hack. The cost is CPU: one short
+  process every few seconds. Leave it until `metal=2` works for PosterBoard's extensions.
+
+### Maps (VectorKit): the honest route
+
+- **The blocker is the shaders, not the GPU.** On 20F66, VectorKit ships its map shaders (`DaVinci::ground_*`, ribbons, flyover and the
+  rest) **only as Apple GPU binaries**: `VectorKit.framework/iphoneos.pipelinelib/pipelines.g11p` and the files beside it, `LPPM`
+  archives, one per AGX generation. Its `functions` file is empty, and `pipelines.desc` names a `default.metallib` that is not in the
+  image. The only AIR VectorKit has is `metal_libraries/AlloyCommonLibrary.metallib`, 13 clear and text functions. So no Metal plug-in can
+  draw the map from what is on the phone. It is the same wall as QuartzCore's missing `default.metallib` for the compositor.
+- **The route:**
+  1. `metal=2`, and MTLAddDevice, so that Maps gets the device by discovery.
+  2. The plug-in answers `newPipelineLibraryWithFilePath:` from `pipelines.desc`: pipeline names, function names, function-constant
+     hashes, formats.
+  3. The AIR for those functions comes from a VectorKit `default.metallib` that the user supplies from a matching release; the iOS
+     16.4/16.5 Simulator runtime's VectorKit is the closest. It is put in place on the user's own machine, as `tools/ca-metallib.py` does
+     for QuartzCore, and is never in this repository.
+  4. Then the frontend's gaps that VectorKit hits: argument buffers (refused today), its tile textures and formats, and memory
+     (Starbite's TLS and varying-buffer fixes, phase 4 above).
+- **Effort.** Steps 1 and 2: 3 to 5 days. Step 3: as soon as the owner has the Simulator runtime, then 1 to 2 weeks of working through the
+  `asked and not implemented` lists. Step 4: weeks. The blue dot and the tiles come back together, since both are drawn by VectorKit's
+  Metal. AegirPoster is the nearer target, because its AIR is on the phone, and should go first.
+
+### Opt-in, and what an image gets
+
+Nothing above is in the default build, and nothing here changes the OpenGL ES compositor:
+
+- PanVK is in an image only with `PANVK_DIR=`.
+- The plug-in is the Metal-on-Vulkan one only with `METAL=vk`.
+- The device is shown to a process only with `metal=N` or `HakiosMetal.clients`.
+- `metal_tri` and `MetalTri.app` are hand tests. The command line is
+  `metal_tri [--bundle DIR] [--metallib FILE] [--surface] [--out F.ppm]`. As an application (bundle identifier
+  `com.hakios.metaltri`) it takes everything from its own directory.
+
+Not yet ready for an image:
+
+- build.sh does not build `metal_tri` or `metal_tri.metallib`.
+- `tools/metal/mk-metal2vulkan.sh` has no Linux path. It assumes a Mac (`xcrun metal` for its self-test shaders, Xcode's `strip`), and on
+  git 2.34 its sparse checkout needs `git sparse-checkout init --cone` first. The hand build used
+  `CARGO_TARGET_AARCH64_APPLE_IOS_LINKER=xnu-clang`, with `SDKROOT` set to theos's iPhoneOS16.5 SDK.
