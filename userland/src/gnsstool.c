@@ -10,6 +10,13 @@
  *   gnsstool dump ADDR LEN FILE [CHUNK]  the same into FILE, CHUNK bytes per read (default 256)
  *   gnsstool meif ID [HEX] [SECONDS]     send one MEIF message to the chip's measurement engine (RPC 0x1E, "TxNav data"),
  *                                        then listen; ID and HEX in hex, HEX is the payload after the serial number
+ *   gnsstool esw [-r] [-n] [-2] [-x] [-l SECONDS] [FILE@ADDR ...]
+ *                                        put the engine in PASSTHROUGH and talk to the baseband's boot ROM as gpsd does:
+ *                                        handshake, then load each FILE at baseband address ADDR (hex) in checked blocks;
+ *                                        -r RESET first, -n no flow control, -2 clock doubler, -x GetOutOfLegacy at the end
+ *   gnsstool bri HEX [SECONDS]           raw bytes for the baseband in a MEIF PASS_THRU (in PASSTHROUGH), then listen
+ *
+ * MEIF_SERIAL in the environment sets the serial of the first MEIF message sent (meif, esw, bri; default 1).
  *
  * MEIF (gpsd's GlPe_MeIfImpl, the hub's GlMe_PeIfImpl): [u16 id][u16 len][u16 serial][payload][u16 sum], len counting
  * everything before the sum, the sum adding all those bytes; framed A5 93 ... A5 68 with every A5 inside doubled. RPC 0x1E
@@ -186,6 +193,8 @@ meif_print(const uint8_t *m, unsigned n)
 	putchar('\n');
 }
 
+static void meif_got(const uint8_t *m, unsigned n);
+
 /* RPC 0x1F, [u16 n][n bytes], the bytes A5 93 ... A5 68 framed MEIF */
 static void
 meif_rx(const uint8_t *d, unsigned len)
@@ -223,7 +232,7 @@ meif_rx(const uint8_t *d, unsigned len)
 					m[k++] = c;
 				}
 			} else if (c == 0x68) {
-				meif_print(m, k);
+				meif_got(m, k);
 				st = 0;
 			} else {
 				st = c == 0x93 ? 1 : 0;
@@ -380,6 +389,491 @@ peek(uint32_t addr, uint16_t len, uint8_t *out)
 	return 0;
 }
 
+/*
+ * The baseband's boot ROM interface ("bri"), reached through the measurement engine's PASSTHROUGH state, as gpsd's host
+ * measurement engine does it (GlMeSrdAsicinit; docs/gnss.md has the protocol). CONTROL(PASSTHROUGH) makes the chip
+ * forward the bytes of every MEIF 0x8002 PASS_THRU ([u16 n][n bytes]) to the baseband as they are, and send the
+ * baseband's bytes back the same way. The boot ROM's messages are `ff|fe <n> fd <cmd> <args> fc`; its answers start
+ * `fe 00 fd` and are 9 bytes (flow control 0x0f, clock doubler 0x86/0x06) or 13 (a read, 0x?9: address, data; a block
+ * check, 0x?a: address, 24-bit byte sum, CRC-8).
+ */
+static unsigned meif_serial = 1;        /* the serial of the next MEIF message sent */
+static int meif_last_state = -1;        /* the new state of the last STATE_REPORT */
+static unsigned meif_refused;           /* NACKs and ERRORs seen */
+static uint8_t bri_acc[16];
+static unsigned bri_acc_n;
+static uint8_t bri_q[8][13];            /* complete answers not yet taken */
+static unsigned bri_qn;
+static unsigned long bri_rx_bytes;
+static int bri_verbose = 1;
+
+static void
+bri_rx(const uint8_t *d, unsigned n)
+{
+	bri_rx_bytes += n;
+	if (bri_verbose) {
+		printf("    baseband %u bytes:", n);
+		for (unsigned i = 0; i < n && i < 48; i++) {
+			printf(" %02x", d[i]);
+		}
+		printf("%s\n", n > 48 ? " ..." : "");
+	}
+	for (unsigned i = 0; i < n; i++) {
+		uint8_t c = d[i];
+		unsigned len;
+
+		if (bri_acc_n == 0 && c != 0xfe) {
+			continue;
+		}
+		bri_acc[bri_acc_n++] = c;
+		len = bri_acc_n;
+		if ((len == 9 && bri_acc[8] == 0xfc && bri_acc[1] == 0 && bri_acc[2] == 0xfd &&
+		    (bri_acc[3] == 0x0f || (bri_acc[3] | 0x80) == 0x86)) ||
+		    (len == 13 && bri_acc[12] == 0xfc && bri_acc[1] == 0 && bri_acc[2] == 0xfd)) {
+			if (bri_qn < 8) {
+				memset(bri_q[bri_qn], 0, 13);
+				memcpy(bri_q[bri_qn++], bri_acc, len);
+			}
+			bri_acc_n = 0;
+		} else if (len >= 13) {
+			/* garbage: start again at the next fe */
+			unsigned j = 1;
+
+			while (j < len && bri_acc[j] != 0xfe) {
+				j++;
+			}
+			memmove(bri_acc, bri_acc + j, len - j);
+			bri_acc_n = len - j;
+		}
+	}
+}
+
+/* a whole MEIF message from the chip: the baseband's bytes to the bri parser, the rest printed */
+static void
+meif_got(const uint8_t *m, unsigned n)
+{
+	unsigned id = n >= 2 ? (unsigned)(m[0] | m[1] << 8) : 0xffff;
+
+	if (id == 0x8002 && n >= 10) {
+		unsigned c = m[6] | m[7] << 8;
+
+		bri_rx(m + 8, c <= n - 10 ? c : n - 10);
+		return;
+	}
+	if (id == 4 && n >= 10) {
+		meif_last_state = m[8] | m[9] << 8;
+	}
+	if (id == 1 || id == 2) {
+		meif_refused++;
+	}
+	meif_print(m, n);
+}
+
+/* one MEIF message to the chip, framed, in RPCs 0x1E of at most 990 framed bytes; 0 when every RPC was acknowledged */
+static int
+meif_send(unsigned id, const uint8_t *p, unsigned plen)
+{
+	static uint8_t msg[2200], fr[4500], q[3 + 1000];
+	unsigned n = 6 + plen, sum = 0, k = 0;
+
+	if (plen > 2100) {
+		return -1;
+	}
+	memcpy(msg + 6, p, plen);
+	if (n & 1) {
+		msg[n++] = 0;   /* the length is always even (gpsd asserts it); the chip allows the pad byte */
+	}
+	msg[0] = (uint8_t)id;
+	msg[1] = (uint8_t)(id >> 8);
+	msg[2] = (uint8_t)n;
+	msg[3] = (uint8_t)(n >> 8);
+	msg[4] = (uint8_t)meif_serial++;
+	msg[5] = 0;
+	for (unsigned i = 0; i < n; i++) {
+		sum += msg[i];
+	}
+	msg[n] = (uint8_t)sum;
+	msg[n + 1] = (uint8_t)(sum >> 8);
+	fr[k++] = 0xa5;
+	fr[k++] = 0x93;
+	for (unsigned i = 0; i < n + 2; i++) {
+		fr[k++] = msg[i];
+		if (msg[i] == 0xa5) {
+			fr[k++] = 0xa5;
+		}
+	}
+	fr[k++] = 0xa5;
+	fr[k++] = 0x68;
+	for (unsigned off = 0; off < k;) {
+		unsigned c = k - off < 990 ? k - off : 990;
+		struct rec *r;
+
+		q[0] = 'R';
+		q[1] = 0x1e;
+		q[2] = 0;
+		q[3] = (uint8_t)c;
+		q[4] = (uint8_t)(c >> 8);
+		memcpy(q + 5, fr + off, c);
+		put(q, 5 + c);
+		r = answer('A', 8);
+		if (r == NULL || !r->flags) {
+			printf("RPC 0x1e (MEIF 0x%x serial %u): %s\n", id, msg[4], r == NULL ? "no word from the kernel" :
+			    "NOT acknowledged");
+			return -1;
+		}
+		off += c;
+	}
+	return 0;
+}
+
+/* bytes for the baseband, in PASS_THRU messages of at most 900 */
+static int
+bri_send(const uint8_t *d, unsigned n)
+{
+	static uint8_t p[2 + 900];
+
+	while (n > 0) {
+		unsigned c = n < 900 ? n : 900;
+
+		p[0] = (uint8_t)c;
+		p[1] = (uint8_t)(c >> 8);
+		memcpy(p + 2, d, c);
+		if (meif_send(0x8002, p, 2 + c) != 0) {
+			return -1;
+		}
+		d += c;
+		n -= c;
+	}
+	return 0;
+}
+
+/* handle what the chip sends for up to `t` seconds; stop early at a bri answer with command `cmd` (0x09 and 0x0a match
+ * on the low four bits) and copy it to `out`. 1 when it came */
+static int
+bri_wait(int cmd, double t, uint8_t *out)
+{
+	static struct rec r;
+	double end = now() + t;
+
+	for (;;) {
+		for (unsigned i = 0; i < bri_qn; i++) {
+			uint8_t c = bri_q[i][3];
+			int hit = cmd == 0x09 || cmd == 0x0a ? (c & 0x0f) == cmd : c == cmd;
+
+			if (hit) {
+				if (out != NULL) {
+					memcpy(out, bri_q[i], 13);
+				}
+				memmove(bri_q[i], bri_q[i + 1], (bri_qn - i - 1) * 13);
+				bri_qn--;
+				return 1;
+			}
+		}
+		if (now() >= end || !next_rec(&r, end - now())) {
+			return 0;
+		}
+		if (r.kind != 'A') {
+			print_rec(&r);
+			fflush(stdout);
+		}
+	}
+}
+
+/* CRC-8, polynomial 0x4d, MSB first, from 0 (GlUtlCrc; the baseband's block check) */
+static uint8_t
+crc8_4d(const uint8_t *d, unsigned n)
+{
+	uint8_t c = 0;
+
+	while (n--) {
+		c ^= *d++;
+		for (int b = 0; b < 8; b++) {
+			c = (uint8_t)(c & 0x80 ? (c << 1) ^ 0x4d : c << 1);
+		}
+	}
+	return c;
+}
+
+static uint32_t
+le32(const uint8_t *p)
+{
+	return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+/* bri: read a baseband register (`ff 00 fd 09 <addr> fc`); 0 and *val when answered */
+static int
+bri_read(uint32_t addr, uint32_t *val)
+{
+	uint8_t m[9] = { 0xff, 0x00, 0xfd, 0x09, (uint8_t)addr, (uint8_t)(addr >> 8), (uint8_t)(addr >> 16),
+		(uint8_t)(addr >> 24), 0xfc }, a[13];
+
+	for (int t = 0; t < 3; t++) {
+		if (bri_send(m, sizeof(m)) != 0) {
+			return -1;
+		}
+		while (bri_wait(0x09, 0.5, a)) {
+			if (le32(a + 4) == addr) {
+				*val = le32(a + 8);
+				return 0;
+			}
+		}
+	}
+	return -1;
+}
+
+/* bri: write `size` bytes at `addr` (`fe <words-1> fd 4c <addr> <data> fc`, a last partial word rewritten whole) and
+ * check them (`fe 00 fd 4a <addr> <u16 size> fc`, answered with the address, the byte sum and the CRC-8) */
+static int
+bri_block(const uint8_t *d, uint32_t addr, unsigned size)
+{
+	static uint8_t m[8 + 4096 + 32];
+	unsigned body = size & ~3u, tail = size & 3u, sum = 0;
+	uint8_t crc = crc8_4d(d, size), a[13];
+
+	if (size < 4 || size > 4096) {
+		return -1;
+	}
+	for (unsigned i = 0; i < size; i++) {
+		sum += d[i];
+	}
+	for (int t = 0; t < 3; t++) {
+		unsigned k = 0;
+		uint32_t at = addr + size - 4;
+
+		m[k++] = 0xfe;
+		m[k++] = (uint8_t)(body / 4 - 1);
+		m[k++] = 0xfd;
+		m[k++] = 0x4c;
+		for (int i = 0; i < 4; i++) {
+			m[k++] = (uint8_t)(addr >> (8 * i));
+		}
+		memcpy(m + k, d, body);
+		k += body;
+		m[k++] = 0xfc;
+		if (tail) {
+			m[k++] = 0xfe;
+			m[k++] = 0x00;
+			m[k++] = 0xfd;
+			m[k++] = 0x4c;
+			for (int i = 0; i < 4; i++) {
+				m[k++] = (uint8_t)(at >> (8 * i));
+			}
+			memcpy(m + k, d + size - 4, 4);
+			k += 4;
+			m[k++] = 0xfc;
+		}
+		m[k++] = 0xfe;
+		m[k++] = 0x00;
+		m[k++] = 0xfd;
+		m[k++] = 0x4a;
+		for (int i = 0; i < 4; i++) {
+			m[k++] = (uint8_t)(addr >> (8 * i));
+		}
+		m[k++] = (uint8_t)size;
+		m[k++] = (uint8_t)(size >> 8);
+		m[k++] = 0xfc;
+		if (bri_send(m, k) != 0) {
+			return -1;
+		}
+		while (bri_wait(0x0a, 2.0, a)) {
+			uint32_t ra = le32(a + 4), rs = a[8] | a[9] << 8 | a[10] << 16;
+
+			if (ra != addr) {
+				printf("  block %05x: a check answer for %05x, ignored\n", addr, ra);
+				continue;
+			}
+			if (rs == (sum & 0xffffff) && a[11] == crc) {
+				return 0;
+			}
+			printf("  block %05x (%u bytes): sum %06x crc %02x, expected %06x %02x\n", addr, size, rs, a[11],
+			    sum & 0xffffff, crc);
+			break;
+		}
+		if (t < 2) {
+			printf("  block %05x: no good check answer, try %d\n", addr, t + 2);
+		}
+	}
+	return -1;
+}
+
+/*
+ * gnsstool esw [-r] [-n] [-2] [-x] [-l SECS] [FILE@ADDR ...]: PASSTHROUGH, then gpsd's boot ROM sequence: autobaud,
+ * flow control, the hardware version, the debug register, then each FILE written at baseband address ADDR (hex) in
+ * blocks of 1020 bytes, each checked. -r: CONTROL(RESET) first. -n: no flow control set. -2: the clock doubler on for
+ * the load. -x: GetOutOfLegacy at the end (start the ESW). -l: listen SECS at the end (default 3). With no FILE only the
+ * handshake is done.
+ */
+static int
+esw_main(int argc, char **argv)
+{
+	static const uint8_t autobaud[16] = { 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+		0x80, 0x80, 0x80, 0x80 };
+	/* gpsd with hardware flow control: `ff 00 fd 0f 01 33 0e 10 fc` and the register write that goes with it; the
+	 * answer echoes the setting */
+	static const uint8_t hwflow[9] = { 0xff, 0x00, 0xfd, 0x0f, 0x01, 0x33, 0x0e, 0x10, 0xfc };
+	static const uint8_t hwflow2[17] = { 0xfe, 0x01, 0xfd, 0x43, 0x30, 0x01, 0x00, 0xc0, 0x01, 0x00, 0x80, 0x80, 0x80,
+		0x80, 0x80, 0x80, 0xfc };
+	static uint8_t img[256 * 1024];
+	int reset = 0, flow = 1, clk2x = 0, out_of_legacy = 0, ok = 0;
+	double listen_end = 3, t0;
+	const char *seq = getenv("MEIF_SERIAL");
+	uint8_t st[2], a[13];
+	unsigned total = 0, blocks = 0;
+	uint32_t v;
+	int i;
+
+	for (i = 2; i < argc && argv[i][0] == '-'; i++) {
+		switch (argv[i][1]) {
+		case 'r': reset = 1; break;
+		case 'n': flow = 0; break;
+		case '2': clk2x = 1; break;
+		case 'x': out_of_legacy = 1; break;
+		case 'l': listen_end = i + 1 < argc ? atof(argv[++i]) : 3; break;
+		default: fprintf(stderr, "gnsstool esw: unknown option %s\n", argv[i]); return 2;
+		}
+	}
+	meif_serial = seq ? (unsigned)atoi(seq) : 1;
+	if (reset) {
+		st[0] = 0;
+		st[1] = 0;
+		printf("CONTROL(RESET)\n");
+		if (meif_send(3, st, 2) != 0) {
+			return 1;
+		}
+		bri_wait(-1, 1.5, NULL);
+	}
+	st[0] = 10;
+	st[1] = 0;
+	printf("CONTROL(PASSTHROUGH), serial %u\n", meif_serial);
+	meif_last_state = -1;
+	meif_refused = 0;
+	if (meif_send(3, st, 2) != 0) {
+		return 1;
+	}
+	for (double end = now() + 3; now() < end && meif_last_state != 10 && meif_refused == 0;) {
+		bri_wait(-1, 0.1, NULL);
+	}
+	if (meif_last_state != 10) {
+		printf("no PASSTHROUGH state report (last state %d, %u refusals); going on anyway\n", meif_last_state,
+		    meif_refused);
+	}
+	if (reset) {
+		meif_serial = 1;        /* after a RESET the chip wants serial 1 next; CONTROL messages are not counted */
+	}
+
+	for (int t = 0; t < 3 && !ok; t++) {
+		printf("bri: autobaud%s (try %d)\n", flow ? ", hardware flow control" : "", t + 1);
+		if (bri_send(autobaud, sizeof(autobaud)) != 0) {
+			return 1;
+		}
+		if (!flow) {
+			ok = 1;
+			break;
+		}
+		if (bri_send(hwflow, sizeof(hwflow)) != 0 || bri_send(hwflow2, sizeof(hwflow2)) != 0) {
+			return 1;
+		}
+		if (bri_wait(0x0f, 0.6, a)) {
+			printf("bri: flow control answer %02x %02x %02x %02x%s\n", a[4], a[5], a[6], a[7],
+			    a[4] == 1 && a[5] == 0x33 && a[6] == 0x0e && a[7] == 0x10 ? " (set)" : " (unexpected)");
+			ok = 1;
+		}
+	}
+	if (!ok) {
+		printf("bri: no flow control answer; going on\n");
+	}
+	if (bri_read(0xc0000000, &v) != 0) {
+		printf("bri: no hardware version: the boot ROM does not answer\n");
+		bri_wait(-1, listen_end, NULL);
+		printf("next MEIF serial %u\n", meif_serial);
+		return 1;
+	}
+	printf("bri: hardware version 0x%08x\n", v);
+	if (bri_read(0xc0000a54, &v) == 0) {
+		printf("bri: debug register 0x%08x: debugger %s\n", v, v & 4 ? "detected" : "not detected");
+	} else {
+		printf("bri: no answer for the debug register\n");
+	}
+	if (clk2x) {
+		static const uint8_t on[9] = { 0xff, 0x00, 0xfd, 0x86, 0xff, 0x00, 0xaa, 0x55, 0xfc };
+
+		bri_send(on, sizeof(on));
+		printf("bri: clock doubler on: %s\n", bri_wait(0x86, 0.6, a) ? "answered" : "no answer");
+	}
+
+	/* the segments, in the order given (gpsd: 0x5fdf0, 0x78000, then the 12 bytes at 0x5fff0) */
+	t0 = now();
+	bri_verbose = 0;
+	for (; i < argc; i++) {
+		char path[512];
+		const char *at = strrchr(argv[i], '@');
+		uint32_t addr;
+		size_t len;
+		FILE *f;
+
+		if (at == NULL || (size_t)(at - argv[i]) >= sizeof(path)) {
+			fprintf(stderr, "gnsstool esw: %s is not FILE@ADDR\n", argv[i]);
+			return 2;
+		}
+		memcpy(path, argv[i], (size_t)(at - argv[i]));
+		path[at - argv[i]] = 0;
+		addr = (uint32_t)strtoul(at + 1, NULL, 16);
+		f = fopen(path, "rb");
+		if (f == NULL) {
+			perror(path);
+			return 1;
+		}
+		len = fread(img, 1, sizeof(img), f);
+		fclose(f);
+		if (len < 4 || (len & 3)) {
+			fprintf(stderr, "gnsstool esw: %s: %zu bytes, not whole words\n", path, len);
+			return 2;
+		}
+		printf("esw: %s, %zu bytes at %05x\n", path, len, addr);
+		fflush(stdout);
+		for (size_t off = 0; off < len;) {
+			size_t rem = len - off, sz = rem;
+
+			if (rem > 1020) {
+				sz = rem - 1020 < 4 ? 1016 : 1020;   /* never leave less than a word (gpsd's patch loader) */
+			}
+			if (bri_block(img + off, addr + (uint32_t)off, (unsigned)sz) != 0) {
+				printf("esw: block at %05x failed; stopping\n", addr + (uint32_t)off);
+				bri_verbose = 1;
+				bri_wait(-1, listen_end, NULL);
+				printf("next MEIF serial %u\n", meif_serial);
+				return 1;
+			}
+			off += sz;
+			total += (unsigned)sz;
+			blocks++;
+		}
+	}
+	bri_verbose = 1;
+	if (blocks > 0) {
+		printf("esw: %u bytes in %u blocks written and checked, %.1f s\n", total, blocks, now() - t0);
+	}
+	if (clk2x) {
+		static const uint8_t off[9] = { 0xff, 0x00, 0xfd, 0x06, 0xff, 0x00, 0xaa, 0x55, 0xfc };
+
+		bri_send(off, sizeof(off));
+		printf("bri: clock doubler off: %s\n", bri_wait(0x06, 0.6, a) ? "answered" : "no answer");
+	}
+	if (out_of_legacy) {
+		static const uint8_t gool[9] = { 0xff, 0x00, 0xfd, 0x05, 0x55, 0xaa, 0x00, 0xff, 0xfc };
+
+		printf("bri: GetOutOfLegacy\n");
+		bri_rx_bytes = 0;
+		bri_send(gool, sizeof(gool));
+	}
+	bri_wait(-1, listen_end, NULL);
+	if (out_of_legacy) {
+		printf("esw: %lu bytes from the baseband after GetOutOfLegacy\n", bri_rx_bytes);
+	}
+	printf("next MEIF serial %u\n", meif_serial);
+	return 0;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -448,6 +942,20 @@ main(int argc, char **argv)
 		    r->flags ? "acknowledged" : "NOT acknowledged");
 		fflush(stdout);
 		listen_for(argc > 4 ? atof(argv[4]) : 5);
+	} else if (strcmp(cmd, "esw") == 0) {
+		return esw_main(argc, argv);
+	} else if (strcmp(cmd, "bri") == 0 && argc > 2) {
+		static uint8_t b[4096];
+		unsigned n = (unsigned)unhex(argv[2], b, sizeof(b));
+		const char *seq = getenv("MEIF_SERIAL");
+
+		meif_serial = seq ? (unsigned)atoi(seq) : 1;
+		if (bri_send(b, n) != 0) {
+			return 1;
+		}
+		printf("%u bytes for the baseband sent; next MEIF serial %u\n", n, meif_serial);
+		fflush(stdout);
+		bri_wait(-1, argc > 3 ? atof(argv[3]) : 3, NULL);
 	} else if (strcmp(cmd, "ssp") == 0 && argc > 5) {
 		uint8_t d[64];
 		size_t n = argc > 6 ? unhex(argv[6], d, sizeof(d)) : 0;
@@ -514,7 +1022,8 @@ main(int argc, char **argv)
 		fprintf(stderr, "\rgnsstool: %u bytes from %08x in %.1f s\n", len, a, now() - t0);
 	} else {
 		fprintf(stderr, "usage: gnsstool listen [SECONDS] | rpc|prpc ID [HEX] [SECONDS] | ssp CMD OPTS ARG LEN [HEX] |\n"
-		    "                peek ADDR [LEN] | dump ADDR LEN FILE [CHUNK] | meif ID [HEX] [SECONDS]\n"
+		    "                peek ADDR [LEN] | dump ADDR LEN FILE [CHUNK] | meif ID [HEX] [SECONDS] |\n"
+		    "                esw [-r] [-n] [-2] [-x] [-l SECONDS] [FILE@ADDR ...] | bri HEX [SECONDS]\n"
 		    "                (numbers in hex, CHUNK decimal)\n");
 		return 2;
 	}
