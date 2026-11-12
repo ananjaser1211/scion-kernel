@@ -251,6 +251,21 @@ Offline, before the next try:
   (`meif 6 0100 01801000 ff000000 ffffffff 00000000`); REQ_CURRENT; RESET; read the log and the state; then IDLE. If the log
   shows the ESW not loading, add `esw_ctrl:` by SW_UPLOAD 0x8000.
 
+Build 32, cold boot. Sent pin mux and `1c 01`, then the logging CONFIG_SET: **ACK**, but no log text came. REQ_CURRENT:
+SETUP. RESET: ACK, then RESET -> SETUP, no assert. REQ_CURRENT: SETUP. After that, the logging CONFIG_SET and IDLE were
+both **NACKed**. The control handler (0x0081b214) explains at least the IDLE NACK:
+- It acts on a CONTROL only when the pending target `[ME+8]` is -1 (none), or when the request is RESET.
+- If the target equals the request, nothing is done.
+- Otherwise it NACKs with "Trans in progress".
+- **REQ_CURRENT itself sets the target to the current state** (0x0081b4b0: `target = current`).
+
+So, once the ME is loaded, a REQ_CURRENT probe leaves target = SETUP behind, and every following CONTROL is refused.
+Before RESET the ME is not loaded, and the target is cleared. gpsd never sends REQ_CURRENT in this phase. **Rule: after
+RESET, do not probe with REQ_CURRENT. Read the state from the STATE_REPORTs the chip sends by itself.** The chip's log
+did not come out by any route: not as MEIF DEBUG/LOGGING, not in the hub's log RPCs, and not as readable text in RAM
+0x00900000-0x0091fd00, which was dumped with peek. CORE_ON in Samsung's `ssp_bbd.c` only sets `IsGpsWorking`. The only
+supply Samsung's kernel switches is vdd_mcu_1p8 (LDO37); the baseband's power is the chip's own business.
+
 ## The tools (kernel and userland)
 
 - `/dev/hakios-gnss` (made at `shub=6`, root only; `drivers/input/ssp/hakios.ssp.c`): every RPC from the hub that is
