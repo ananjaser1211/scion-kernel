@@ -17,7 +17,9 @@
  */
 static const uint64_t exynos9810_extra_ram[][2] = {
 	{ 0x80200000, 0x8F000000 }, { 0x98000000, 0xAF800000 }, { 0xB1800000, 0xB8000000 }, { 0xB8200000, 0xC0000000 },
-	{ 0xC0080000, 0xCC000000 }, { 0xE3700000, 0xF0000000 }, { 0, 0 },
+	{ 0xC0080000, 0xCC000000 }, { 0xE3700000, 0xF0000000 },
+	/* The main window has already been claimed and is no longer ConventionalMemory; collect any other high-bank pieces. */
+	{ 0x880000000, 0xA00000000 }, { 0, 0 },
 };
 
 static const struct platform platform_starlte = {
