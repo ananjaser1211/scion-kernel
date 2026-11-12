@@ -583,6 +583,41 @@ Version received: Asic 0x3000000F, IFC 132, Radio 0x03"**, then **STATE_REPORT S
     triggered from the PVT side; `GnssPvtDataStart` 0x1C and the PVT data RPC 0x1E's "DC" special case are the
     candidates.
 
+**The open question, answered: `gnss_start` is the trigger** (read offline and checked with peek, 22:45).
+- The vtable 0x0082e9e4 class is not an RPC client. It is a **call recorder** wrapped around the hub's ME engine, GulpMeChinookEngine, whose
+  object sits at wrapper+20 with vtable 0x0082ec40. Each slot does three things: if tracing is on (0x00810176), it writes a record with
+  the tag and the arguments (1..17 for a call, 0x81.. for its return; 0x00818934 / 0x00818ad8 build the record); it calls the real
+  method; and it writes the return record. So tag 15 is a trace tag. No transport id is behind it, and nobody has to answer it.
+- The wrapper is built by 0x0080fc1a (from 0x00808594, at core+0x1fcb8, returned by the core's vtable 0x0082e5a8 slot 4). Its
+  pointer is also kept at `[0x008e78f8 + 0xb874]` (0x008f316c). A peek of that object shows vtable 0x0082e9e4.
+- The caller of slot 14 is the GNSS task's **event 0x200 handler** (0x00805f20, entry 9 of the event table that 0x00806058 fills in at
+  0x0090dfa4). It calls `[ctx+0xb874]->slot14(a, b, c)` with the three words at 0x0090e728.
+- Those words are written by 0x00805ef4 `(period s, flags, constellation mask)`, which posts event 0x200 **only if they changed**. Its
+  callers are `StartGnssRequest` (0x00803a30): period = FixIntMs/1000, flags 0x200008 or 0x204208; and the stop path (0x00803ae8):
+  zeros. `BrcmGnssStart` (`gnss_start`) calls StartGnssRequest. So **`gnsstool pvt gnss_start` with the engine ON gives
+  `UpdateOnchipRequest : Start 1` -> `Asic On`, then `LoadMeasEngine`**. Earlier attempts saw nothing because the engine was not ON
+  then, or because the words already held the same values.
+
+**ASIC on, first search** (22:50, the build-33 boot, phone at a window).
+- `pvt gnss_start` after ON: Asic On, the ME loads, the baseband runs bri again ("Exiting Legacy", "INIT_STAGE C: Received
+  Heartbeat"), and MicroNav starts (`HybridMode BatchMeasAndPvt`, `SIGAID(32)`: a full-sky search over GPS 1-32 with no aiding).
+  The engine sends one `ONCHIP_NMEA` GGA/RMC/PGLOR per second, with no fix.
+- **Indoor detection turns it off again**: after 16 s with no satellites, it logs "Indoor Detected", the request period becomes 600 s,
+  and `Asic Off`. **`pvt disable_indoor`** stops that. The ASIC then stays on, with `ProcessPowerCycleLogic ... Asic On, 1000` every
+  second. (`disable_indoor` re-evaluates the slots by itself. Slot 0 from the earlier 0x818E a=1 b=1 request now counts too, because
+  loading the ME set the last-location time.)
+- Result after about 12 minutes with the ASIC on: **Sats(0)**, "No sats@N", and no `Strong Sats Acquired`. The AGC report every 5 s
+  gives GPS_GAL AAGC 8.00 dB (sometimes 11.52), GLO 15.96 to 18.46 dB, and BDS about 24 dB. The pin mux 0x34 `[17][1]` (external
+  LNA), sent while the search ran, changed nothing.
+- The chip's RF defaults match gps.xml: `SetRfType(35)` = GL_RF_4755_BRCM_EXT_LNA, LNA mask 1 (L1_EXT_ON). The one difference is
+  `SetPikeRfMode(3)` = L1_LP where gps.xml has L1 (1). The chip's ONCHIP_CONFIG parser knows only `indoor_logic:` and `lte_filter:`.
+- gnsstool now masks every text record (hub log lines included): numbers with four or more decimals, and the latitude and
+  longitude fields of GGA/RMC/GLL/GNS. The engine's noise statistics are the one exception (they carry no position).
+- Next: the same test outdoors or at an open window, on a cold chip, with the pin mux sent before the ESW load, and with
+  `disable_indoor` before `gnss_start`. If there are still no detections, read the ME's detection table and noise statistics. The
+  ME prints them when it unloads, so turn indoor detection back on and let the ASIC go off. That shows whether the RF path or the
+  external LNA is dead. Aiding (time from the AP's clock, a coarse position) is the step after that.
+
 **Integration, when it works.**
 - **Firmware**: `devices/star2lte/firmware/gnss/` holds a README and SHA256SUMS only. `tools/fetch-firmware.sh`
   extracts the three 4775_B0 segments from the user's own gpsd: `--from DIR`, or the pinned vendor tree if it has
