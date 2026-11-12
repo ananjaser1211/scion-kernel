@@ -569,6 +569,20 @@ Version received: Asic 0x3000000F, IFC 132, Radio 0x03"**, then **STATE_REPORT S
 - Next step, offline: identify the RPC or MEIF behind 0x008100b2. It may be a TxNav or PVT RPC that lhd sends on gpsd's
   behalf (lhd's encoders do not include it), or a MEIF/PEX message. Then send `period = 1` after ON on a cold chip.
 
+- The function at 0x008100b2 is slot 14 of a patch RPC class. Its vtable starts at 0x0082e9e4; the slots are
+  0x0086311d, 0x0086310b, 0x0080fc4d, ... 0x0081006f (slot 13), **0x008100b3 (slot 14)**, 0x0080fda5, ...
+- Each slot is a transaction with a tag passed in r3: 1, 2, ... 14, 15 for the request, and 0x81, 0x82, ... 0x8e for
+  the answer. That is an RPC *client* inside the hub. Slot 14 (tag 15) receives three u32s and passes them to
+  0x00818de0 -> `UpdateOnchipRequest(period != 0, period)`.
+- **Open question for the next agent**: who serves that RPC, and with which global RPC id (the transport id, not the
+  per-class tag)?
+  - It may be the host (lhd), the ROM's GNSS service, or the hub talking to itself.
+  - The tag-to-id mapping is in the helpers 0x0080fee2 / 0x0080fef4 / 0x00818934. Read them, then look for the id in
+    lhd's decoders (`lhd.ann`) and in the ROM's RPC tables (0x00022000-0x00023400).
+  - If the hub expects the AP to answer with the period, gnsstool can answer it. Otherwise the call may have to be
+    triggered from the PVT side; `GnssPvtDataStart` 0x1C and the PVT data RPC 0x1E's "DC" special case are the
+    candidates.
+
 **Integration, when it works.**
 - **Firmware**: `devices/star2lte/firmware/gnss/` holds a README and SHA256SUMS only. `tools/fetch-firmware.sh`
   extracts the three 4775_B0 segments from the user's own gpsd: `--from DIR`, or the pinned vendor tree if it has
