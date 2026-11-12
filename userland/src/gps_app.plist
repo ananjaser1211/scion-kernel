@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+	Info.plist of HakiosGPS.app (src/gps_app.m). The shape is src/triangle_app.plist's,
+	which says where each key comes from; what differs:
+
+	  CFBundleDisplayName GPS, CFBundleIdentifier com.hakios.gps.
+
+	  CFBundleURLTypes -> hakiosgps:
+		hakiosgps:// opens it (uiopen, or /redwood/bin/battery_test open);
+		hakiosgps://start and hakiosgps://pause press its buttons.
+
+	  UIStatusBarHidden false, no UIRequiresFullScreen
+		an ordinary application with the clock and the battery above it: it is used
+		while walking about, and the battery matters then.
+
+	  UIUserInterfaceStyle absent
+		it follows the system's light or dark appearance; every colour in it is either
+		a system colour or reads on both.
+
+	NO UIApplicationSceneManifest: the application delegate's own window, as in the triangle.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>GPS</string>
+	<key>CFBundleExecutable</key>
+	<string>HakiosGPS</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.hakios.gps</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>HakiosGPS</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleSignature</key>
+	<string>????</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array>
+		<string>iPhoneOS</string>
+	</array>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>CFBundleIcons</key>
+	<dict>
+		<key>CFBundlePrimaryIcon</key>
+		<dict>
+			<key>CFBundleIconFiles</key>
+			<array>
+				<string>AppIcon60x60</string>
+			</array>
+			<key>CFBundleIconName</key>
+			<string>AppIcon</string>
+		</dict>
+	</dict>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.hakios.gps</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>hakiosgps</string>
+			</array>
+		</dict>
+	</array>
+	<key>DTPlatformName</key>
+	<string>iphoneos</string>
+	<key>DTSDKName</key>
+	<string>iphoneos16.5</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>MinimumOSVersion</key>
+	<string>16.0</string>
+	<key>UIApplicationSupportsIndirectInputEvents</key>
+	<true/>
+	<key>UIDeviceFamily</key>
+	<array>
+		<integer>1</integer>
+	</array>
+	<key>UILaunchScreen</key>
+	<dict>
+		<key>UILaunchScreen</key>
+		<dict/>
+	</dict>
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>arm64</string>
+	</array>
+	<key>UIStatusBarHidden</key>
+	<false/>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+	</array>
+</dict>
+</plist>

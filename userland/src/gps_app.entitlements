@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+	What HakiosGPS.app is signed with: the same three as src/triangle_app.entitlements, which
+	says why (none is needed to run here; they are the known-good shape of an application
+	in /Applications with no data container). Nothing about location: the application never
+	asks locationd anything, it reads gnssd's status file and posts gnssd's notifications,
+	and neither needs an entitlement.
+-->
+<plist version="1.0">
+<dict>
+	<key>application-identifier</key>
+	<string>com.hakios.gps</string>
+	<key>com.apple.private.security.no-container</key>
+	<true/>
+	<key>platform-application</key>
+	<true/>
+</dict>
+</plist>
