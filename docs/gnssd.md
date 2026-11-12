@@ -55,23 +55,34 @@ sequence is in gnssd. The chip does not produce satellites yet, so no real fix h
 ## The daemon
 
 ```
-gnssd [-L gpsd|sim] [-f FWDIR] [-n NMEA] [-t] [-a] [-i MS]
+gnssd [-L gpsd|sim] [-f FWDIR] [-n NMEA] [-t] [-a] [-i MS] [-c S]
 gnssd parse [FILE]        # NMEA -> per epoch: fix type, satellites, DOP, accuracy (never the position)
 gnssd segments [FWDIR]    # the ESW pieces the chip is given
 ```
+`-c S`: the engine's search statistics every S seconds while no satellite is in view (default 120; 0 never), below.
 
 **(a) The chip** (`chip_bringup()` in gnssd, the protocol in `gnss_chip.c`). A thread of its own owns
-`/dev/hakios-gnss` while the receiver is wanted. It runs gnss.md's sequence:
-1. Wait until 3 minutes after boot: hub log facilities set earlier upset the RPC channel.
-2. Pin mux RPC 0x34 `[17][1]` (the external LNA).
-3. `enable_log_to_host_LOG_INFO_Overwrite`, then log facilities 0x0e, 0x16, 0x4f, 0x97, 2 s apart, once per gnssd run,
+`/dev/hakios-gnss` while the receiver is wanted. It runs gnss.md's best-known sequence (the d8957eb run):
+1. Wait until 3 minutes after boot: hub log facilities set earlier upset the RPC channel. A Start pressed earlier
+   waits; the status says `step` = "waiting for the hub (N s more)" and the app "Waiting for the hub...".
+2. The AR table cut (`gc_ar_table_cut()`): peek 0x008300b0; if it holds the hub patch's table (`04 00 00 00 2a 00 00
+   00`), RPC 0x05 `b0008300 0200 ffff` and a peek to check it. Skipped, with a log line, when the peek does not answer
+   (no `shub_peek=1`), shows something else, or does not show the write. Already cut since the hub started counts as
+   cut (`arTableCut`).
+3. Pin mux RPC 0x34 `[17][1]` (the external LNA).
+4. `enable_log_to_host_LOG_INFO_Overwrite`, then log facilities 0x0e, 0x16, 0x4f, 0x97, 2 s apart, once per gnssd run,
    never in a loop.
-4. RPC 0x1C `01`.
-5. The ESW: RESET, PASSTHROUGH, bri handshake, every block's sum and CRC-8 checked, GetOutOfLegacy.
-6. RESET, `esw_ctrl:1,1,0` (retain), the logging CONFIG_SET, IDLE and ON, each confirmed by a STATE_REPORT.
-7. `disable_indoor`, then `gnss_start`.
+5. RPC 0x1C `01`.
+6. The ESW: RESET, PASSTHROUGH, bri handshake, every block's sum and CRC-8 checked, GetOutOfLegacy.
+7. `gc_engine_on()`: RESET (serial outside the count), then serials 1-5: `esw_ctrl:1,1,0` (retain), gpsd's
+   CONFIG_SET **without EXT_OSC** (six items: 5 with its byte back to 6, 8, 0x8002, 0x8006, 7, 0x8001 logging on),
+   EXT_LNA (sub-block 25 = 1), IDLE and ON, each confirmed by a STATE_REPORT.
+8. `disable_indoor`, then `gnss_start`.
 
-When the receiver is no longer wanted it sends `gnss_stop` and closes the device.
+While no satellite is in view, every 120 s (`-c`): `gnss_stop`, 5 s for the engine's statistics table (it prints
+detections, attempts and noise only when its measurement engine unloads), then `disable_indoor` and `gnss_start`
+again. With a satellite in view it is left alone. When the receiver is no longer wanted it sends `gnss_stop`, waits
+5 s for the last table, and closes the device. After a failed step it stays in error (no retry loop) until Pause.
 
 The ESW comes from `/redwood/fw/gnss-esw-<N>-<ADDR>.bin`. `devices/star2lte/firmware/gnss`: `fetch-firmware.sh` cuts
 the pieces from Broadcom's gpsd (your own copy, or the pinned public vendor tree) and checks them against SHA256SUMS.
@@ -109,10 +120,42 @@ Steps the bring-up finds later (for example gpsd's CONFIG_SET with the 49.152 MH
   - `latitude`/`longitude`/`altitude`/`speed`/`course`, only with a 2D or 3D fix;
   - `utc`, `ttffSeconds`, `receiverOnSeconds`;
   - `updated`, the wall-clock date.
+  - Diagnostics (all optional):
+    - `step` (the bring-up step: "waiting for the hub (N s more)", "AR table cut", "ESW load", "CONFIG_SET", "IDLE",
+      "searching", "statistics (gnss_stop)" ...) and `stepError` (why it failed: gnss_chip's last word);
+    - `engineState`: the last MEIF STATE_REPORT (IDLE, ON, ...);
+    - `eswLoaded`, `eswBlocks`, `arTableCut`;
+    - `detections` / `attempts`: GPS, GLONASS, Galileo -> sums over the engine's statistics tables this session
+      (`statsTables` of them);
+    - `agcGps`, `agcGlonass` (AAGC dB from the AGC report), `noiseGps` / `noiseExpected` (measured GPS_GAL noise and
+      the GLL table's);
+    - `oscOffsetPpb`, `oscUncertaintyPpb` (`MEIF:OSC GetOscOffset`), `cntin` (`SetCntinMeas`, or "none (no reference
+      clock)");
+    - `searchSeconds` (since the first gnss_start);
+    - `hubLog`: the last 30 relevant hub lines (bring-up, search tables, noise, oscillator, indoor logic, asserts,
+      warnings), masked;
+    - `sessionLog`: the path of the session log.
 - Start and Pause are answered with a status write at once.
 
-Positions go to locationd and to that file (the phone's own screen). They never go to the console or a log. The hub's
-text is not logged.
+Positions go to locationd and to that file (the phone's own screen). They never go to the console or a log. Hub lines
+reach the status and the session log only from a fixed list of kinds, never one that mentions Lat, Lon, LLA, Pos, NMEA
+or `$G`, and after `mask_strict()`: every number with four or more decimals, then NMEA's latitude and longitude
+fields. The statistics gnssd writes itself are rounded to three decimals.
+
+**(f) The session log, for a field test with no computer.**
+- Each receiver start writes `/var/mobile/Library/Caches/com.hakios.gnssd/session-YYYYMMDD-HHMMSS.log` (0644). The
+  last 10 are kept. Each line is `HH:MM:SS +MM:SS text` (wall clock, time since the start):
+  - a `#` header: date, who started it (the app, locationd), uptime, system build, gnssd's build, the sequence;
+  - `step: NAME` / `step NAME FAILED: why`, `state: ...`, `engine: IDLE -> ON`;
+  - `gnss_chip: ...` (what the library says: the AR cut, the bri version, the ESW blocks);
+  - `hub: ...` (the relevant hub lines, as in `hubLog`);
+  - every 10 s, `stats: state, engine, step, search s, N in view / M used, fix ND[, accuracy, hdop], AGC, noise,
+    detections/attempts`, and when any satellite is seen, `sats: G12 34dB el45 az120 used; ...`;
+  - `fix: 3D, ... accuracy ...`, `TTFF`, `fix lost`, `receiver off`, `session end: ...`.
+- No position is ever written to it.
+- The GPS app's Diagnostics shows the same numbers and the hub lines; **Copy log** puts the current (or newest)
+  session log on the pasteboard, **Share log...** hands a copy to the share sheet (Messages, Mail, Save to Files). Over
+  SSH: `ls -t /var/mobile/Library/Caches/com.hakios.gnssd/session-*.log`.
 
 ## Testing without the chip: do not poison locationd
 
