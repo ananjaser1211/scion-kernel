@@ -593,8 +593,7 @@ load_and_verify(void)
 static bool
 dl_start(volatile uint8_t *ipc)
 {
-	say("shannon: DL_START: writing the IPC map at %#llx (outside what the secure call closes, if Samsung's layout holds)
-",
+	say("shannon: DL_START: writing the IPC map at %#llx (outside what the secure call closes, if Samsung's layout holds)\n",
 	    CP_PA + CP_IPC_OFFSET);
 	for (uint32_t offset = 0x08; offset <= 0x24; offset += 4) {
 		wr(ipc, offset, 0);
