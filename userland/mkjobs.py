@@ -245,7 +245,11 @@ DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'soft
         # Darwin userland 16 keeps its power log -- com.apple.powerlog.plxpclogger.xpc and the rest -- that Settings > Battery
         # waits for; it now runs through a session.)
         'homed', 'routined', 'com.apple.dmd', 'syncdefaultsd', 'photoanalysisd', 'avconferenced',
-        'com.apple.atc')
+        'com.apple.atc',
+        # Apple's gpsd: its Mach service, com.apple.gpsd, is where locationd asks for GNSS, and here it is our
+        # com.hakios.gnssd that answers it (src/gnssd.m, docs/gnssd.md): two jobs cannot claim one service, and Apple's
+        # drives GNSS hardware of Apple's own (GnssHalCommUart/Spi, the AOP's passthrough) that this phone has not got.
+        'com.apple.gpsd')
 
 # ALLOW="word ..." in the environment lets jobs through that DENY would stop: for trying one out
 DENY = tuple(word for word in DENY if word not in os.environ.get('ALLOW', '').split())

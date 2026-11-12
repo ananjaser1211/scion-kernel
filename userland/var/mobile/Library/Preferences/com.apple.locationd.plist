@@ -7,5 +7,9 @@
 	     by the Wi-Fi networks it hears (wifid's scans, Apple's location service): a fix of 50-80 m. -->
 	<key>LocationServicesEnabledIn8.0</key>
 	<true/>
+	<!-- locationd's own GNSS stack (CLGnssProvider, CLGnssController), whose device is Apple's gpsd: here gnssd, which
+	     serves com.apple.gpsd with the S9+'s receiver (src/gnssd.m; src/inject_locationd.c picks that device; docs/gnssd.md) -->
+	<key>UseNewGnssArchitecture</key>
+	<true/>
 </dict>
 </plist>
