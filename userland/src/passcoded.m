@@ -386,6 +386,29 @@ watch(void)
 	IOObjectRelease(service);
 }
 
+/*
+ * keybagd posts lock_status when it starts, and its clients read the state then. wifid only learns that the device
+ * has been unlocked since boot from that notification (__WiFiManagerLockStateUpdate sets its unlockedSinceBoot):
+ * without it, it holds Wi-Fi's power off for itself and never auto-joins, though Settings can still join by hand.
+ * With no passcode (or already unlocked) the state never changes here, so nothing was ever posted. Post it now and
+ * again over the first minute, for the daemons that register later (wifid among them).
+ */
+static void
+announce_unlocked(void)
+{
+	static const int at[] = { 0, 3, 10, 20, 40, 60 };
+
+	for (size_t i = 0; i < sizeof(at) / sizeof(at[0]); i++) {
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t) at[i] * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+			notify_post("com.apple.mobile.keybagd.lock_status");
+			if (at[i] == 0 || at[i] == 20) {
+				notify_post("com.apple.mobile.keybagd.first_unlock");
+			}
+		});
+	}
+	say("unlocked since boot: lock_status and first_unlock posted over the first minute");
+}
+
 int
 main(void)
 {
@@ -403,6 +426,9 @@ main(void)
 		watch();
 		if (status(out)) {
 			say("serving com.apple.mobile.keybagd.xpc; passcode %s, lock state %llu", out[0] ? "set" : "none", out[1]);
+			if (out[1] != 1) {
+				announce_unlocked();
+			}
 		} else {
 			say("serving com.apple.mobile.keybagd.xpc; the key store does not answer its status");
 		}
