@@ -1,9 +1,11 @@
 abl_fdt	k
 abox	k
+abox_bass	k
 abox_bclk_on	k
 abox_burst	k
 abox_dvfs	k
 abox_gain	k
+abox_hpf	k
 abox_mic	k
 abox_mmu_off	k
 abox_rdma_ctrl0	k

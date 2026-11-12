@@ -1,9 +1,11 @@
 ABL_FDT	arg	abl_fdt	Storage and APFS	k	hakios.ufshc.lga.h	
 ABOX	arg	abox	Audio and battery	k	hakios.exynos_abox.c	the first N of ABOX's eight steps (1 only looks, 7 plays a tone, 8 serves iOS); 0 or none: left alone
+ABOX_BASS	arg	abox_bass	Audio and battery	k	hakios.exynos_abox.c	a low shelf at 250 Hz, +N dB (0 to 6; 0): the speakers' weakest range lifted, inside the guard's limits
 ABOX_BCLK_ON	arg	abox_bclk_on	Audio and battery	k	hakios.exynos_abox.c	ABOX never gates UAIF1's BCLK (QCHANNEL_DISABLE bit 3), as Samsung does for UAIF0 while it plays
 ABOX_BURST	arg	abox_burst	Audio and battery	k	hakios.exynos_abox.c	RDMA0's CTRL0 BURST_LEN [22:19], 1 to 15 (8, set only when it reads 0; given, set anyway; 0: left)
 ABOX_DVFS	arg	abox_dvfs	Audio and battery	k	hakios.exynos_abox.c	ACPM's AUD DVFS domain (index 9) set to this before step 3 (none: left as found, only read)
 ABOX_GAIN	arg	abox_gain	Audio and battery	k	hakios.exynos_abox.c	eighths of a dB of gain before the speakers' guard, 0 to 96 (0)
+ABOX_HPF	arg	abox_hpf	Audio and battery	k	hakios.exynos_abox.c	the guard's high-pass corner: 200 (the default), 150 or 120 Hz; lower lets more of the bass through
 ABOX_MIC	arg	abox_mic	Audio and battery	k	hakios.exynos_abox.c	with abox=8: /dev/hakios-mic, the codec's main microphone for iOS, recorded through UAIF0 and WDMA1
 ABOX_MMU_OFF	arg	abox_mmu_off	Audio and battery	k	hakios.exynos_abox.c	refuse a translating SysMMU instead of switching it off (1: CTRL 0, as found needed on the S9)
 ABOX_RDMA_CTRL0	arg	abox_rdma_ctrl0	Audio and battery	k	hakios.exynos_abox.c	bits of RDMA0's CTRL0 besides ENABLE, to try a format there (none: as it reads after reset)
