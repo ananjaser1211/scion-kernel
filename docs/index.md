@@ -42,7 +42,7 @@ on the Adreno 642L, at 100 to 104 frames a second in page swipes on a 120 Hz pan
 | [Devices](devices/index.md) | how far each part works, device by device: [redwood](devices/redwood.md), [QEMU](devices/qemu.md) |
 | [Cellular](cellular.md) | the modem's bring-up ([in Russian](ru/cellular.md)) |
 | [GNSS](gnss.md) | the S9's BCM4775 GNSS: what its firmware holds (an on-chip position engine), the tools, the next steps |
-| [gnssd](gnssd.md) | GNSS fixes into iOS: how locationd can take positions (gpsd, accessory, simulation), what apps see, the daemon and its chip hooks |
+| [gnssd](gnssd.md) | the GNSS chain into iOS: the chip's bring-up, locationd's gpsd protocol (and the one change to locationd), the GPS app's status |
 | [Driver reviews](driver-review/README.md) | each driver read for what it does and what was and was not verified |
 | [Network review](net-review.md) | the network stack, read the same way |
 

@@ -1,124 +1,138 @@
-# gnssd: GNSS fixes for iOS's location stack
+# gnssd: the GNSS chain into iOS
 
-`gnssd` (`userland/src/gnssd.m`, the job `com.hakios.gnssd`) takes the BCM4775's fixes and hands them to locationd,
-which passes them to every app: Maps, Safari's geolocation, Weather and anything else that uses CoreLocation. The chip
-side, which brings the receiver up and gets the first fix, is in [gnss.md](gnss.md). This page covers the iOS side:
-how a position gets into locationd, what apps see, and what the daemon expects from the chip.
+`gnssd` (`userland/src/gnssd.m` with `src/gnss_chip.c`, job `com.hakios.gnssd`) does three things:
+- it brings the BCM4775's GNSS receiver up and reads the on-chip engine's fixes;
+- it hands them to locationd **as the phone's own GPS**, so Maps, Safari's geolocation, Weather and every CoreLocation
+  client see GPS positions;
+- it writes a status file for the GPS app (`com.hakios.gps`).
 
-Status (12 Nov 2026): the feed works end to end with a synthetic NMEA stream. The chip does not produce fixes yet, so
-`chip_up()` / `chip_fd()` are the hand-off points for the GNSS bring-up (below).
+The chip side, which brings the receiver up and gets the first fix, is in [gnss.md](gnss.md). This page covers the
+iOS side.
+
+Status (12 Nov 2026, night): locationd talks to gnssd as its gpsd, and START/STOP follow its clients. The chip
+sequence is in gnssd. The chip does not produce satellites yet, so no real fix has gone through.
 
 ## How a position can get into locationd (iOS 16.5, 20F66, read from the system image)
 
-Four routes were checked in locationd, ExternalAccessory, CoreAccessories (accessoryd) and Apple's gpsd.
-
-| Route | What locationd makes of it | Usable here? |
+| Route | What locationd makes of it | Here |
 |---|---|---|
-| **Built-in GNSS, new architecture**: Apple's `gpsd`, Mach service `com.apple.gpsd`, protobuf `proto.gpsd.Request` / `Response` / `Indication` (schema embedded in locationd: `GpsdProtocol.proto`, `GnssTypes.proto`) | the phone's own GPS: `CLLocationType` GPS, neither simulated nor accessory | **No**, see below |
-| **Built-in GNSS, baseband**: `CLEurekaController` (Qualcomm QMI PDS through CommCenter) / `CLIceController` (Intel ARI) | the phone's own GPS | No: needs a Qualcomm/Intel baseband stack (CommCenter is not running here) and Apple's private PDS messages |
-| **External accessory**: `CLAccessoryLocationProvider` <- `CLAccessoryObserver` <- ExternalAccessory (`EAAccessoryDidReceiveNMEASentenceNotification`, `-[EAAccessory getNMEASentence:]`) <- accessoryd's iAP2 LocationInformation (or iapd's iAP1 `IAPLocationCopyNMEAData`) | `isProducedByAccessory` | No: the accessory has to identify over iAP2, and its features (location among them) depend on MFi authentication (`-[ACCTransportIOAccessoryManager setFeaturesFromAuthStatus:authCert:certType:]`, AuthCP certificate). It can't be done without a real MFi coprocessor or a patched accessoryd |
-| **Simulation**: `CLSimulationManager` (entitlement `com.apple.locationd.simulation`; Xcode's "simulate location", `loctool sim`) | `isSimulatedBySoftware` | **Yes**: gnssd's default |
+| **Built-in GNSS**: `CLGnssProvider` -> `CLGnssController` -> `CLGnssDaemonDevice` -> XPC `com.apple.gpsd`, protobuf `proto.gpsd.Request` / `Response` / `Indication` (schema embedded in locationd: `GpsdProtocol.proto`, `GnssTypes.proto`) | the phone's GPS: not simulated, not accessory | **used**, with one change to locationd (below) |
+| Built-in GNSS, baseband: `CLEurekaController` (Qualcomm QMI PDS through CommCenter), `CLIceController` (Intel ARI) | GPS | no: no such baseband stack here |
+| External accessory: `CLAccessoryLocationProvider` <- ExternalAccessory (`EAAccessoryDidReceiveNMEASentenceNotification`) <- accessoryd iAP2 LocationInformation / iapd iAP1 | `isProducedByAccessory` | no: the accessory's features depend on MFi authentication (`-[ACCTransportIOAccessoryManager setFeaturesFromAuthStatus:authCert:certType:]`) |
+| Simulation: `CLSimulationManager` (entitlement `com.apple.locationd.simulation`) | `isSimulatedBySoftware` | the fallback, `gnssd -L sim` |
 
-Why the gpsd route is closed on this phone, even though it is the cleanest protocol:
+**The one change.**
+- locationd picks the device behind its GNSS controller in `CLGnssDeviceFacade::create` (0x1011eb084), from the
+  hardware model only:
+  - `CLGnssDaemonDevice` (gpsd) for the models in a fixed set (0x1003b0104);
+  - otherwise `CLEurekaController` or `CLGnssUnknownDevice`.
+- On iPhone10,3 that means a Qualcomm baseband this phone has not got. No preference overrides it.
+- `src/inject_locationd.c` (`libhakios.locationd.dylib`, inserted into locationd through `etc/inject.conf`) replaces
+  the one call of the predicate inside `create` (0x1011eb0e0, `bl` -> `mov w0, #1`), and nothing else. It does so
+  only on iPhone10,3, only if the instruction there is build 20F66's, and it logs one console line.
+- locationd's new GNSS stack itself is its own preference `UseNewGnssArchitecture`, in **mobile's**
+  `com.apple.locationd` domain. It is seeded in `userland/var/`, and gnssd sets it too when a kept data volume lacks
+  it (locationd reads it at start).
+- Apple's gpsd job is left out (`mkjobs.py`): `com.hakios.gnssd` owns `com.apple.gpsd`.
 
-- locationd only uses its new GNSS stack (`CLGnssProvider` -> `CLGnssController`) when `CLPlatformInfo` says so. The
-  preference `UseNewGnssArchitecture` (in **mobile's** `com.apple.locationd` domain) turns it on for any device, and
-  that was tried on the S9+: `CLGnssProvider,startLocation` and `GnssEvent clientStart/clientStop` follow the clients.
-- The device behind the controller is chosen by `CLGnssDeviceFacade::create` (locationd 0x1011eb084), from the
-  hardware model alone, with no preference:
-  - `CLGnssDaemonDevice` (XPC to `com.apple.gpsd`) only for the hardware ids in a fixed set (0x1003b0104 / 0x1003affe0);
-  - otherwise `CLEurekaController` (QMI) or `CLGnssUnknownDevice`.
-- The phone runs as iPhone10,3 (D22), which is not in that set. A server on `com.apple.gpsd` (gnssd `-L gpsd`, tried
-  with Apple's gpsd job swapped out) gets no connection at all, and Apple's own gpsd job has `runs = 0`.
-- Using the protocol would take code injected into locationd to change that one choice. That is the kind of change
-  this project avoids, so it is not done.
-
-`gnssd -L gpsd` keeps the complete server anyway, for a later identity that has gpsd or a sanctioned override:
-
-- what it handles: START / STOP (receiver on and off), BUILD_DEVICE (Status), every other request answered with
-  kSuccess;
-- what it sends: each fix as Indication(PVTM) with `proto.gnss.Fix` (GPS time, Position with the WGS84 height and
-  undulation, 1-sigma horizontal and vertical uncertainty, Velocity);
-- the XPC dictionary keys: `gpsdRequest` in, `gpsdResponse` / `gpsdIndication` out.
-
-So **the feed is CLSimulationManager**: no Apple code is changed and no system file is patched. The cost is the flag.
-
-## What apps see
-
-Measured on the S9+ with `nullisland.nmea` (made by `tools/nmea-synth.py`: 0.001 N, 0.001 E, HDOP 0.9, 8 satellites,
-1 kn east) and a CoreLocation client running as `com.apple.weather`:
-
-- `horizontalAccuracy` 3.6 m (HDOP 0.9 x 4 m), `verticalAccuracy` 7.2 m, altitude 12 m (MSL), timestamp age 0 s, the
-  position moving east as the stream does;
-- `sourceInformation.isSimulatedBySoftware` = **1**, `isProducedByAccessory` = 0;
-- speed and course arrive as -1: CLSimulationManager drops them, although gnssd sets them on the CLLocation;
-- Maps, Safari and Weather get the same positions, because the simulation replaces locationd's own fix for every
-  client.
-
-An app that checks `isSimulatedBySoftware` (a few games and anti-fraud checks do) will refuse these fixes. Nothing in
-the stock apps does.
-
-**Hazard when testing.** A synthetic fix far from where the phone really is affects more than the test:
-
-- After the Null Island run, locationd's Wi-Fi positioning no longer recognised the access points around the phone:
-  `@WifiAps lookiter ... notindb`, then `AlsWifi query ... out 0`, with no new query to Apple's service.
-- So once the simulation stopped, there was no Wi-Fi fix, even across a locationd restart.
-- locationd treats a precise position as the truth and takes the local APs to have moved.
-- Real fixes, at the phone's real position, do not do this.
-
-To test the feed, use a synthetic stream briefly, and know that Wi-Fi location may need its cache rebuilt afterwards
-(locationd's `cache_encryptedB.db`).
+**The protocol** (tested on the S9+ with gnssd serving and no fixes):
+- locationd connects and sends a connection message. gnssd answers with a STATUS indication at once and then every
+  5 s. Without it, locationd's "gpsd alive" timer moves its device to Recovery and it sends EXIT.
+- Then BUILD_DEVICE (answered with STATUS) and SET_CONFIG_ENABLE_GNSS_CONSTELLATIONS.
+- When a client wants GNSS: START (answered with Indication START_COMPLETED / kSuccess), then the assistance it has.
+  That is INJECT_ASSISTANCE_TIME, INJECT_ASSISTANCE_POSITION (its Wi-Fi position, about every 5 s),
+  INJECT_ASSISTANCE_FILE (the ephemeris file), the RTI file, the emergency config, and others.
+- About 13 s after the last client stops: STOP (STOP_COMPLETED). The receiver follows START/STOP.
+- Every request gets a Response (kSuccess). A fix goes to locationd as Indication PVTM with a `proto.gnss.Fix`:
+  - Time: GPS ns and leap seconds, plus the receipt time in mach continuous time;
+  - Position: WGS84 height and undulation, 1-sigma semi-major/minor and vertical uncertainty, reliability, 2D/3D;
+  - Velocity: speed and course with their uncertainties.
+- XPC dictionaries carry the keys `gpsdRequest` (in) and `gpsdResponse` / `gpsdIndication` (out), each a data
+  object holding the protobuf.
+- The assistance locationd injects (its time, its Wi-Fi position, the ephemeris) is taken and not used yet. It is
+  what the chip needs for a fast first fix (gnss.md's "aiding").
 
 ## The daemon
 
 ```
-gnssd [-L sim|gpsd] [-f FWDIR] [-n NMEA] [-t] [-a] [-i MS]
-gnssd parse [FILE]        # NMEA -> one line per epoch: fix quality, satellites, DOP, accuracy (never the position)
-gnssd segments [FWDIR]    # the ESW segments chip_up() would load
+gnssd [-L gpsd|sim] [-f FWDIR] [-n NMEA] [-t] [-a] [-i MS]
+gnssd parse [FILE]        # NMEA -> per epoch: fix type, satellites, DOP, accuracy (never the position)
+gnssd segments [FWDIR]    # the ESW pieces the chip is given
 ```
 
-- **(a) chip**: `chip_up()`, `chip_down()`, `chip_fd()`.
-  - The ESW segments come from the firmware directory (`-f`, default `/redwood/fw`). `build.sh DEVICE=star2lte`
-    installs `devices/star2lte/firmware/` there, flat, and that is where the plan in gnss.md puts the GNSS
-    segments.
-  - Names: `gnss-esw-<N>-<ADDR>.bin`, where N is the load order and ADDR the baseband address in hex. In gpsd's
-    `a4775_B0_ImageSegments` they are `gnss-esw-0-5fdf0.bin`, `gnss-esw-1-78000.bin` and `gnss-esw-2-5fff0.bin` (the
-    12-byte word). `tools/fetch-firmware.sh` should write them under those names.
-  - Until the bring-up is final, `chip_up()` runs `/redwood/bin/gnsstool esw -r -x FILE@ADDR...` instead of
-    repeating its code.
-  - Without the segments it says so and leaves the receiver off: locationd keeps to Wi-Fi.
-- **(b) fixes**:
-  - NMEA 0183, with optional checksums. GGA gives the fix quality, satellites used, HDOP, the MSL altitude and the
-    undulation. RMC gives the date, speed and course. GSA gives 2D/3D and the PDOP/HDOP/VDOP. GSV gives the
-    satellites in view, over all talkers.
-  - An epoch closes when the UTC time changes.
-  - Accuracy is the engine's estimate when it gives one (`hacc` / `vacc` in `struct gnss_fix`), otherwise
-    HDOP x 4 m (UERE) and VDOP x 6 m.
-  - `meif_pvt_decode()` is the stub for MEIF PVT messages.
-- **(c) feed**: one CLLocation per epoch to CLSimulationManager (`-i` thins them).
-  - When the fix is lost for 10 s, or the receiver goes off, the simulation is stopped and cleared, so locationd
-    goes back to Wi-Fi by itself.
-  - `-L gpsd` uses the protocol server described above instead.
-- **(d) power**:
-  - With `-L gpsd`, locationd's START and STOP decide.
-  - CLSimulationManager says nothing about who wants a position, and the location status bar state is not readable
-    from outside: `CLGetStatusBarIconState()` stayed 0 with clients active.
-  - So with `-L sim` the receiver is on while the screen is on (`com.apple.springboard.hasBlankedScreen`) and
-    Location Services are on, and for 60 s after the screen goes dark. `-a` keeps it on for tests.
+**(a) The chip** (`chip_bringup()` in gnssd, the protocol in `gnss_chip.c`). A thread of its own owns
+`/dev/hakios-gnss` while the receiver is wanted. It runs gnss.md's sequence:
+1. Wait until 3 minutes after boot: hub log facilities set earlier upset the RPC channel.
+2. Pin mux RPC 0x34 `[17][1]` (the external LNA).
+3. `enable_log_to_host_LOG_INFO_Overwrite`, then log facilities 0x0e, 0x16, 0x4f, 0x97, 2 s apart, once per gnssd run,
+   never in a loop.
+4. RPC 0x1C `01`.
+5. The ESW: RESET, PASSTHROUGH, bri handshake, every block's sum and CRC-8 checked, GetOutOfLegacy.
+6. RESET, `esw_ctrl:1,1,0` (retain), the logging CONFIG_SET, IDLE and ON, each confirmed by a STATE_REPORT.
+7. `disable_indoor`, then `gnss_start`.
 
-The job runs `gnssd` at load and restarts it if it fails. On SIGTERM it stops the simulation before it exits. It
-logs fix quality, accuracy, satellites and speed only, never a position.
+When the receiver is no longer wanted it sends `gnss_stop` and closes the device.
 
-## For the GNSS bring-up: what to fill in
+The ESW comes from `/redwood/fw/gnss-esw-<N>-<ADDR>.bin`. `devices/star2lte/firmware/gnss`: `fetch-firmware.sh` cuts
+the pieces from Broadcom's gpsd (your own copy, or the pinned public vendor tree) and checks them against SHA256SUMS.
+`build.sh DEVICE=star2lte` installs them.
 
-1. **`chip_up()`**: after ON, whatever makes the engine report positions (the on-chip PVT request, docs/gnss.md).
-   Return true once the receiver is running. It may call gnsstool or, once the sequence is final, do it directly.
-2. **`chip_fd()`**: return a descriptor that yields the engine's NMEA as lines (`$GPGGA`/`$GNGGA`, RMC, GSA, GSV,
-   `\n`-terminated). For example, the `ONCHIP_NMEA` log lines from `/dev/hakios-gnss`, with the hub's prefix stripped.
-   gnssd reads it non-blocking from a dispatch source. If the positions come as MEIF PVT instead, decode them in
-   `meif_pvt_decode()` and call `fix_ready()`, setting `hacc` / `vacc` from the engine's own estimate.
-3. **`chip_down()`**: `gnss_stop` / engine OFF / the ASIC's low-power state.
-4. Name the segments `gnss-esw-<N>-<ADDR>.bin` in `devices/star2lte/firmware/gnss/` (fetch-firmware.sh).
+Steps the bring-up finds later (for example gpsd's CONFIG_SET with the 49.152 MHz oscillator, gnss.md) belong in
+`gc_engine_on()` in `gnss_chip.c`.
 
-To try a recorded stream without the chip: `gnssd -a -t -n FILE` (a file is replayed one epoch a second, `-` reads
-stdin). To check a stream: `gnssd parse FILE`.
+**(b) The fixes.**
+- The on-chip engine's NMEA arrives as hub log lines (RPC 0x19, `ONCHIP_NMEA[0][$GPGGA,...`). gnssd takes the
+  sentence after the last prefix.
+- GGA, RMC, GSA and GSV are parsed. The satellites (system, PRN, C/N0, elevation, azimuth, used) come from GSV and GSA.
+- Accuracy is HDOP x 4 m and VDOP x 6 m until the engine's own estimate is decoded: `meif_pvt_decode()` for MEIF PVT,
+  or `$PGLOR,..,FIX`.
+- `-n FILE|FIFO|-` replaces the chip with a recorded stream (`tools/nmea-synth.py` makes one). With `-n` the chip is
+  never touched.
+
+**(c) locationd**: the gpsd service above (default), or `-L sim` (CLSimulationManager; fixes are flagged
+`isSimulatedBySoftware`, and speed and course are dropped by the simulation).
+
+**(d) Power.** The receiver runs while locationd has it STARTed, or from the GPS app's Start
+(`com.hakios.gnssd.start`) to its Pause (`com.hakios.gnssd.pause`), or always with `-a`.
+
+**(e) Status, for the GPS app.**
+- File: `/var/mobile/Library/Caches/com.hakios.gnssd/status.plist`, binary plist, mode 0644, in a 0755 directory
+  owned by mobile.
+- Written once a second in every state, off included. Each write is a file of gnssd's own renamed over the old one,
+  followed by the notification `com.hakios.gnssd.status`.
+- Keys:
+  - `state`: off, starting, loading_esw, engine_on, searching, fix, error;
+  - `error`: only while in error;
+  - `fixType`, `satsInView`, `satsUsed`;
+  - `sats`: system, prn, cn0, used, and elevation/azimuth once known;
+  - `hdop`/`vdop`/`pdop`, `hAccuracy`/`vAccuracy`;
+  - `latitude`/`longitude`/`altitude`/`speed`/`course`, only with a 2D or 3D fix;
+  - `utc`, `ttffSeconds`, `receiverOnSeconds`;
+  - `updated`, the wall-clock date.
+- Start and Pause are answered with a status write at once.
+
+Positions go to locationd and to that file (the phone's own screen). They never go to the console or a log. The hub's
+text is not logged.
+
+## Testing without the chip: do not poison locationd
+
+Feeding a made-up position far from the phone (the Null Island run of 12 Nov, through CLSimulationManager) made
+locationd take the local Wi-Fi access points for moved:
+- every one became `notindb`, and `AlsWifi query ... out 0` stopped the queries to Apple;
+- Wi-Fi positioning stayed dead across locationd restarts until its AP cache (`/var/root/Library/Caches/locationd/
+  cache_encryptedB.db*`) was moved aside.
+
+So:
+- never feed a synthetic position to the live locationd;
+- test the protocol with no fixes (`gnssd -n FIFO` with nothing written: locationd's requests show the path);
+- check positions on the client side, or with `gnssd parse`;
+- keep a copy of that cache before any experiment that could feed one.
+
+## Installing (the image)
+
+- `build.sh` builds `gnssd` (with `gnss_chip.c`, signed with `src/gnssd.entitlements`) and `libhakios.locationd.dylib`.
+- It lists `/redwood/lib/libhakios.locationd.dylib locationd` in INJECT, installs the job `com.hakios.gnssd`, and
+  takes the ESW from `devices/star2lte/firmware/gnss` with `DEVICE=star2lte`.
+- `mkjobs.py` leaves Apple's gpsd out. The data-volume seed sets `UseNewGnssArchitecture`.
+- `kern.exec_inject` holds at most 511 characters. With this line the default INJECT, Bluetooth included, uses about
+  435.
