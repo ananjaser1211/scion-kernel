@@ -183,6 +183,35 @@ So the path from the host to the engine is right, and the engine is already in S
 gpsd sends CONFIG_GET / CONFIG_SET / the config string / CONTROL(IDLE). The RESET assert is still unexplained. Skipping
 RESET is the working rule.
 
+**CONFIG_GET** is gpsd's fixed request: `meif 7 07000100020003000500080009000a00` (count 7, then parameter ids 1, 2, 3, 5,
+8, 9, 10). The chip answered with CONFIG_VALUES (len 152). Its items are `[u16 id][u16 size incl. header][data]`:
+1 (64 bytes, mostly zero), 2 `e8030000 00000000` (1000), 3 `9f010000 01000000` + zeros, 5 `e803 ffffffff 0000 ffffffff`,
+8 `0002 0100`, 9 `0032 0c00`, 10 `00000000 ffff 0000`.
+
+gpsd's **CONFIG_SET** (id 6) is 92 bytes, or 100 with an optional 0x8004 item. The items, read from its builder:
+
+| Item | Size | Data |
+|---|---|---|
+| 5 | 16 | `e803 0100 0003 06|07 00 0a00 0a00` |
+| 10 | 12 | u32, u16 (fixed 8.8 of a value × 1e6), u16 |
+| 8 | 8 | u16 oscillator uncertainty in ppm, 8.8 (`0002` = 2 ppm, the chip's default and gps.xml's 2PPM), `0100` |
+| 0x8002 | 16 | `0100` + zeros |
+| 0x8006 | 8 | u32 from settings |
+| 7 | 8 | zeros |
+| 0x8001 | 16 | u16, 0, u32 from settings, 0 |
+
+The config string goes as SW_UPLOAD (id 0x10) type 0x8000.
+
+**CONTROL(IDLE) from SETUP fails**: `meif 3 0400` got MEIF ERROR (id 2) with the text "GPS BB not responding -- ERR"
+(`GlMe_PeIfImpl::CommunicationBreakdown`), then STATE_REPORT SETUP -> ERROR. The hub kept running. The baseband (the
+GNSS core under the ME, "ChipData" to `GlMeImpl::SetAsicData`) never spoke. The ME is loaded only on RESET
+(`handling MEIF_STATE_RESET : m_bIsMeasEngineLoaded`, `LoadMeasEngine`, "ChipData with unloaded ME"). So skipping RESET
+cannot work: RESET is what starts the ME and the baseband, and it is RESET that asserted (`rpc_engine.cpp` 222). The
+likeliest reading is that the baseband's own RPCs, on the chip's internal link to the ME, do not match the ME's decoder.
+That would happen if the baseband runs its bare ROM where Android has loaded a patch. gpsd embeds a Pike baseband patch
+("esw3_dev:4775_FF", `GetPatchSegmentPike`, `GlMeSrdAsicInitPatchLoader`); how it reaches the chip is the next thing to
+read.
+
 ## The tools (kernel and userland)
 
 - `/dev/hakios-gnss` (made at `shub=6`, root only; `drivers/input/ssp/hakios.ssp.c`): every RPC from the hub that is
