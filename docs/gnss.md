@@ -396,6 +396,45 @@ Build 33 (the hub now gets AP_STATUS wakeup/resume, thermistor and mag PDC at bo
   does not answer after that.
 - MiniMe banner seen: "Broadcom GLL ver. 68.19.21 282318, Jan 23 2017, pike:glmesrd_build.cpp".
 
+**Where the ESW comes from on Android: gpsd's host measurement engine.** In `GlMeIf::Instance` (gpsd 0x002cc6b0), gpsd
+asks `GlSettings::ShouldBeUsingOnChipMe()` (vtable +696):
+- **true**: `InstancePe_MeIf` (MEIF to the chip's MiniMe), `SetUsingOnChipMe(1)`.
+- **false**: the **host ME** (`GlMeIf::Instance(...)`: GlMeSrd/GlDineCtrl running in gpsd, with `meif_4771:1;` added to
+  the config string), `SetUsingOnChipMe(0)`.
+
+The choice is made per request set by `GlEngineImplStd::setOnChipMeSetting(GlSet32, bool)` ("ShouldBeUsingOnChipMe
+%s", `GlReqSm::idle ShouldBeUsingOnChipMe`, `on_chip_positioning`). The on-chip ME serves the low-power requests
+(breadcrumbs, geofences, `$pglirm ... pvtOnChip`). Ordinary navigation runs the ME in gpsd. The host ME reaches the
+baseband **through the chip in PASSTHROUGH**:
+- `GlMeMeifCodec::SendPassthroughCtrlMsg` sends the fixed frame `a593 0300 0800 0300 0a00 1800 a568` (CONTROL serial
+  3, state 10 = PASSTHROUGH).
+- `GlMeMeifCodec::EncodeData` then wraps the host ME's baseband bytes as MEIF **0x8002 PASS_THRU**:
+  `[0x8002][len = n + 8, made even][serial][u16 n][n bytes][sum]`, at most 2048 bytes each.
+
+That host ME runs `GlMeSrdAsicinit` itself, bri boot ROM interface included. It loads the ESW from gpsd's own copy:
+`GetPatchSegmentPike("4775_B0")` -> `a4775_B0_ImageSegments`, `ui4775_B0_NumSegments = 2`:
+
+| Baseband address | Size | Content |
+|---|---|---|
+| 0x5fdf0 | 528 bytes | segment 0 |
+| 0x78000 | 25844 bytes | segment 1 |
+| 0x5fff0 | 12 bytes | stub (the same one the hub patch hands out) |
+
+The ESW is `esw3_dev:4775_B0@394878`, about 26 KB in gpsd's `.rodata` (0x1abff0 / 0x1ac200). It stays local, never
+committed. With RetainEsw the overlay survives, and the chip's MiniMe can later run without loading it. That is the
+"could be Overlay was not retained!" case we hit: nothing ever loaded it.
+
+So a fix has two possible routes:
+- **(1) Load the ESW ourselves through PASSTHROUGH.** Replicate `GlMeSrdAsicinit`'s bri sequence (startup, flow
+  control, version, asic_ready, `bri_wait4patchload` / `bri_wait4patchblockload` with CRC, GetOutOfLegacy), using
+  gpsd's two segments as MEIF 0x8002 packets. Then go back to the on-chip ME with `esw_ctrl:1,...` (retain) and RESET /
+  IDLE / ON. The on-chip ME and MicroNav could then measure and fix.
+- **(2) Give the hub patch's own segment table (0x0086fd28: count, table pointer, name) the ESW in hub RAM, and restore
+  the load branch.** This needs patch surgery and about 26 KB of free hub RAM.
+
+Route (1) needs the bri message formats. The ROM implements the same `GlMeSrdAsicinit` (0x000b3670 onwards), so they
+can be read from either side.
+
 ## The tools (kernel and userland)
 
 - `/dev/hakios-gnss` (made at `shub=6`, root only; `drivers/input/ssp/hakios.ssp.c`): every RPC from the hub that is
