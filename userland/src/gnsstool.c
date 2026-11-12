@@ -145,6 +145,38 @@ meif_print(const uint8_t *m, unsigned n)
 	if (id == 4 && n >= 10) {
 		printf(" %s -> %s", meif_state(m[6] | m[7] << 8), meif_state(m[8] | m[9] << 8));
 	}
+	if (id == 0xd || id == 0x8000) {
+		/* the engine's log text. Every number with four or more decimals is masked, so a position never gets out */
+		char t[1600];
+		unsigned k = 0;
+
+		for (unsigned i = 6; i + 2 < n && k + 1 < sizeof(t); i++) {
+			t[k++] = m[i] >= 0x20 && m[i] < 0x7f ? (char)m[i] : m[i] == 0 ? ' ' : '.';
+		}
+		t[k] = 0;
+		for (unsigned i = 0; i < k; i++) {
+			if (t[i] == '.' && i > 0 && t[i - 1] >= '0' && t[i - 1] <= '9') {
+				unsigned j = i + 1;
+
+				while (j < k && t[j] >= '0' && t[j] <= '9') {
+					j++;
+				}
+				if (j - i - 1 >= 4) {
+					unsigned b = i;
+
+					while (b > 0 && ((t[b - 1] >= '0' && t[b - 1] <= '9') || t[b - 1] == '-')) {
+						b--;
+					}
+					for (unsigned x = b; x < j; x++) {
+						t[x] = '#';
+					}
+				}
+				i = j;
+			}
+		}
+		printf(" \"%s\"\n", t);
+		return;
+	}
 	if (id <= 2 || id == 4 || id == 8) {
 		printf(" :");
 		for (unsigned i = 6; i + 2 < n && i < (id == 8 || id == 2 ? 400u : 40u); i++) {
