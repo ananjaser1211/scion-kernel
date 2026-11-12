@@ -21,12 +21,16 @@
  *   Classes       an Objective-C class the program has
  * and takes the tweak if any of them matches, unless Mode is "Any", where all must. A list with no
  * Filter at all belongs in every program, as it does on a phone.
+ *
+ * Being the one library of ours in Settings, it also carries what Settings itself needs here
+ * (location_services_row below).
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <dirent.h>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
+#include <objc/message.h>
 #include <objc/runtime.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -259,6 +263,47 @@ load_the_tweaks(void)
 	}
 }
 
+/*
+ * Settings > Privacy & Security shows "Location Services" only once it has asked every SIM's carrier
+ * bundle whether location services are allowed (-[PUIPrivacyController refreshLocationServicesAvailable],
+ * PrivacySettingsUI, key LocationServicesAvailable): with no SIM, or no carrier saying otherwise, the answer
+ * is yes. It asks CommCenter, which this system does not run, so the question fails ("the connection to
+ * service named com.apple.commcenter.coretelephony.xpc was invalidated") and Settings returns without
+ * an answer -- and with none, it leaves the row out. When it has no answer after asking, it gets the
+ * one it would have had from a phone without a SIM.
+ */
+static IMP refresh_location_original;
+
+static void
+refresh_location(id self, SEL cmd)
+{
+	SEL get = sel_registerName("_cachedLocationServicesAvailableValue");
+	SEL set = sel_registerName("set_cachedLocationServicesAvailableValue:");
+
+	((void (*)(id, SEL))refresh_location_original)(self, cmd);
+	if (((id (*)(id, SEL))objc_msgSend)(self, get) == nil) {
+		((void (*)(id, SEL, id))objc_msgSend)(self, set, (id)kCFBooleanTrue);
+	}
+}
+
+static void
+location_services_row(void)
+{
+	Class privacy;
+	Method method;
+
+	/* in the shared cache, and Settings opens it for that pane anyway; opened now, it is hooked before it is used */
+	dlopen("/System/Library/PrivateFrameworks/Settings/PrivacySettingsUI.framework/PrivacySettingsUI", RTLD_NOW);
+	privacy = objc_getClass("PUIPrivacyController");
+	method = privacy != NULL ? class_getInstanceMethod(privacy, sel_registerName("refreshLocationServicesAvailable")) : NULL;
+	if (method == NULL || class_getInstanceMethod(privacy, sel_registerName("set_cachedLocationServicesAvailableValue:")) == NULL ||
+	    class_getInstanceMethod(privacy, sel_registerName("_cachedLocationServicesAvailableValue")) == NULL) {
+		say("hakios: tweaks: no -[PUIPrivacyController refreshLocationServicesAvailable], Location Services left as it is\n");
+		return;
+	}
+	refresh_location_original = method_setImplementation(method, (IMP)refresh_location);
+}
+
 __attribute__((constructor))
 static void
 hakios_tweaks_init(void)
@@ -269,5 +314,8 @@ hakios_tweaks_init(void)
 		return;
 	}
 	done = true;
+	if (executable_name() != NULL && strcmp(executable_name(), "Preferences") == 0) {
+		location_services_row();
+	}
 	load_the_tweaks();
 }
