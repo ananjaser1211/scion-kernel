@@ -32,6 +32,8 @@
  * 1 success, 21 "invalid PMK" (a wrong passphrase), 9 a timeout, 2 anything else.
  */
 #include <kern/kalloc.h>
+#include <pexpert/pexpert.h>
+#include <sys/param.h>
 #include <kern/locks.h>
 #include <libkern/libkern.h>
 #include <sys/errno.h>
@@ -310,6 +312,22 @@ give_network(const struct apple80211req *request, const struct hakios_sta_bss *b
 
 /* ---- get ---------------------------------------------------------------------------------------------- */
 
+
+/*
+ * RSSI_BOUNDS' answer (106), as 16.5's IO80211 reads it (seen with wifi_rssi_probe=1): word 0 a version, 1 RSSI_MIN,
+ * 2 RSSI_MAX, 3 RSSI_THRESHOLD, in dBm. Auto-join leaves out networks heard below the threshold; -85 is about where a
+ * link stops being usable.
+ */
+static void
+rssi_bounds_fill(int32_t *answer, size_t words)
+{
+	static const int32_t bounds[] = { 1, -100, -10, -85 };
+
+	for (size_t i = 0; i < words && i < sizeof(bounds) / sizeof(bounds[0]); i++) {
+		answer[i] = bounds[i];
+	}
+}
+
 static int
 get(struct apple80211req *request)
 {
@@ -345,6 +363,32 @@ get(struct apple80211req *request)
 		} answer = { .version = 1, .radios = 1, .state = { !hakios_sta_present() || hakios_sta_powered() } };
 
 		return give(request, &answer, sizeof(answer));
+	}
+	case 106: {                             /* RSSI_BOUNDS: what wifid's auto-join takes as the weakest network worth joining */
+		/*
+		 * wifid reads it once (Apple80211CopyValue: RSSI_MIN, RSSI_MAX, RSSI_THRESHOLD) and keeps zeros when it is refused:
+		 * every network is then "below the minimum RSSI threshold" (all are negative), so auto-join finds the known
+		 * network and never joins it -- only a join by hand did. wifi_rssi_probe=1 answers 1000, 1001, ... per 32-bit
+		 * word instead, and says how much was asked for, to read off which word the framework takes for which.
+		 */
+		static uint32_t probe = 2;
+		int32_t answer[16] = { 0 };
+		size_t words = MIN(request->req_len / sizeof(int32_t), sizeof(answer) / sizeof(answer[0]));
+
+		if (probe == 2) {
+			probe = 0;
+			PE_parse_boot_argn("wifi_rssi_probe", &probe, sizeof(probe));
+		}
+		if (probe) {
+			for (size_t i = 0; i < words; i++) {
+				answer[i] = 1000 + (int32_t)i;
+			}
+			printf("apple80211: RSSI_BOUNDS asked for %u bytes, value %d: answered with 1000, 1001, ...\n", request->req_len,
+			    request->req_val);
+		} else {
+			rssi_bounds_fill(answer, words);
+		}
+		return give(request, answer, words * sizeof(int32_t));
 	}
 	case 15:                                /* the mode: a station (APPLE80211_M_STA) */
 		request->req_val = 1;
