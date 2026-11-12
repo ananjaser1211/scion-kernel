@@ -2,10 +2,12 @@
  * gnssd: the phone's GNSS receiver (the BCM4775), for iOS. docs/gnssd.md.
  *
  *   (a) the chip:    a thread of its own runs docs/gnss.md's sequence through /dev/hakios-gnss (src/gnss_chip.c): the
- *                    external LNA's pin mux, GnssPvtDataStart, the hub's log facilities, the ESW (/redwood/fw/
- *                    gnss-esw-N-ADDR.bin) through the baseband's boot ROM, RESET, esw_ctrl, IDLE, ON, disable_indoor,
- *                    gnss_start; gnss_stop when the receiver is no longer wanted. It reads the on-chip engine's NMEA from
- *                    the hub's log (ONCHIP_NMEA[0][$GPGGA...) and the engine's state reports.
+ *                    AR table cut, the external LNA's pin mux, the hub's log facilities, GnssPvtDataStart, the ESW
+ *                    (/redwood/fw/gnss-esw-N-ADDR.bin) through the baseband's boot ROM, RESET, esw_ctrl, CONFIG_SET
+ *                    (no EXT_OSC), EXT_LNA, IDLE, ON, disable_indoor, gnss_start; the engine's statistics now and then
+ *                    while nothing is seen (-c); gnss_stop when the receiver is no longer wanted. It reads the on-chip
+ *                    engine's NMEA from the hub's log (ONCHIP_NMEA[0][$GPGGA...), its state reports, and its
+ *                    statistics (AGC, noise, search table, oscillator) for the diagnostics.
  *   (b) the fixes:   NMEA GGA, RMC, GSA, GSV (from the chip, or a file / FIFO / stdin with -n); MEIF PVT later
  *                    (meif_pvt_decode()). Accuracy is DOP x UERE until the engine gives its own.
  *   (c) locationd:   -L gpsd (the default): gnssd is com.apple.gpsd, in Apple's gpsd protocol (proto.gpsd, recovered from
@@ -16,19 +18,24 @@
  *                    until its Pause (Darwin notifications com.hakios.gnssd.start / .pause), or with -a always.
  *   (e) status:      /var/mobile/Library/Caches/com.hakios.gnssd/status.plist about once a second, then the Darwin
  *                    notification com.hakios.gnssd.status: state, satellites, DOPs, accuracy, the fix (on the phone's
- *                    screen only: positions never go to a log).
+ *                    screen only: positions never go to a log), and the diagnostics (step, engine state, ESW, AR cut,
+ *                    detections/attempts, AGC, noise, oscillator, masked hub lines).
+ *   (f) session log: STATUS_DIR/session-YYYYMMDD-HHMMSS.log for each receiver start (the last 10 kept): steps,
+ *                    states, statistics every 10 s, satellites, fix type and accuracy. Never a position.
  *
- *   gnssd [-L gpsd|sim] [-f FWDIR] [-n NMEA] [-t] [-a] [-i MS]
+ *   gnssd [-L gpsd|sim] [-f FWDIR] [-n NMEA] [-t] [-a] [-i MS] [-c S]
  *       -f FWDIR   the ESW's directory (default /redwood/fw)
  *       -n NMEA    NMEA from this file, FIFO or "-" instead of the chip; a regular file is replayed one epoch a second
  *       -t         stamp each fix with the time it is passed on, not the receiver's UTC (for a replayed stream)
  *       -a         the receiver always on
  *       -i MS      at most one fix every MS milliseconds
+ *       -c S       the engine's search statistics every S s while no satellite is in view (default 120, 0 never)
  *   gnssd parse [FILE]         NMEA -> one line per epoch: quality, satellites, DOP, accuracy (never the position)
  *   gnssd segments [FWDIR]     the ESW pieces the chip would be given
  */
 #import <CoreLocation/CoreLocation.h>
 #import <Foundation/Foundation.h>
+#include <ctype.h>
 #include <dirent.h>
 #include <dispatch/dispatch.h>
 #include <errno.h>
@@ -263,8 +270,10 @@ nmea_close_epoch(struct nmea *n, emit_fn emit)
 			f.sats[f.nsat++] = s;
 		}
 	}
-	if (f.sats_used == 0)
+	if (f.sats_used == 0 || f.quality <= 0) {    /* with no fix, GGA's count is not satellites used */
+		f.sats_used = 0;
 		for (int i = 0; i < f.nsat; i++) f.sats_used += f.sats[i].used;
+	}
 	if (n->date_y > 0 && n->epoch_tod >= 0) {
 		struct tm tm = { 0 };
 
@@ -426,10 +435,194 @@ static void receiver_off(void);
 static void feed_fix(const struct gnss_fix *f, double utc);
 static void feed_lost(void);
 
+/* ---- diagnostics and the session log: what the receiver did, for a field test with no computer ----------------- */
+
+#define STATUS_DIR "/var/mobile/Library/Caches/com.hakios.gnssd"
+#define STATUS_FILE STATUS_DIR "/status.plist"
+#define SESSIONS_KEPT 10
+#define HUB_LINES 30
+
+enum { CON_GPS, CON_GLO, CON_GAL, NCON };
+static NSString *const con_names[NCON] = { @"GPS", @"GLONASS", @"Galileo" };
+
+/* written by the chip's thread, read by the main queue: under diag_lock */
+static pthread_mutex_t diag_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct diag {
+	char step[80], step_error[200], engine[16], cntin[96];
+	int det[NCON], att[NCON], tables;   /* summed over the engine's statistics tables this session */
+	double agc_gps, agc_glo, noise_gps, noise_exp, osc_off_ppb, osc_unc_ppb;     /* NAN: not reported yet */
+	bool esw_loaded, ar_cut;
+	int esw_blocks;
+	double search_since;                /* mono_s() of the first gnss_start; 0: not searching yet */
+	char hub[HUB_LINES][160];
+	int hub_n, hub_next;
+} dg;
+static atomic_int sats_in_view;           /* the last epoch's, for the chip's thread (statistics checkpoints) */
+static double checkpoint_s = 120;         /* -c: the engine's statistics every so often while no satellite is seen */
+
+static void
+diag_reset(void)
+{
+	pthread_mutex_lock(&diag_lock);
+	memset(&dg, 0, sizeof(dg));
+	dg.agc_gps = dg.agc_glo = dg.noise_gps = dg.noise_exp = dg.osc_off_ppb = dg.osc_unc_ppb = NAN;
+	dg.esw_blocks = -1;
+	pthread_mutex_unlock(&diag_lock);
+	atomic_store(&sats_in_view, 0);
+}
+
+/*
+ * The session log: STATUS_DIR/session-YYYYMMDD-HHMMSS.log (0644), one per receiver start, the last SESSIONS_KEPT kept.
+ * Steps, states, the engine's statistics, satellites, fix type and accuracy: never a position. Hub lines are taken
+ * from a short list of kinds and masked again (mask_strict) before they are written.
+ */
+static pthread_mutex_t sess_lock = PTHREAD_MUTEX_INITIALIZER;
+static FILE *sess;
+static char sess_path[256];
+static double sess_t0;
+static atomic_uint sess_gen;
+
+static void
+slog(const char *fmt, ...)
+{
+	va_list ap;
+	time_t t = time(NULL);
+	char ts[16];
+	double e;
+
+	pthread_mutex_lock(&sess_lock);
+	if (sess) {
+		strftime(ts, sizeof(ts), "%H:%M:%S", localtime(&t));
+		e = mono_s() - sess_t0;
+		fprintf(sess, "%s +%02d:%02d ", ts, (int)e / 60, (int)e % 60);
+		va_start(ap, fmt);
+		vfprintf(sess, fmt, ap);
+		va_end(ap);
+		fputc('\n', sess);
+		fflush(sess);
+	}
+	pthread_mutex_unlock(&sess_lock);
+}
+
+static int
+cmp_names(const void *a, const void *b)
+{
+	return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+/* leave the newest `keep` session logs */
+static void
+sessions_prune(int keep)
+{
+	DIR *d = opendir(STATUS_DIR);
+	struct dirent *e;
+	char *names[256];
+	int n = 0;
+
+	if (d == NULL) return;
+	while ((e = readdir(d)) != NULL && n < 256)
+		if (strncmp(e->d_name, "session-", 8) == 0 && strstr(e->d_name, ".log")) names[n++] = strdup(e->d_name);
+	closedir(d);
+	qsort(names, n, sizeof(names[0]), cmp_names);           /* the names sort by time */
+	for (int i = 0; i < n; i++) {
+		if (i < n - keep) {
+			char p[512];
+
+			snprintf(p, sizeof(p), STATUS_DIR "/%s", names[i]);
+			unlink(p);
+		}
+		free(names[i]);
+	}
+}
+
+static void
+session_close_locked(const char *why)
+{
+	if (sess == NULL) return;
+	time_t t = time(NULL);
+	char ts[16];
+	double e = mono_s() - sess_t0;
+
+	strftime(ts, sizeof(ts), "%H:%M:%S", localtime(&t));
+	fprintf(sess, "%s +%02d:%02d session end: %s\n", ts, (int)e / 60, (int)e % 60, why);
+	fclose(sess);
+	sess = NULL;
+}
+
+/* the main queue, at each receiver start; returns the session's number */
+static unsigned
+session_open(const char *who)
+{
+	time_t t = time(NULL);
+	char name[64], up[32];
+	struct tm tm;
+	int fd;
+	unsigned gen;
+
+	localtime_r(&t, &tm);
+	strftime(name, sizeof(name), "session-%Y%m%d-%H%M%S.log", &tm);
+	pthread_mutex_lock(&sess_lock);
+	session_close_locked("a new session started");
+	gen = atomic_fetch_add(&sess_gen, 1) + 1;
+	sessions_prune(SESSIONS_KEPT - 1);
+	snprintf(sess_path, sizeof(sess_path), STATUS_DIR "/%s", name);
+	fd = open(sess_path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
+	if (fd >= 0) {
+		fchmod(fd, 0644);
+		sess = fdopen(fd, "a");
+	}
+	if (sess == NULL) {
+		say("session log %s: %s\n", sess_path, strerror(errno));
+		sess_path[0] = 0;
+	} else {
+		struct timeval bt;
+		size_t len = sizeof(bt);
+		char osv[32] = "?";
+		size_t ol = sizeof(osv);
+
+		sysctlbyname("kern.osversion", osv, &ol, NULL, 0);
+		if (sysctlbyname("kern.boottime", &bt, &len, NULL, 0) == 0) snprintf(up, sizeof(up), "%lds", (long)(t - bt.tv_sec));
+		else snprintf(up, sizeof(up), "?");
+		sess_t0 = mono_s();
+		strftime(name, sizeof(name), "%Y-%m-%d %H:%M:%S %z", &tm);
+		fprintf(sess, "# gnssd session log (docs/gnssd.md): %s, started by %s, uptime %s, system %s, gnssd of %s %s\n"
+		    "# sequence: AR table cut, pin mux, log facilities, 1c 01, ESW, RESET, esw_ctrl, CONFIG_SET (no EXT_OSC),"
+		    " EXT_LNA, IDLE, ON, disable_indoor, gnss_start; statistics every %.0f s while no satellite is seen\n"
+		    "# no positions are ever written here: satellites, fix type and accuracy only\n",
+		    name, who, up, osv, __DATE__, __TIME__, checkpoint_s);
+		fflush(sess);
+	}
+	pthread_mutex_unlock(&sess_lock);
+	return gen;
+}
+
+/* closes session `gen` (0: whichever is open) */
+static void
+session_close(unsigned gen, const char *why)
+{
+	pthread_mutex_lock(&sess_lock);
+	if (gen == 0 || gen == atomic_load(&sess_gen)) session_close_locked(why);
+	pthread_mutex_unlock(&sess_lock);
+}
+
+static void
+set_step(const char *s, const char *error)
+{
+	pthread_mutex_lock(&diag_lock);
+	snprintf(dg.step, sizeof(dg.step), "%s", s);
+	if (error) snprintf(dg.step_error, sizeof(dg.step_error), "%s", error);
+	pthread_mutex_unlock(&diag_lock);
+	if (error) slog("step %s FAILED: %s", s, error);
+	else slog("step: %s", s);
+}
+
 static void
 set_state(NSString *s, NSString *error)
 {
-	if (![s isEqualToString:state]) say("state: %s%s%s\n", s.UTF8String, error ? ": " : "", error ? error.UTF8String : "");
+	if (![s isEqualToString:state]) {
+		say("state: %s%s%s\n", s.UTF8String, error ? ": " : "", error ? error.UTF8String : "");
+		slog("state: %s%s%s", s.UTF8String, error ? ": " : "", error ? error.UTF8String : "");
+	}
 	state = s;
 	last_error = error;
 }
@@ -454,13 +647,24 @@ fix_ready(const struct gnss_fix *f)
 	if (!running) return;
 	last = *f;
 	have_last = true;
+	atomic_store(&sats_in_view, f->sats_seen);
 	if (type < 2 || f->hacc <= 0) {
 		if (![state isEqualToString:@"error"]) set_state(@"searching", nil);
-		if (last_good > 0 && t - last_good > 10) { feed_lost(); last_good = 0; }
+		if (last_good > 0 && t - last_good > 10) {
+			feed_lost();
+			last_good = 0;
+			slog("fix lost");
+		}
 		return;
 	}
 	set_state(@"fix", nil);
-	if (first_fix_at == 0) first_fix_at = t;
+	if (last_good == 0)
+		slog("fix: %dD, %d of %d satellites, hdop %.1f, accuracy %.1f m (vertical %.1f)%s", type, f->sats_used,
+		    f->sats_seen, f->hdop, f->hacc, f->vacc, first_fix_at == 0 ? ", the first (TTFF below)" : "");
+	if (first_fix_at == 0) {
+		first_fix_at = t;
+		slog("TTFF %.1f s", t - running_since);
+	}
 	last_good = t;
 	if (min_interval_s > 0 && last_sent > 0 && t - last_sent < min_interval_s) return;
 	last_sent = t;
@@ -485,12 +689,240 @@ post_state(NSString *s, NSString *error)
 	dispatch_async(q, ^{ set_state(s, error); });
 }
 
+/*
+ * Masks a hub line for the app and the session log, harder than gc_mask_position(): EVERY number with four or more
+ * decimals (the engine's statistics included; gnssd writes those itself, rounded), then NMEA's latitude and longitude.
+ */
+static void
+mask_strict(char *t)
+{
+	size_t k = strlen(t);
+
+	for (size_t i = 0; i < k; i++) {
+		if (t[i] == '.' && i > 0 && t[i - 1] >= '0' && t[i - 1] <= '9') {
+			size_t j = i + 1;
+
+			while (j < k && t[j] >= '0' && t[j] <= '9') j++;
+			if (j - i - 1 >= 4) {
+				size_t b = i;
+
+				while (b > 0 && ((t[b - 1] >= '0' && t[b - 1] <= '9') || t[b - 1] == '-')) b--;
+				for (size_t x = b; x < j; x++) t[x] = '#';
+			}
+			i = j;
+		}
+	}
+	gc_mask_position(t);
+}
+
+/* one line for the app's hub log (the last HUB_LINES) and the session log; masked here. Under diag_lock. */
+static void
+hub_keep_locked(const char *line)
+{
+	char m[160];
+	int last = (dg.hub_next + HUB_LINES - 1) % HUB_LINES;
+
+	snprintf(m, sizeof(m), "%s", line);
+	mask_strict(m);
+	if (dg.hub_n > 0 && strcmp(dg.hub[last], m) == 0) return;      /* the same again */
+	strcpy(dg.hub[dg.hub_next], m);
+	dg.hub_next = (dg.hub_next + 1) % HUB_LINES;
+	if (dg.hub_n < HUB_LINES) dg.hub_n++;
+	slog("hub: %s", m);
+}
+
+/* the kinds of hub line worth a field test's log: the engine's bring-up, its search, its clock, its troubles */
+static const char *const hub_kinds[] = { "INIT_STAGE", "LoadMeasEngine", "UpdateOnchipRequest", "Asic Off",
+	"AsicToStandby", "IndoorDetectionByHost", "Strong Sats", "meif_state_report_msg", "Detect(#)", "cnt in clk",
+	"MeasCNTIN", "SetCntinMeas", "IsExtOscAvailable", "SetRefClockParams", "assert", "Assert", "ASSERT", "WARNING",
+	"Error", "ERROR", NULL };
+
+/* one record of the hub's log (its "hhhh Q...D $...X " prefix taken off): numbers for the status, lines for the logs */
+static void
+hub_record(const char *b)
+{
+	char name[8], line[200];
+	int det, xc, att, vpr, vrr;
+	double dp, xp;
+	const char *m;
+
+	/* never anything near a position, and nothing of the NMEA (which only the screen shows) */
+	if (strstr(b, "Lat") || strstr(b, "Lon") || strstr(b, "LLA") || strstr(b, "NMEA") || strstr(b, "$G") ||
+	    strstr(b, "Pos")) return;
+	pthread_mutex_lock(&diag_lock);
+	if ((m = strstr(b, "AGC report::")) != NULL) {
+		const char *g = strstr(m, "GPS_GAL AAGC "), *r = strstr(m, "GLO AAGC ");
+
+		if (g) dg.agc_gps = atof(g + 13);
+		if (r) dg.agc_glo = atof(r + 9);
+	} else if ((m = strstr(b, "LogNoiseStats(GPS_GAL) Measured Noise(u:")) != NULL) {
+		const char *tb = strstr(m, "Noise Table(u:");
+
+		dg.noise_gps = atof(m + 40);
+		if (tb) dg.noise_exp = atof(tb + 14);
+		snprintf(line, sizeof(line), "noise GPS_GAL %.3f, table %.3f", dg.noise_gps, dg.noise_exp);
+		hub_keep_locked(line);
+	} else if ((m = strstr(b, "LogNoiseStats(GLNS) Measured Noise(u:")) != NULL) {
+		const char *tb = strstr(m, "Noise Table(u:");
+
+		snprintf(line, sizeof(line), "noise GLNS %.3f, table %.3f", atof(m + 37), tb ? atof(tb + 14) : NAN);
+		hub_keep_locked(line);
+	} else if ((m = strstr(b, "GetOscOffset(")) != NULL) {
+		double off = NAN, unc = NAN;
+
+		if (sscanf(m + 13, "%lf, %lf", &off, &unc) == 2) {
+			dg.osc_off_ppb = off * 1e9;
+			dg.osc_unc_ppb = unc * 1e9;
+			snprintf(line, sizeof(line), "oscillator: GetOscOffset %.0f ppb, uncertainty %.0f ppb", dg.osc_off_ppb,
+			    dg.osc_unc_ppb);
+			hub_keep_locked(line);
+		}
+	} else if (sscanf(b, " %7[A-Z], %d, %lf, %d, %lf, %d, %d, %d", name, &det, &dp, &xc, &xp, &att, &vpr, &vrr) == 8) {
+		int c = strcmp(name, "GPS") == 0 ? CON_GPS : strcmp(name, "GLNS") == 0 ? CON_GLO :
+		    strcmp(name, "GAL") == 0 ? CON_GAL : -1;
+
+		if (c >= 0) {
+			dg.det[c] += det;
+			dg.att[c] += att;
+			if (c == CON_GPS) dg.tables++;
+		}
+		snprintf(line, sizeof(line), "search %s: %d detections in %d attempts, %d xcorr, %d valid PR, %d valid RR",
+		    name, det, att, xc, vpr, vrr);
+		hub_keep_locked(line);
+	} else {
+		if ((m = strstr(b, "SetCntinMeas(")) != NULL) {
+			const char *e = strchr(m, ')');
+			int n = e ? (int)(e - m - 13) : (int)strlen(m + 13);
+
+			snprintf(dg.cntin, sizeof(dg.cntin), "%.*s", n > 60 ? 60 : n, m + 13);
+		} else if (strstr(b, "no reference cnt in clk")) {
+			snprintf(dg.cntin, sizeof(dg.cntin), "none (no reference clock)");
+		}
+		for (int i = 0; hub_kinds[i]; i++) {
+			if (strstr(b, hub_kinds[i])) {
+				hub_keep_locked(b);
+				break;
+			}
+		}
+	}
+	pthread_mutex_unlock(&diag_lock);
+}
+
+/* "hhhh Q1234567D " at t + i, after the start or a record's end ('.', ' '): the start of a hub log record */
+static size_t
+rec_start(const char *t, size_t i)
+{
+	size_t j = i, h = 0, d = 0;
+
+	if (i > 0 && t[i - 1] != '.' && t[i - 1] != ' ') return 0;
+	while (h < 4 && isxdigit((unsigned char)t[j])) { j++; h++; }
+	if (h < 3 || t[j] != ' ' || t[j + 1] != 'Q') return 0;
+	j += 2;
+	while (isdigit((unsigned char)t[j])) { j++; d++; }
+	if (d < 5 || t[j] != 'D' || t[j + 1] != ' ') return 0;
+	return j + 2 - i;
+}
+
+/* the start of the next record's prefix left at the end of a record: " fffe Q981", " fffe", " f" (lowercase hex) */
+static size_t
+last_token(const char *r, size_t s, size_t len)
+{
+	size_t x = len;
+
+	while (x > s && r[x - 1] != ' ') x--;
+	return x;
+}
+
+static bool
+counter_like(const char *r, size_t from, size_t to)
+{
+	bool letter = false;
+
+	if (to - from < 1 || to - from > 4) return false;
+	for (size_t i = from; i < to; i++) {
+		if (!isxdigit((unsigned char)r[i]) || isupper((unsigned char)r[i])) return false;
+		if (isalpha((unsigned char)r[i])) letter = true;
+	}
+	return letter;
+}
+
+static size_t
+trim_next_prefix(char *r, size_t s, size_t len)
+{
+	size_t x = last_token(r, s, len);
+
+	if (x > s && r[x] == 'Q') {         /* "fffe Q981" */
+		for (size_t i = x + 1; i < len; i++) if (!isdigit((unsigned char)r[i])) return len;
+		size_t y = last_token(r, s, x - 1);
+
+		if (y > s && counter_like(r, y, x - 1)) len = y - 1;
+		else return len;
+	} else if (x > s && counter_like(r, x, len)) {
+		len = x - 1;
+	}
+	r[len] = 0;
+	return len;
+}
+
+/* an RPC 0x19 from the hub: one or more records, the first maybe the tail of one before */
+static void
+hub_text(const char *t)
+{
+	size_t n = strlen(t), i = 0, from = 0;
+	char rec[1100];
+
+	while (i <= n) {
+		size_t p = i < n ? rec_start(t, i) : 0;
+
+		if (i == n || p > 0) {
+			if (i > from) {
+				size_t len = i - from, s = 0;
+
+				if (len >= sizeof(rec)) len = sizeof(rec) - 1;
+				memcpy(rec, t + from, len);
+				rec[len] = 0;
+				/* the level tag "$274239I " / "#288863D " / "&300274W " */
+				if ((rec[0] == '$' || rec[0] == '#' || rec[0] == '&') && isdigit((unsigned char)rec[1])) {
+					s = 1;
+					while (isdigit((unsigned char)rec[s])) s++;
+					if (isalpha((unsigned char)rec[s]) && rec[s + 1] == ' ') s += 2;
+					else s = 0;
+				}
+				/* a prefix cut in two by the RPCs: "0795D $693323W ..." */
+				if (s == 0) {
+					char *tag = strstr(rec, "D $");
+
+					if (tag && tag - rec < 12 && isdigit((unsigned char)tag[3])) {
+						size_t x = (size_t)(tag - rec) + 3;
+
+						while (isdigit((unsigned char)rec[x])) x++;
+						if (isalpha((unsigned char)rec[x]) && rec[x + 1] == ' ') s = x + 2;
+					}
+				}
+				while (len > s && (rec[len - 1] == ' ' || rec[len - 1] == '.')) rec[--len] = 0;
+				/* ... or at the end: "... 42104 fffe Q981", "... @42 f" (the next record's counter) */
+				len = trim_next_prefix(rec, s, len);
+				if (len > s) hub_record(rec + s);
+			}
+			if (i == n) break;
+			i += p;
+			from = i;
+			continue;
+		}
+		i++;
+	}
+}
+
 static void
 chip_text(const char *line, void *ctx)
 {
 	const char *p = line, *m;
 
 	(void)ctx;
+	if (strstr(line, "ONCHIP_NMEA[") == NULL) {
+		hub_text(line);
+		return;
+	}
 	/* "ONCHIP_NMEA[0][$GPGGA,...*hh" (the engine repeats the prefix now and then): the sentence after the last one */
 	while ((m = strstr(p, "ONCHIP_NMEA[")) != NULL) p = m + 12;
 	if (p == line) return;
@@ -519,6 +951,10 @@ chip_state(unsigned from, unsigned to, void *ctx)
 
 	(void)ctx;
 	say("engine: %s -> %s\n", from < 11 ? names[from] : "?", to < 11 ? names[to] : "?");
+	slog("engine: %s -> %s", from < 11 ? names[from] : "?", to < 11 ? names[to] : "?");
+	pthread_mutex_lock(&diag_lock);
+	snprintf(dg.engine, sizeof(dg.engine), "%s", to < 11 ? names[to] : "?");
+	pthread_mutex_unlock(&diag_lock);
 	if (to == GC_ERROR) post_state(@"error", @"the measurement engine reports ERROR");
 }
 
@@ -527,14 +963,26 @@ chip_assert(const char *file, unsigned line, void *ctx)
 {
 	(void)ctx;
 	say("the chip asserted: %s line %u\n", file, line);
+	slog("the chip asserted: %s line %u", file, line);
 	post_state(@"error", [NSString stringWithFormat:@"chip assert %s:%u", file, line]);
 }
+
+static char chip_last_log[200];           /* what gnss_chip said last: the reason, when a step fails */
 
 static void
 chip_log(const char *line, void *ctx)
 {
 	(void)ctx;
 	say("%s\n", line);
+	slog("%s", line);
+	snprintf(chip_last_log, sizeof(chip_last_log), "%s", strncmp(line, "gnss_chip: ", 11) == 0 ? line + 11 : line);
+}
+
+static void
+chip_step(const char *name, void *ctx)
+{
+	(void)ctx;
+	set_step(name, NULL);
 }
 
 static double
@@ -552,7 +1000,8 @@ chip_wait_want(bool want, double seconds)
 {
 	double end = mono_s() + seconds;
 
-	while (atomic_load(&chip_want) != want && mono_s() < end) gc_poll(0.2);
+	while (atomic_load(&chip_want) != want && mono_s() < end)
+		if (gc_poll(0.2) != 0) usleep(200000);
 	return atomic_load(&chip_want) == want;
 }
 
@@ -565,66 +1014,165 @@ chip_bringup(void)
 	int n = esw_segments(fw_dir, seg, 8);
 	static const uint8_t pin_mux[2] = { 17, 1 }, pvt_start[1] = { 1 };
 	static const unsigned facilities[] = { 0x0e, 0x16, 0x4f, 0x97 };
+	const char *what = "start";
+	int cut;
 
+	chip_last_log[0] = 0;
 	if (n <= 0) {
+		set_step("ESW files", "no gnss-esw-N-ADDR.bin in the firmware directory");
 		post_state(@"error", [NSString stringWithFormat:@"no ESW (gnss-esw-N-ADDR.bin) in %s", fw_dir]);
 		return false;
 	}
 	for (int i = 0; i < n; i++) gs[i] = (struct gc_segment){ seg[i].path, seg[i].addr };
 	/* the hub's log facilities upset its RPC channel early after boot (docs/gnss.md): not before 3 minutes */
-	while (uptime_s() < 180) {
+	for (double up; (up = uptime_s()) < 180;) {
+		char w[80];
+
+		snprintf(w, sizeof(w), "waiting for the hub (%.0f s more)", 180 - up);
+		pthread_mutex_lock(&diag_lock);
+		snprintf(dg.step, sizeof(dg.step), "%s", w);
+		pthread_mutex_unlock(&diag_lock);
 		post_state(@"starting", @"waiting for the hub to settle (3 minutes after boot)");
 		if (chip_wait_want(false, 5)) return false;
 	}
+	slog("the hub has been up 3 minutes: bring-up");
 	post_state(@"starting", nil);
+	set_step(what = "AR table cut", NULL);
+	cut = gc_ar_table_cut();
+	if (cut < 0) goto fail;
+	pthread_mutex_lock(&diag_lock);
+	dg.ar_cut = cut > 0;
+	pthread_mutex_unlock(&diag_lock);
+	set_step(what = "pin mux", NULL);
 	if (gc_rpc(0x34, pin_mux, 2) != 0) goto fail;                         /* P17 = mode 1: the external LNA */
+	set_step(what = "log to host", NULL);
 	if (gc_pvt("enable_log_to_host_LOG_INFO_Overwrite") != 0) goto fail;
 	if (!facilities_on) {
+		set_step(what = "log facilities", NULL);
 		for (unsigned i = 0; i < sizeof(facilities) / sizeof(facilities[0]); i++) {
 			if (gc_log_facility(facilities[i]) != 0) goto fail;
 			gc_poll(2);                                                    /* a few, 2 s apart */
 		}
 		facilities_on = true;
 	}
+	set_step(what = "GnssPvtDataStart", NULL);
 	if (gc_rpc(0x1c, pvt_start, 1) != 0) goto fail;                       /* GnssPvtDataStart(1) */
 	post_state(@"loading_esw", nil);
-	if (gc_esw_load(gs, n) != 0) { post_state(@"error", @"the ESW did not load"); return false; }
-	if (gc_engine_on() != 0) { post_state(@"error", @"the engine did not come ON"); return false; }
+	set_step(what = "ESW load", NULL);
+	if (gc_esw_load(gs, n) != 0) {
+		set_step(what, chip_last_log[0] ? chip_last_log : "the ESW did not load");
+		post_state(@"error", @"the ESW did not load");
+		return false;
+	}
+	pthread_mutex_lock(&diag_lock);
+	dg.esw_loaded = true;
+	dg.esw_blocks = gc_esw_blocks();
+	pthread_mutex_unlock(&diag_lock);
+	if (gc_engine_on() != 0) {
+		char s[80];
+
+		pthread_mutex_lock(&diag_lock);
+		snprintf(s, sizeof(s), "%s", dg.step);
+		pthread_mutex_unlock(&diag_lock);
+		set_step(s, chip_last_log[0] ? chip_last_log : "the engine did not come ON");
+		post_state(@"error", @"the engine did not come ON");
+		return false;
+	}
 	post_state(@"engine_on", nil);
+	set_step(what = "disable_indoor", NULL);
 	if (gc_pvt("disable_indoor") != 0) goto fail;                         /* or it gives up after 16 s indoors */
 	gc_poll(1);
+	set_step(what = "gnss_start", NULL);
 	if (gc_pvt("gnss_start") != 0) goto fail;                             /* UpdateOnchipRequest: ASIC on */
+	pthread_mutex_lock(&diag_lock);
+	dg.search_since = mono_s();
+	pthread_mutex_unlock(&diag_lock);
+	set_step("searching", NULL);
 	post_state(@"searching", nil);
 	return true;
 fail:
+	set_step(what, chip_last_log[0] ? chip_last_log : "the hub did not acknowledge a request");
 	post_state(@"error", @"the hub did not acknowledge a request");
 	return false;
+}
+
+/*
+ * The engine prints its search statistics (detections and attempts per constellation, the measured noise) only when
+ * its measurement engine unloads. So while no satellite is in view, every `checkpoint_s`: gnss_stop, its table, then
+ * disable_indoor and gnss_start again (as the open-sky phases of docs/gnss.md did). Nothing is lost: there is nothing
+ * being tracked. With a satellite in view it is left alone.
+ */
+static bool
+chip_checkpoint(void)
+{
+	set_step("statistics (gnss_stop)", NULL);
+	if (gc_pvt("gnss_stop") != 0) return false;
+	gc_poll(5);
+	if (!atomic_load(&chip_want)) return true;
+	set_step("disable_indoor", NULL);
+	if (gc_pvt("disable_indoor") != 0) return false;
+	gc_poll(1);
+	set_step("gnss_start", NULL);
+	if (gc_pvt("gnss_start") != 0) return false;
+	set_step("searching", NULL);
+	return true;
 }
 
 static void *
 chip_thread(void *arg)
 {
-	struct gc_events ev = { .text = chip_text, .state = chip_state, .chip_assert = chip_assert, .log = chip_log };
+	struct gc_events ev = { .text = chip_text, .state = chip_state, .chip_assert = chip_assert, .log = chip_log,
+		.step = chip_step };
 
 	(void)arg;
 	for (;;) {
+		unsigned gen;
+
 		pthread_mutex_lock(&chip_lock);
 		while (!atomic_load(&chip_want)) pthread_cond_wait(&chip_cond, &chip_lock);
 		pthread_mutex_unlock(&chip_lock);
+		gen = atomic_load(&sess_gen);
 		if (gc_open(&ev) != 0) {
-			post_state(@"error", [NSString stringWithFormat:@"/dev/hakios-gnss: %s", strerror(errno)]);
+			int e = errno;
+
+			set_step("open /dev/hakios-gnss", strerror(e));
+			post_state(@"error", [NSString stringWithFormat:@"/dev/hakios-gnss: %s", strerror(e)]);
 			while (atomic_load(&chip_want)) sleep(1);
+			session_close(gen, "the receiver was let go");
 			continue;
 		}
 		if (chip_bringup()) {
-			while (atomic_load(&chip_want))
-				if (gc_poll(0.5) != 0) { post_state(@"error", @"/dev/hakios-gnss failed"); break; }
+			double next = mono_s() + checkpoint_s;
+
+			while (atomic_load(&chip_want)) {
+				if (gc_poll(0.5) != 0) {
+					set_step("searching", "/dev/hakios-gnss failed");
+					post_state(@"error", @"/dev/hakios-gnss failed");
+					break;
+				}
+				if (checkpoint_s > 0 && mono_s() >= next) {
+					if (atomic_load(&sats_in_view) == 0 && !chip_checkpoint()) {
+						set_step("statistics", chip_last_log[0] ? chip_last_log : "the hub did not acknowledge");
+						post_state(@"error", @"the hub did not acknowledge a request");
+						break;
+					}
+					next = mono_s() + checkpoint_s;
+				}
+			}
+			bool failed = atomic_load(&chip_want);
+
+			if (!failed) set_step("gnss_stop", NULL);
 			gc_pvt("gnss_stop");
-			gc_poll(1);
+			gc_poll(5);                                /* the engine's last statistics, for the session log */
+			while (atomic_load(&chip_want))            /* after a failure: in error until the receiver is let go */
+				if (gc_poll(0.5) != 0) usleep(500000);
 		} else {
-			while (atomic_load(&chip_want)) gc_poll(0.5);      /* stay in error until the receiver is let go */
+			while (atomic_load(&chip_want))            /* stay in error until the receiver is let go */
+				if (gc_poll(0.5) != 0) usleep(500000);
 		}
 		gc_close();
+		set_step("off", NULL);
+		session_close(gen, "the receiver was let go");
 		dispatch_async(q, ^{ if (!running) set_state(@"off", nil); });
 	}
 	return NULL;
@@ -715,9 +1263,17 @@ receiver_on(void)
 	first_fix_at = 0;
 	last_good = 0;
 	have_last = false;
+	diag_reset();
+	{
+		char who[64];
+
+		snprintf(who, sizeof(who), "%s%s%s", loc_on ? "locationd" : "", loc_on && user_on ? ", " : "",
+		    user_on ? "the app" : always_on ? "always" : "");
+		session_open(who);
+		say("receiver on (%s), session log %s\n", who, sess_path[0] ? sess_path : "none");
+	}
+	state = @"off";
 	set_state(@"starting", nil);
-	say("receiver on (%s%s%s)\n", loc_on ? "locationd" : "", loc_on && user_on ? ", " : "", user_on ? "the app" :
-	    always_on ? "always" : "");
 	if (nmea_path) {
 		file_on();
 		set_state(@"searching", nil);
@@ -740,12 +1296,93 @@ receiver_off(void)
 	have_last = false;
 	set_state(@"off", nil);
 	say("receiver off after %.0f s\n", mono_s() - running_since);
+	slog("receiver off after %.0f s", mono_s() - running_since);
+	if (nmea_path) session_close(0, "the receiver was let go");
 }
 
 /* ---- (e) the status, for the app --------------------------------------------------------------------------------- */
 
-#define STATUS_DIR "/var/mobile/Library/Caches/com.hakios.gnssd"
-#define STATUS_FILE STATUS_DIR "/status.plist"
+static const char sys_abbr[] = "GRECJS";      /* sys_names' letters */
+
+/* every 10 s while the receiver runs: one line of numbers, the satellites if any (no position, ever) */
+static void
+session_stats(void)
+{
+	struct gnss_fix *f = have_last ? &last : NULL;
+	char l[1200];
+	int k;
+
+	pthread_mutex_lock(&diag_lock);
+	k = snprintf(l, sizeof(l), "stats: state %s, engine %s, step %s, search %.0f s, %d in view / %d used, fix %dD",
+	    state.UTF8String, dg.engine[0] ? dg.engine : "-", dg.step[0] ? dg.step : "-",
+	    dg.search_since > 0 ? mono_s() - dg.search_since : 0, f ? f->sats_seen : 0, f ? f->sats_used : 0,
+	    f ? fix_type(f) : 0);
+	if (f && fix_type(f) >= 2)
+		k += snprintf(l + k, sizeof(l) - k, ", accuracy %.1f m (vertical %.1f), hdop %.1f", f->hacc, f->vacc, f->hdop);
+	if (!isnan(dg.agc_gps) || !isnan(dg.agc_glo))
+		k += snprintf(l + k, sizeof(l) - k, ", AGC GPS %.2f GLO %.2f dB", dg.agc_gps, dg.agc_glo);
+	if (!isnan(dg.noise_gps)) k += snprintf(l + k, sizeof(l) - k, ", noise %.3f (table %.3f)", dg.noise_gps, dg.noise_exp);
+	if (dg.tables > 0)
+		k += snprintf(l + k, sizeof(l) - k, ", detections/attempts GPS %d/%d GLO %d/%d GAL %d/%d (%d tables)",
+		    dg.det[CON_GPS], dg.att[CON_GPS], dg.det[CON_GLO], dg.att[CON_GLO], dg.det[CON_GAL], dg.att[CON_GAL],
+		    dg.tables);
+	pthread_mutex_unlock(&diag_lock);
+	slog("%s", l);
+	if (f && f->nsat > 0) {
+		k = snprintf(l, sizeof(l), "sats:");
+		for (int i = 0; i < f->nsat && k < (int)sizeof(l) - 40; i++) {
+			const struct sat *s = &f->sats[i];
+
+			k += snprintf(l + k, sizeof(l) - k, " %c%d %.0fdB", sys_abbr[s->sys], s->prn, s->cn0);
+			if (s->elev >= 0 && s->azim >= 0) k += snprintf(l + k, sizeof(l) - k, " el%d az%d", s->elev, s->azim);
+			if (s->used) k += snprintf(l + k, sizeof(l) - k, " used");
+			k += snprintf(l + k, sizeof(l) - k, ";");
+		}
+		slog("%s", l);
+	}
+}
+
+static void
+diag_status(NSMutableDictionary *d)
+{
+	pthread_mutex_lock(&diag_lock);
+	if (dg.engine[0]) d[@"engineState"] = @(dg.engine);
+	if (dg.step[0]) d[@"step"] = @(dg.step);
+	if (dg.step_error[0]) d[@"stepError"] = @(dg.step_error);
+	if (dg.tables > 0) {
+		NSMutableDictionary *det = [NSMutableDictionary dictionary], *att = [NSMutableDictionary dictionary];
+
+		for (int c = 0; c < NCON; c++) {
+			det[con_names[c]] = @(dg.det[c]);
+			att[con_names[c]] = @(dg.att[c]);
+		}
+		d[@"detections"] = det;
+		d[@"attempts"] = att;
+		d[@"statsTables"] = @(dg.tables);
+	}
+	if (!isnan(dg.agc_gps)) d[@"agcGps"] = @((float)dg.agc_gps);
+	if (!isnan(dg.agc_glo)) d[@"agcGlonass"] = @((float)dg.agc_glo);
+	if (!isnan(dg.noise_gps)) d[@"noiseGps"] = @((float)dg.noise_gps);
+	if (!isnan(dg.noise_exp)) d[@"noiseExpected"] = @((float)dg.noise_exp);
+	if (!isnan(dg.osc_off_ppb)) d[@"oscOffsetPpb"] = @((float)dg.osc_off_ppb);
+	if (!isnan(dg.osc_unc_ppb)) d[@"oscUncertaintyPpb"] = @((float)dg.osc_unc_ppb);
+	if (dg.cntin[0]) d[@"cntin"] = @(dg.cntin);
+	d[@"eswLoaded"] = @(dg.esw_loaded);
+	if (dg.esw_blocks >= 0) d[@"eswBlocks"] = @(dg.esw_blocks);
+	d[@"arTableCut"] = @(dg.ar_cut);
+	if (dg.search_since > 0) d[@"searchSeconds"] = @((float)(mono_s() - dg.search_since));
+	NSMutableArray *hub = [NSMutableArray array];
+	for (int i = 0; i < dg.hub_n; i++) {
+		NSString *s = @(dg.hub[(dg.hub_next + HUB_LINES - dg.hub_n + i) % HUB_LINES]);
+
+		if (s) [hub addObject:s];
+	}
+	d[@"hubLog"] = hub;
+	pthread_mutex_unlock(&diag_lock);
+	pthread_mutex_lock(&sess_lock);
+	if (sess_path[0]) d[@"sessionLog"] = @(sess_path);
+	pthread_mutex_unlock(&sess_lock);
+}
 
 static void
 write_status(void)
@@ -796,6 +1433,7 @@ write_status(void)
 		}
 		if (first_fix_at > 0) d[@"ttffSeconds"] = @((float)(first_fix_at - running_since));
 		d[@"receiverOnSeconds"] = @((float)(running ? mono_s() - running_since : 0));
+		diag_status(d);
 		d[@"updated"] = [NSDate date];
 		NSData *data = [NSPropertyListSerialization dataWithPropertyList:d format:NSPropertyListBinaryFormat_v1_0
 		                                                        options:0 error:nil];
@@ -822,7 +1460,12 @@ status_start(void)
 	chmod(STATUS_DIR, 0755);
 	tick = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
 	dispatch_source_set_timer(tick, dispatch_time(DISPATCH_TIME_NOW, 0), NSEC_PER_SEC, NSEC_PER_SEC / 10);
-	dispatch_source_set_event_handler(tick, ^{ write_status(); });
+	dispatch_source_set_event_handler(tick, ^{
+		static unsigned n;
+
+		write_status();
+		if (running && ++n % 10 == 0) session_stats();
+	});
 	dispatch_resume(tick);
 	notify_register_dispatch("com.hakios.gnssd.start", &token, q, ^(int t) {
 		(void)t;
@@ -1236,7 +1879,7 @@ main(int argc, char **argv)
 		for (int i = 0; i < n; i++) printf("%s@%x\n", s[i].path, s[i].addr);
 		return n > 0 ? 0 : 1;
 	}
-	while ((c = getopt(argc, argv, "L:f:n:tai:")) != -1) {
+	while ((c = getopt(argc, argv, "L:f:n:tai:c:")) != -1) {
 		switch (c) {
 		case 'L':
 			if (strcmp(optarg, "sim") == 0) feed = FEED_SIM;
@@ -1248,9 +1891,10 @@ main(int argc, char **argv)
 		case 't': stamp_now = true; break;
 		case 'a': always_on = true; break;
 		case 'i': min_interval_s = atof(optarg) / 1000; break;
+		case 'c': checkpoint_s = atof(optarg); break;
 		default:
 		usage:
-			fprintf(stderr, "usage: gnssd [-L gpsd|sim] [-f FWDIR] [-n NMEA] [-t] [-a] [-i MS] | gnssd parse [FILE] |"
+			fprintf(stderr, "usage: gnssd [-L gpsd|sim] [-f FWDIR] [-n NMEA] [-t] [-a] [-i MS] [-c S] | gnssd parse [FILE] |"
 			    " gnssd segments [FWDIR]\n");
 			return 2;
 		}
@@ -1263,8 +1907,11 @@ main(int argc, char **argv)
 	dispatch_source_set_event_handler(term, ^{
 		receiver_off();
 		write_status();
-		/* give the chip's thread its gnss_stop */
-		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), q, ^{ exit(0); });
+		/* give the chip's thread its gnss_stop and the engine's last statistics (5 s) */
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.5 * NSEC_PER_SEC)), q, ^{
+			session_close(0, "gnssd stopped (SIGTERM)");
+			exit(0);
+		});
 	});
 	dispatch_resume(term);
 	/* locationd's GNSS stack (the seed in var/mobile sets it on a fresh data volume; a kept one may predate it) */
