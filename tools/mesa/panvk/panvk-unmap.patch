@@ -1,0 +1,96 @@
+panvk: a buffer's CPU mapping undone through the libdrm stand-in on Darwin, not munmap()
+
+Applied by tools/mk-panvk.sh only, after tools/mesa/*.patch (pan_kmod.h's __APPLE__ mapping is panfrost-darwin.patch's) and the
+other panvk patches, to Mesa 25.0.7 (Mesa's own licence, MIT, applies to the lines it changes). Written for Scion.
+  - pan_kmod.h: pan_kmod_bo_munmap(), hakios_drm_unmap() on Darwin, os_munmap() elsewhere.
+  - panvk_buffer.c, panvk_device_memory.c, panvk_image.c, panvk_priv_bo.c: their os_munmap() of a buffer's mapping is that.
+On Darwin a buffer has one mapping per process (IOKit's), so a VkBuffer covering its whole VkDeviceMemory got the memory's own
+mapping, and vkDestroyBuffer's munmap() took it away under vkFreeMemory, whose munmap() then fell on a hole: a VM guard
+exception (kGUARD_EXC_DEALLOC_GAP), fatal in applications and app extensions (every Metal client on the S9, build 45).
+
+--- a/src/panfrost/lib/kmod/pan_kmod.h
++++ b/src/panfrost/lib/kmod/pan_kmod.h
+@@ -634,6 +634,21 @@
+    return host_addr;
+ }
+ 
++/* Scion: undo pan_kmod_bo_mmap(). On Darwin the kernel's driver made the mapping, one per buffer
++ * and process, which src/hakios-drm counts and unmaps when its last user does; munmap() would take
++ * it away from every user at once. */
++static inline int
++pan_kmod_bo_munmap(struct pan_kmod_bo *bo, void *host_addr, size_t size)
++{
++#ifdef __APPLE__
++   (void)size;
++   hakios_drm_unmap(bo->dev->fd, bo->handle, host_addr);
++   return 0;
++#else
++   return os_munmap(host_addr, size);
++#endif
++}
++
+ static inline size_t
+ pan_kmod_bo_size(struct pan_kmod_bo *bo)
+ {
+--- a/src/panfrost/vulkan/panvk_buffer.c
++++ b/src/panfrost/vulkan/panvk_buffer.c
+@@ -136,7 +136,7 @@
+       uintptr_t map_start = (uintptr_t)buffer->host_ptr & ~(pgsize - 1);
+       uintptr_t map_end =
+          ALIGN_POT((uintptr_t)buffer->host_ptr + buffer->vk.size, pgsize);
+-      ASSERTED int ret = os_munmap((void *)map_start, map_end - map_start);
++      ASSERTED int ret = pan_kmod_bo_munmap(buffer->bo, (void *)map_start, map_end - map_start);
+ 
+       assert(!ret);
+       buffer->host_ptr = NULL;
+--- a/src/panfrost/vulkan/panvk_device_memory.c
++++ b/src/panfrost/vulkan/panvk_device_memory.c
+@@ -33,7 +33,7 @@
+ {
+    if (mem->addr.host) {
+       ASSERTED int ret =
+-         os_munmap((void *)mem->addr.host, pan_kmod_bo_size(mem->bo));
++         pan_kmod_bo_munmap(mem->bo, (void *)mem->addr.host, pan_kmod_bo_size(mem->bo));
+ 
+       assert(!ret);
+       mem->addr.host = NULL;
+@@ -191,7 +191,7 @@
+                             pan_kmod_bo_size(mem->bo));
+ 
+       if (mem->debug.host_mapping)
+-         os_munmap(mem->debug.host_mapping, pan_kmod_bo_size(mem->bo));
++         pan_kmod_bo_munmap(mem->bo, mem->debug.host_mapping, pan_kmod_bo_size(mem->bo));
+    }
+ 
+    panvk_memory_munmap(mem);
+--- a/src/panfrost/vulkan/panvk_image.c
++++ b/src/panfrost/vulkan/panvk_image.c
+@@ -521,7 +521,7 @@
+          }
+       }
+ 
+-      ASSERTED int ret = os_munmap(bo_base, pan_kmod_bo_size(bo));
++      ASSERTED int ret = pan_kmod_bo_munmap(bo, bo_base, pan_kmod_bo_size(bo));
+       assert(!ret);
+    }
+ }
+--- a/src/panfrost/vulkan/panvk_priv_bo.c
++++ b/src/panfrost/vulkan/panvk_priv_bo.c
+@@ -97,7 +97,7 @@
+ 
+ err_munmap_bo:
+    if (priv_bo->addr.host) {
+-      ret = os_munmap(priv_bo->addr.host, pan_kmod_bo_size(bo));
++      ret = pan_kmod_bo_munmap(bo, priv_bo->addr.host, pan_kmod_bo_size(bo));
+       assert(!ret);
+    }
+ 
+@@ -137,7 +137,7 @@
+    }
+ 
+    if (priv_bo->addr.host) {
+-      ret = os_munmap(priv_bo->addr.host, pan_kmod_bo_size(priv_bo->bo));
++      ret = pan_kmod_bo_munmap(priv_bo->bo, priv_bo->addr.host, pan_kmod_bo_size(priv_bo->bo));
+       assert(!ret);
+    }
+ 

@@ -162,6 +162,7 @@ call(unsigned number, void *data, size_t size)
 }
 
 static int submit(struct drm_panfrost_submit *request);
+static void forget_mapping(uint32_t handle);
 static int wait_buffer(struct drm_panfrost_wait_bo *request);
 static bool pan_syncobj_ioctl(unsigned number, void *arg, int *error);
 
@@ -179,6 +180,9 @@ drmIoctl(int fd, unsigned long request, void *arg)
 	} else if (opened == PANFROST && pan_syncobj_ioctl(number, arg, &error)) {
 		/* (done there) */
 	} else {
+		if (number == (DRM_IOCTL_GEM_CLOSE & 0xff)) {
+			forget_mapping(((struct drm_gem_close *)arg)->handle);
+		}
 		error = call(number, arg, IOCPARM_LEN(request));
 	}
 	if (error != 0) {
@@ -259,11 +263,52 @@ drmCloseBufferHandle(int fd, uint32_t handle)
 	return drmIoctl(fd, DRM_IOCTL_GEM_CLOSE, &request);
 }
 
+/*
+ * A buffer's mapping is one per process here: IOKit gives a task that maps the same memory again the
+ * mapping it already has, where Linux's mmap() makes a new one each time. So a buffer mapped twice
+ * (PanVK maps a VkBuffer that covers its whole VkDeviceMemory as well as the memory itself) is one
+ * mapping with two users, counted here, and it goes when the last of them unmaps it. Unmapping it at
+ * the first left the second user's unmap over a hole: a VM guard exception (kGUARD_EXC_DEALLOC_GAP),
+ * fatal in applications and app extensions, on every device PanVK opened (docs/metal.md, build 45).
+ */
+static struct mapped {
+	uint32_t handle, users;
+	mach_vm_address_t address;
+} *maps;
+static uint32_t map_count;
+static pthread_mutex_t map_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* (with map_lock held) the entry of HANDLE, or NULL */
+static struct mapped *
+mapped_of(uint32_t handle)
+{
+	for (uint32_t i = 0; i < map_count; i++) {
+		if (maps[i].users != 0 && maps[i].handle == handle) {
+			return &maps[i];
+		}
+	}
+	return NULL;
+}
+
+/* a buffer closed (GEM_CLOSE): its mapping goes with its memory, and its handle may come back for another */
+static void
+forget_mapping(uint32_t handle)
+{
+	struct mapped *m;
+
+	pthread_mutex_lock(&map_lock);
+	if ((m = mapped_of(handle)) != NULL) {
+		m->users = 0;
+	}
+	pthread_mutex_unlock(&map_lock);
+}
+
 void *
 hakios_drm_map(int fd, uint32_t handle, uint64_t size)
 {
 	mach_vm_address_t address = 0;
 	mach_vm_size_t mapped = 0;
+	struct mapped *m;
 
 	(void)fd;
 	(void)size;
@@ -271,24 +316,56 @@ hakios_drm_map(int fd, uint32_t handle, uint64_t size)
 		void *memory = noop_map(handle);
 		return memory != NULL ? memory : (void *)-1;
 	}
+	pthread_mutex_lock(&map_lock);
+	if ((m = mapped_of(handle)) != NULL) {
+		m->users++;
+		pthread_mutex_unlock(&map_lock);
+		return (void *)(uintptr_t)m->address;
+	}
 	/*
 	 * Linux gives freedreno and panfrost their buffers write-combined, with no cache of this
 	 * processor's between the program and the memory the GPU sees. So do the kernel's drivers
 	 * here: the memory is made that way, and this mapping is as the memory is.
 	 */
 	if (IOConnectMapMemory64(connection, handle, mach_task_self(), &address, &mapped, kIOMapAnywhere) != 0) {
+		pthread_mutex_unlock(&map_lock);
 		return (void *)-1;              /* mmap()'s MAP_FAILED */
 	}
+	for (m = maps; m != NULL && m < maps + map_count && m->users != 0; m++) {
+	}
+	if (m == NULL || m == maps + map_count) {
+		struct mapped *grown = realloc(maps, (map_count + 64) * sizeof(*grown));
+
+		if (grown == NULL) {
+			IOConnectUnmapMemory64(connection, handle, mach_task_self(), address);
+			pthread_mutex_unlock(&map_lock);
+			return (void *)-1;
+		}
+		memset(grown + map_count, 0, 64 * sizeof(*grown));
+		m = grown + map_count;
+		maps = grown;
+		map_count += 64;
+	}
+	*m = (struct mapped){ handle, 1, address };
+	pthread_mutex_unlock(&map_lock);
 	return (void *)(uintptr_t)address;
 }
 
 void
 hakios_drm_unmap(int fd, uint32_t handle, void *address)
 {
+	struct mapped *m;
+
 	(void)fd;
 	if (hakios_drm_noop()) {
 		return;                 /* (the memory goes with the buffer: GEM_CLOSE) */
 	}
+	pthread_mutex_lock(&map_lock);
+	if ((m = mapped_of(handle)) != NULL && --m->users != 0) {
+		pthread_mutex_unlock(&map_lock);
+		return;                 /* (another user still has it) */
+	}
+	pthread_mutex_unlock(&map_lock);
 	IOConnectUnmapMemory64(connection, handle, mach_task_self(), (mach_vm_address_t)(uintptr_t)address);
 }
 
