@@ -163,6 +163,7 @@ call(unsigned number, void *data, size_t size)
 
 static int submit(struct drm_panfrost_submit *request);
 static int wait_buffer(struct drm_panfrost_wait_bo *request);
+static bool pan_syncobj_ioctl(unsigned number, void *arg, int *error);
 
 int
 drmIoctl(int fd, unsigned long request, void *arg)
@@ -175,6 +176,8 @@ drmIoctl(int fd, unsigned long request, void *arg)
 		error = submit(arg);
 	} else if (opened == PANFROST && number == DRM_COMMAND_BASE + DRM_PANFROST_WAIT_BO) {
 		error = wait_buffer(arg);
+	} else if (opened == PANFROST && pan_syncobj_ioctl(number, arg, &error)) {
+		/* (done there) */
 	} else {
 		error = call(number, arg, IOCPARM_LEN(request));
 	}
@@ -336,6 +339,7 @@ none(void)
  */
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t submitted;              /* the last job number the kernel gave (to this process) */
+static pthread_cond_t pan_given = PTHREAD_COND_INITIALIZER;     /* a sync object was given a job or signalled */
 static uint64_t finished;               /* a job known to be done, and with it every one before it */
 
 /*
@@ -411,6 +415,7 @@ submit(struct drm_panfrost_submit *request)
 	submitted = seq > submitted ? seq : submitted;
 	if (request->out_sync != 0 && (fence = pan_syncobj(request->out_sync)) != NULL) {
 		*fence = seq;
+		pthread_cond_broadcast(&pan_given);
 	}
 	pthread_mutex_unlock(&lock);
 	return 0;
@@ -439,12 +444,24 @@ wait_buffer(struct drm_panfrost_wait_bo *request)
 /*
  * Linux's fences that a program holds by a handle. Here, for panfrost, each is the number of the
  * job it waits for, kept in this process: the kernel has no fences, it has numbers. 0 is no job,
- * nothing to wait for -- a sync object made signalled, and one made without a fence (Linux would
- * refuse to wait on that, which panfrost never asks). Waiting for several is waiting for the
- * highest of their numbers (all of them) or the lowest (any), since the jobs end in order.
- * freedreno waits by requests of its own and has none of these, as before (ENOSYS).
+ * nothing to wait for: a sync object made signalled, or signalled by the CPU. SYNCOBJ_UNSUBMITTED is
+ * one without a fence yet (made unsignalled, or reset), which no job has been given since.
+ * Waiting for several is waiting for the highest of their numbers (all of them) or the lowest (any),
+ * since the jobs end in order. freedreno waits by requests of its own and has none of these, as
+ * before (ENOSYS).
+ *
+ * A sync object without a fence is waited for as Linux does with DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT:
+ * until a submission gives it a job (or the CPU signals it), then for that job. Vulkan's common code
+ * waits that way for every fence and semaphore (vk_drm_syncobj.c), and it has to: with timelines
+ * emulated (vk_sync_timeline, there being no DRM_CAP_SYNCOBJ_TIMELINE here) the queue submits from a
+ * thread of its own, so vkQueueSubmit can return before the fence's job is given, and a wait that
+ * took the fence for done returned before the GPU had run anything (docs/metal.md, 14 November: a
+ * Metal texture read back with -getBytes: had lines of zeroes, read before its copy had run).
+ * Without that flag, which panfrost's OpenGL ES never gives, such a sync object counts as signalled,
+ * as before; Linux would refuse the wait (EINVAL).
  */
-#define SYNCOBJ_FREE    UINT64_MAX
+#define SYNCOBJ_FREE            UINT64_MAX
+#define SYNCOBJ_UNSUBMITTED     (UINT64_MAX - 1)
 static uint64_t *pan_syncobjs;              /* handle n is pan_syncobjs[n - 1]: its job, or SYNCOBJ_FREE */
 static uint32_t pan_syncobj_count;
 
@@ -464,7 +481,6 @@ pan_drmSyncobjCreate(int fd, uint32_t flags, uint32_t *handle)
 	uint32_t i;
 
 	(void)fd;
-	(void)flags;            /* (signalled or without a fence: no job either way) */
 	if (opened != PANFROST) {
 		return none();
 	}
@@ -486,7 +502,7 @@ pan_drmSyncobjCreate(int fd, uint32_t flags, uint32_t *handle)
 		pan_syncobjs = grown;
 		pan_syncobj_count = count;
 	}
-	pan_syncobjs[i] = 0;
+	pan_syncobjs[i] = (flags & DRM_SYNCOBJ_CREATE_SIGNALED) ? 0 : SYNCOBJ_UNSUBMITTED;
 	*handle = i + 1;
 	pthread_mutex_unlock(&lock);
 	return 0;
@@ -525,21 +541,23 @@ pan_drmSyncobjReset(int fd, const uint32_t *handles, uint32_t count)
 	pthread_mutex_lock(&lock);
 	for (uint32_t i = 0; i < count; i++) {
 		if ((fence = pan_syncobj(handles[i])) != NULL) {
-			*fence = 0;
+			*fence = SYNCOBJ_UNSUBMITTED;
 		}
 	}
 	pthread_mutex_unlock(&lock);
 	return 0;
 }
 
-/* As libdrm's: 0, or minus an errno (ETIME: not done by the deadline, a moment of Mesa's clock). */
+/* As libdrm's: 0, or minus an errno, which errno is too (ETIME: not done by the deadline, a moment of Mesa's clock). */
 int
 pan_drmSyncobjWait(int fd, uint32_t *handles, unsigned count, int64_t timeout_nsec, unsigned flags,
     uint32_t *first_signaled)
 {
 	bool all = (flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL) != 0;
-	uint64_t seq = 0, *fence;
-	unsigned first = 0;
+	bool for_submit = (flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT) != 0;
+	uint64_t seq = 0, job, *fence;
+	unsigned first = 0, given;
+	int64_t left;
 	int error;
 
 	(void)fd;
@@ -547,25 +565,108 @@ pan_drmSyncobjWait(int fd, uint32_t *handles, unsigned count, int64_t timeout_ns
 		return -ENOSYS;
 	}
 	pthread_mutex_lock(&lock);
-	for (unsigned i = 0; i < count; i++) {
-		if ((fence = pan_syncobj(handles[i])) == NULL) {
-			pthread_mutex_unlock(&lock);
-			return -EINVAL;
+	for (;;) {
+		given = 0;
+		for (unsigned i = 0; i < count; i++) {
+			if ((fence = pan_syncobj(handles[i])) == NULL) {
+				pthread_mutex_unlock(&lock);
+				errno = EINVAL;
+				return -EINVAL;
+			}
+			given += *fence != SYNCOBJ_UNSUBMITTED;
 		}
-		if (i == 0 || (all ? *fence > seq : *fence < seq)) {
-			seq = *fence;
+		/* every one has a job (all), or one has (any); without the flag, none has to */
+		if (!for_submit || given == count || (!all && given != 0)) {
+			break;
+		}
+		if ((left = left_ns(timeout_nsec)) == 0) {
+			pthread_mutex_unlock(&lock);
+			errno = ETIME;
+			return -ETIME;
+		}
+		struct timespec slice = { 0, left < 10000000 ? left : 10000000 };
+		pthread_cond_timedwait_relative_np(&pan_given, &lock, &slice);
+	}
+	for (unsigned i = 0, chosen = 0; i < count; i++) {
+		job = *pan_syncobj(handles[i]);
+		if (job == SYNCOBJ_UNSUBMITTED) {
+			if (for_submit) {
+				continue;       /* (any: another one has a job) */
+			}
+			job = 0;
+		}
+		if (!chosen++ || (all ? job > seq : job < seq)) {
+			seq = job;
 			first = i;
 		}
 	}
 	pthread_mutex_unlock(&lock);
 	error = wait_job(seq, timeout_nsec);
 	if (error != 0) {
-		return error == ETIMEDOUT ? -ETIME : -error;
+		errno = error == ETIMEDOUT ? ETIME : error;
+		return -errno;
 	}
 	if (first_signaled != NULL) {
 		*first_signaled = first;
 	}
 	return 0;
+}
+
+/*
+ * PanVK's JM backend makes some of its sync object calls as ioctls of their own, not through libdrm's
+ * functions (panvk_vX_queue.c: a submission's fence handed to the semaphores it signals, through a
+ * sync file; panvk_vX_event.c: VkEvents). Those are the same sync objects as above, kept in this
+ * process; the kernel has none. True when NUMBER is one of them, with what it gave in ERROR (0 or
+ * an errno). Panfrost's OpenGL ES uses libdrm's functions only.
+ */
+int pan_drmSyncobjSignal(int fd, const uint32_t *handles, uint32_t count);
+
+static bool
+pan_syncobj_ioctl(unsigned number, void *arg, int *error)
+{
+	int result;
+
+	errno = 0;
+	if (number == (DRM_IOCTL_SYNCOBJ_CREATE & 0xff)) {
+		struct drm_syncobj_create *create = arg;
+
+		result = pan_drmSyncobjCreate(-1, create->flags, &create->handle);
+	} else if (number == (DRM_IOCTL_SYNCOBJ_DESTROY & 0xff)) {
+		result = pan_drmSyncobjDestroy(-1, ((struct drm_syncobj_destroy *)arg)->handle);
+	} else if (number == (DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD & 0xff)) {
+		struct drm_syncobj_handle *handle = arg;
+
+		if (!(handle->flags & DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE)) {
+			*error = ENOSYS;        /* (a sync object as a descriptor of its own: none here) */
+			return true;
+		}
+		result = pan_drmSyncobjExportSyncFile(-1, handle->handle, &handle->fd);
+	} else if (number == (DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE & 0xff)) {
+		struct drm_syncobj_handle *handle = arg;
+
+		if (!(handle->flags & DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE)) {
+			*error = ENOSYS;
+			return true;
+		}
+		result = pan_drmSyncobjImportSyncFile(-1, handle->handle, handle->fd);
+	} else if (number == (DRM_IOCTL_SYNCOBJ_WAIT & 0xff)) {
+		struct drm_syncobj_wait *wait = arg;
+
+		result = pan_drmSyncobjWait(-1, (uint32_t *)(uintptr_t)wait->handles, wait->count_handles, wait->timeout_nsec,
+		    wait->flags, &wait->first_signaled);
+	} else if (number == (DRM_IOCTL_SYNCOBJ_RESET & 0xff)) {
+		struct drm_syncobj_array *array = arg;
+
+		result = pan_drmSyncobjReset(-1, (const uint32_t *)(uintptr_t)array->handles, array->count_handles);
+	} else if (number == (DRM_IOCTL_SYNCOBJ_SIGNAL & 0xff)) {
+		struct drm_syncobj_array *array = arg;
+
+		result = pan_drmSyncobjSignal(-1, (const uint32_t *)(uintptr_t)array->handles, array->count_handles);
+	} else {
+		return false;
+	}
+	*error = result == 0 ? 0 : errno != 0 ? errno : EINVAL;
+	return true;
 }
 
 /*
@@ -612,7 +713,7 @@ pan_drmSyncobjExportSyncFile(int fd, uint32_t handle, int *sync_file_fd)
 	}
 	sync_files[sync_file_next % SYNC_FILES].used = true;
 	sync_files[sync_file_next % SYNC_FILES].fd = file;
-	sync_files[sync_file_next % SYNC_FILES].seq = *fence;
+	sync_files[sync_file_next % SYNC_FILES].seq = *fence != SYNCOBJ_UNSUBMITTED ? *fence : 0;
 	sync_file_next++;
 	pthread_mutex_unlock(&lock);
 	*sync_file_fd = file;
@@ -641,6 +742,7 @@ pan_drmSyncobjImportSyncFile(int fd, uint32_t handle, int sync_file_fd)
 		}
 	}
 	*fence = seq;
+	pthread_cond_broadcast(&pan_given);
 	pthread_mutex_unlock(&lock);
 	return 0;
 }
@@ -1124,6 +1226,7 @@ pan_drmSyncobjSignal(int fd, const uint32_t *handles, uint32_t count)
 	for (uint32_t i = 0; i < count; i++) {
 		*pan_syncobj(handles[i]) = 0;
 	}
+	pthread_cond_broadcast(&pan_given);
 	pthread_mutex_unlock(&lock);
 	return 0;
 }
