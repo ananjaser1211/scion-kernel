@@ -2,8 +2,10 @@
  * Whether this process may be shown the Metal device, by the level of boot-arg metal (read from sysctl kern.bootargs):
  *
  *   metal=1  only the program metal_test (userland/src/metal_test.m): the safe level, for seeing what Metal does with the device
- *   metal=2  every process but backboardd
- *   metal=3  every process, backboardd too, to find out what the window server asks
+ *   metal=2  applications and app extensions: a process whose executable is in a .app or .appex bundle (SpringBoard, PosterBoard
+ *            and its wallpaper extensions, Maps, the user's programs), and no daemon
+ *   metal=3  every process but backboardd (metal=2 until 14 November 2026)
+ *   metal=4  every process, backboardd too, to find out what the window server asks (metal=3 until then)
  *
  * Why not simply everyone. CoreAnimation's window server tries Metal FIRST and goes to its OpenGL ES path (which works on this port)
  * only when no Metal device exists; with ours it takes Metal and stops on "metallib_url != nil": its own shader library,
@@ -26,6 +28,8 @@
  * (Moved here from src/HakiosMetal.m, unchanged, when the second build of the plug-in, src/metalvk/, came to need it too.)
  */
 #include <dlfcn.h>
+#include <limits.h>
+#include <mach-o/dyld.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -91,6 +95,16 @@ listed(const char *name, const char **where)
 	return image < 0 || kept < 0 ? -1 : image > 0 || kept > 0 ? 1 : 0;
 }
 
+/* whether this process is an application or an app extension: its executable is in a .app or .appex bundle */
+static int
+isApplication(void)
+{
+	char path[PATH_MAX];
+	uint32_t size = sizeof(path);
+
+	return _NSGetExecutablePath(path, &size) == 0 && (strstr(path, ".app/") != NULL || strstr(path, ".appex/") != NULL);
+}
+
 int
 hakios_metal_shown(void (*say)(const char *line))
 {
@@ -120,7 +134,8 @@ hakios_metal_shown(void (*say)(const char *line))
 		}
 		return 0;
 	}
-	if (level >= 3 || (level == 2 && strcmp(name, "backboardd") != 0) || (level == 1 && strcmp(name, "metal_test") == 0)) {
+	if (level >= 4 || (level == 3 && strcmp(name, "backboardd") != 0) || (level == 2 && isApplication()) ||
+	    (level == 1 && strcmp(name, "metal_test") == 0)) {
 		return 1;
 	}
 	if (named > 0) {
@@ -130,7 +145,8 @@ hakios_metal_shown(void (*say)(const char *line))
 		}
 		return 1;
 	}
-	snprintf(line, sizeof(line), "%s is not shown the device (metal=%d; 1 is metal_test only, 2 all but backboardd, 3 all)", name, level);
+	snprintf(line, sizeof(line), "%s is not shown the device (metal=%d; 1 is metal_test only, 2 applications and app extensions, "
+	    "3 all but backboardd, 4 all)", name, level);
 	if (say != NULL) {
 		say(line);
 	}

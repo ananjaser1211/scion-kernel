@@ -28,8 +28,9 @@
  * Metal and the program hold is then the device itself, and the message that opened it is sent again. When the device cannot be
  * opened, every such message is answered with nil or zero, and the log says why once.
  *
- * Who is shown the device (src/hakios_metal_shown.c): metal=1 metal_test only, metal=2 all but backboardd, metal=3 all, and
- * HakiosMetal.clients beside the bundle. A process that is not shown it gets no class, and Metal no device.
+ * Who is shown the device (src/hakios_metal_shown.c): metal=1 metal_test only, metal=2 applications and app extensions, metal=3 all but
+ * backboardd, metal=4 all; and HakiosMetal.clients (beside the bundle, or /private/var/db). A process that is not shown it gets no class,
+ * and Metal no device.
  *
  * What it says goes to the console, to /private/var/tmp/HakiosMetal.log (up to 4 MiB) and to NSLog, one line each, with the process.
  */
