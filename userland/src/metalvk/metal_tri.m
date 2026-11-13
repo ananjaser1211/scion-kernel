@@ -77,10 +77,11 @@ runtime_state(void)
 	return "not loaded";
 }
 
+/* DISCOVER: Metal's own device first; false for an application that carries its own plug-in, which is then the one it tests */
 static id<MTLDevice>
-make_device(const char *bundle_path, bool register_it)
+make_device(const char *bundle_path, bool register_it, bool discover)
 {
-	id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+	id<MTLDevice> device = discover ? MTLCreateSystemDefaultDevice() : nil;
 	if (device != nil) {
 		printf("metal_tri: device by Metal's own discovery: %s\n", device.name.UTF8String);
 		return device;
@@ -568,9 +569,12 @@ static struct {
 	unsigned inside = 0, outside = 0, wrong = 1, worst = 0;
 	double ms;
 	if (app.xr != NULL) {
-		/* a drawable of the CAMetalLayer, presented; a linear one read back and judged (an sRGB one is shown only) */
+		/*
+		 * A drawable of the CAMetalLayer: drawn, a linear one read back and judged (an sRGB one is shown only), then presented by a
+		 * command buffer of its own, as the plug-in turns a presented drawable's codes into its surface's bytes.
+		 */
 		id<CAMetalDrawable> drawable = [app.xr_layer nextDrawable];
-		done = drawable != nil && xr_render(app.queue, app.pipeline, drawable.texture, clear, drawable);
+		done = drawable != nil && xr_render(app.queue, app.pipeline, drawable.texture, clear, nil);
 		ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000;
 		if (done && app.xr_format == MTLPixelFormatBGR10_XR) {
 			[drawable.texture getBytes:app.xr_words bytesPerRow:(size_t)app.n * 4 fromRegion:MTLRegionMake2D(0, 0, app.n, app.n)
@@ -578,6 +582,11 @@ static struct {
 			wrong = xr_judge(app.xr_words, app.n, app.xr, clear, &inside, &outside, &worst, false);
 		} else {
 			wrong = done ? 0 : 1;
+		}
+		if (drawable != nil) {
+			id<MTLCommandBuffer> present = [app.queue commandBuffer];
+			[present presentDrawable:drawable];
+			[present commit];
 		}
 	} else {
 		done = render(app.queue, app.pipeline, app.target[i], clear, true);
@@ -617,7 +626,9 @@ static struct {
 		metallib = @"/redwood/share/metal_tri.metallib";
 	}
 	app.n = 512;
-	app.device = make_device(plugin.UTF8String, true);
+	/* the application's own plug-in, when it has one, rather than the image's that Metal would find (a hand test of a new one) */
+	bool own = ![plugin hasPrefix:@"/redwood/"];
+	app.device = make_device(plugin.UTF8String, !own, !own);
 	NSString *xr = [NSBundle.mainBundle objectForInfoDictionaryKey:@"MTXRBlend"];
 	if (app.device != nil && xr != nil) {
 		app.xr = strdup(xr.UTF8String);
@@ -693,7 +704,7 @@ main(int argc, char *argv[])
 		if (n < 16 || n > 4096) {
 			n = 256;
 		}
-		id<MTLDevice> device = make_device(bundle_path, register_it);
+		id<MTLDevice> device = make_device(bundle_path, register_it, true);
 		if (device == nil) {
 			return 1;
 		}
