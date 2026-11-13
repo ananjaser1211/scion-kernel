@@ -838,6 +838,8 @@ static void waitForResource(id resource) {
  [self check:nmb_encoder_end(handle) what:"endEncoding"];
 }
 - (void)insertDebugSignpost:(NSString *)s {(void)s;}
+// Metal SPI (MTLCommandEncoder): an object id for GPU tools' traces, which MetalPerformanceShaders reads from every encoder it makes.
+- (uint64_t)globalTraceObjectID {return (uint64_t)(uintptr_t)self;}
 - (void)pushDebugGroup:(NSString *)s {(void)s;}
 - (void)popDebugGroup {}
 // Stage 0 compute, 1 vertex, 2 fragment (the bridge's numbering).
