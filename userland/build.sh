@@ -106,7 +106,8 @@
 #                                   The bundle's executable links none of it: HakiosMetal.bundle/HakiosMetalVK.dylib (the
 #                                   frontend) and through it the runtime and the driver are loaded at the device's first use.
 #                                   Also bin/metal_tri, share/metal_tri.metallib and MetalTri.app (a triangle through the Metal
-#                                   API, src/metalvk/metal_tri.m), which open the plug-in themselves, shown the device by
+#                                   API, src/metalvk/metal_tri.m) and bin/metal_libcheck (a library's functions through
+#                                   pipelines), which open the plug-in themselves, shown the device by
 #                                   lib/HakiosMetal.clients: no boot-arg needed. M2V_DIR=DIR takes a libmetal2vulkan.dylib
 #                                   already built (mk-metal2vulkan.sh ios, which also runs on Linux). On the S9:
 #                                   PANVK_DIR=... METAL=vk METAL_ICD=/redwood/lib/libvulkan_panfrost.dylib (docs/metal.md).
@@ -579,6 +580,9 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 			# shaders are hand-written AIR (tools/metal/air), assembled by llvm-as and put in a library by tools/metal/mkmetallib.py.
 			$DYN -fobjc-arc -framework Foundation -framework UIKit -framework QuartzCore -framework Metal -framework IOSurface \
 				-framework IOKit -lobjc -o obj/metal_tri src/metalvk/metal_tri.m
+			# metal_libcheck: whether every function of a system library (NanoUniverse's, SiriUICore's) becomes the GPU's code
+			$DYN -fobjc-arc -framework Foundation -framework Metal -framework IOKit -lobjc -o obj/metal_libcheck \
+				src/metalvk/metal_libcheck.m
 			${LLVM_AS:-llvm-as} -o obj/tri_vertex.bc ../tools/metal/air/tri_vertex.ll
 			${LLVM_AS:-llvm-as} -o obj/tri_fragment.bc ../tools/metal/air/tri_fragment.ll
 			python3 ../tools/metal/mkmetallib.py obj/metal_tri.metallib tri_vertex:vertex:obj/tri_vertex.bc \
@@ -836,8 +840,8 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 		[ -z "$METAL_ICD" ] || echo "$METAL_ICD" > root/lib/HakiosMetal.icd
 		# metal_tri and MetalTri.app open the plug-in themselves (no boot-arg): this file shows it the device
 		# (src/hakios_metal_shown.c); with boot-arg metal=N the level decides for every other process as before
-		echo metal_tri > root/lib/HakiosMetal.clients
-		cp obj/metal_tri root/bin/
+		printf 'metal_tri\nmetal_libcheck\n' > root/lib/HakiosMetal.clients
+		cp obj/metal_tri obj/metal_libcheck root/bin/
 		cp obj/metal_tri.metallib root/share/
 		rm -rf obj/MetalTri.app
 		mkdir -p obj/MetalTri.app
