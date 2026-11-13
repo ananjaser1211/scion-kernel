@@ -1,0 +1,784 @@
+metal2vulkan: blends into BGR10_XR attachments by the device's fixed function, on the codes (Scion)
+
+Upstream:  metal2vulkan, https://github.com/steelbrain/metal2vulkan, at 720ef1ce9ae2a2068999a8675717418b9416283e, after
+           AdrenoMetal's 16 patches to it and Scion's 0001 to 0003; tools/metal/mk-metal2vulkan.sh applies them in that order,
+           then this.
+Licence:   GPL-2.0-or-later OR LGPL-3.0-or-later, metal2vulkan's (its LICENSE); this patch is a change to it and under the same
+           terms. Nothing of it is in Scion's MIT or APSL files.
+Author:    the HakiOS authors (Scion), 14 November 2026.
+
+Why. The Astronomy wallpaper (AegirPoster, NanoUniverse's aegir_* shaders) draws into a CAMetalLayer of BGR10_XR_sRGB and
+blends there: SourceAlpha and OneMinusSourceAlpha for the earth, luna, sprites and stars, One and One for aegir_post_fsh.
+metal2vulkan holds such an attachment as its raw word (R32_UINT), which no device blends, and computes Metal's blend in the
+shader over the attachment's texel, read through rasterization-order input attachments or under the pixel interlock. PanVK v6
+(the Galaxy S9's Mali-G72) offers neither, so all 29 of its blended pipelines were refused NotImplemented(Format) at Color(0)
+and the wallpaper stayed black.
+
+What. On a device that orders no framebuffer fetch (neither rasterizationOrderColorAttachmentAccess nor the pixel interlock)
+and renders and blends A2R10G10B10_UNORM_PACK32, a BGR10_XR or BGR10_XR_sRGB color attachment renders through that view of
+its word (metal::format::unorm_codes_view). The view's fields are the word's own (red in bits 20-29, green 10-19, blue 0-9,
+Metal's two unused bits as alpha), so every pipeline and pass on such a device renders the attachment through it, blended or
+not, and the pass and its pipelines agree on its format:
+
+- Unblended, the fragment function writes Metal's code over 1023 (and alpha 1, the two top bits Metal writes): exact.
+- The codes are affine in Metal's value, u(v) = (384 + 510 v) / 1023, so the device's blend s u_s + d u_d of codes is the code
+  of Metal's blend s v_s + d v_d where the function writes u_s = (510 v_s + 384 b) / 1023, b = (1 - d) / s, the share of the
+  bias the source keeps (pipeline::lower_inputs::UnormWrite, pipeline::color_writes::unorm_write):
+    Over          SourceAlpha / OneMinusSourceAlpha, a blend colour's or blend alpha's pair, One / Zero: b = 1;
+    Added         any destination factor One with a source factor that reads no colour of the source or destination: b = 0
+                  (a source below the code of 0 stores as 0, as the view clamps it);
+    Premultiplied One / OneMinusSourceAlpha: b = the source alpha.
+  These are Metal's blend up to the device's rounding of the blended code; the source is not rounded to a code first (its value
+  is clamped as Metal's blend clamps it, codes 0 to 1022). The alpha channel is masked out under a blend (the top bits kept).
+  Every other blend (a factor of the source or destination colour, the destination alpha, a second source, an operation other
+  than add) stays refused NotImplemented(Format).
+- An _sRGB attachment's codes hold the value encoded through Metal's sRGB tables, so a blend of codes is a blend of encoded
+  values, not Metal's blend of linear ones: the function writes the code of Metal's encode of the source, and the device blends
+  codes as a device without sRGB blending blends 8-bit sRGB bytes. An approximation, said here and in UnormWrite's docs: exact
+  for an unblended write and at the factors' ends (an alpha of 0 or 1), darker than Metal's in between where the colours differ.
+- The image of such a texture takes the view as a format it is viewed in (MUTABLE_FORMAT with a format list), memoryless ones
+  too; the render pass renders the attachment in it (render_pass::attachment_format), and its clear value is the raw texel's
+  fields over their largest (clear_value::in_format), which store the texel exactly.
+- The cache's SEMANTICS_VERSION and ARTIFACT_FORMAT_VERSION move: ExtendedRangeColor has the field `unorm`.
+
+Checked on the phone (PanVK on the Mali-G72): metal_tri --xr none, over and add (BGR10_XR, blended by BlendAlpha 0.25 and by
+One / One, a texture and a texture over an IOSurface) store every pixel within 1 code of Metal's store of the expected value,
+the clear's codes exactly outside; metal_libcheck --format 554 and 555 makes all 27 of NanoUniverse's functions unblended and
+under --blend over, add and premultiplied, where 0 of the blended ones were made before.
+
+--- a/crates/metal2vulkan/src/cache/codec.rs
++++ b/crates/metal2vulkan/src/cache/codec.rs
+@@ -53,7 +53,7 @@
+ };
+ use crate::pipeline::lower_inputs::{
+     BlendEquation, CaptureForm, ChannelWrite, ExtendedRangeColor, FactorLane, HalfOutputLane,
+-    RotatedBlendForm, VertexFetch,
++    RotatedBlendForm, UnormWrite, VertexFetch,
+ };
+ use crate::pipeline::stage_io::{
+     CoverageLoop, CoverageLoopRefusal, DepthMode, Interpolation as IoInterpolation, IoNumeric,
+@@ -1052,7 +1052,7 @@
+         instanced_attributes, selected_colors, half_blend_colors,
+     }
+     SelectedWrite { lanes, rounds, nans }
+-    ExtendedRangeColor { form, blended, nearest_even }
++    ExtendedRangeColor { form, blended, nearest_even, unorm }
+     PulledInput { index, ty, fetch }
+     StageInInput { index, ty, fetch }
+     StageInFetch { format, buffer_index, offset, stride, step_function, step_rate, index }
+@@ -1093,6 +1093,7 @@
+     }
+     FactorLane { Zero, One, Output(f0) }
+     RotatedBlendForm { Premultiplied, Unmeasured }
++    UnormWrite { Codes, Over, Added, Premultiplied }
+     CaptureForm { Vertices, Indexed(f0) }
+     HalfOutputLane { Float32, Float32Added }
+     TextureWriteRoundingMode { TowardZero, NearestEven }
+--- a/crates/metal2vulkan/src/cache/mod.rs
++++ b/crates/metal2vulkan/src/cache/mod.rs
+@@ -60,7 +60,7 @@
+ /// unchanged version, and its bless records the version. Independent of the crate's version and of
+ /// [`ARTIFACT_FORMAT_VERSION`]. The commit that bumps it says what changed; this comment keeps no
+ /// history.
+-pub const SEMANTICS_VERSION: u32 = 1698;
++pub const SEMANTICS_VERSION: u32 = 1699;
+ 
+ /// The byte-layout version of encoded artifacts (`CompiledFunction::to_bytes` and the
+ /// [`PipelineArtifact`] encodings). Every encoded artifact carries it, and a decode under another
+@@ -70,7 +70,7 @@
+ /// re-typed in an encoded type, its `codec` body or its `envelope`. A variant removed while its tag
+ /// stays unused needs no bump: an entry holding it fails to decode, which is a miss. The commit that
+ /// bumps it says what changed; this comment keeps no history.
+-pub const ARTIFACT_FORMAT_VERSION: u32 = 399;
++pub const ARTIFACT_FORMAT_VERSION: u32 = 400;
+ 
+ /// The version of what this crate's runtime does with a compiled pipeline: instantiating a binding
+ /// plan (`BindingPlan::instantiate_*`: descriptor ranges, push bytes, root, argument, and handle
+--- a/crates/metal2vulkan/src/lower/arith/extended_range.rs
++++ b/crates/metal2vulkan/src/lower/arith/extended_range.rs
+@@ -21,6 +21,7 @@
+ use crate::lower::arith::ops::{fsplat, splat};
+ use crate::lower::arith::texel_round::{f32_to_half, ratio_to_f32, HalfRounding};
+ use crate::metal::format::ExtendedRange;
++use crate::pipeline::lower_inputs::UnormWrite;
+ use crate::spirv::builder::FunctionBuilder;
+ use crate::spirv::error::BResult;
+ use crate::spirv::ids::{GlobalId, Value};
+@@ -396,6 +397,95 @@
+     pack(fb, form, code)
+ }
+ 
++/// An upper estimate of the SPIR-V words [`unorm_codes`] adds beside [`encode`]'s codes.
++pub const UNORM_WORDS: u32 = 40 * 6;
++
++/// What a write of `v` (a `vec4` of `f32`, red first, each lane a `half` value) to a
++/// `BGR10_XR` or `BGR10_XR_sRGB` attachment rendered through the `A2R10G10B10_UNORM_PACK32` view
++/// of its word writes as `write` writes it (`pipeline::lower_inputs::UnormWrite`): a `vec4` of
++/// `f32`, red, green and blue each a code over 1023, and alpha.
++///
++/// - Unblended (`Codes`): the codes Metal stores ([`encode`]'s, exact), and alpha 1, which the
++///   view stores as the word's two top bits set, as Metal writes them.
++/// - Blended: the code of the source as Metal's blend clamps it (each color channel to the codes
++///   0 and 1022, a NaN to the low end), of a linear form `384 + 510 v` unrounded and of an
++///   `_sRGB` one Metal's code of its encode, less the share of the bias 384 the source does not
++///   keep (none for `Over`, all for `Added`, one minus the alpha for `Premultiplied`), over 1023;
++///   alpha is the source's, clamped to `[0, 1]` (a NaN 0), which the source-alpha factors read
++///   and the pipeline's write mask keeps out of the word.
++pub(crate) fn unorm_codes(
++    fb: &mut FunctionBuilder<'_>,
++    form: ExtendedRange,
++    v: Value,
++    table: Option<GlobalId>,
++    write: UnormWrite,
++) -> BResult<Value> {
++    let f = floats();
++    let ft = crate::lower::arith::ops::ty(fb, f)?;
++    let f1 = fb.module().ty(Type::Float { width: 32 })?;
++    let zero = fsplat(fb, f, 0.0)?;
++    let codes = linear_codes(fb, form, v, table)?;
++    let codes = fb.convert(ConvOp::ConvertUToF, codes, ft)?;
++    let max = fsplat(fb, f, 1023.0)?;
++    if write == UnormWrite::Codes {
++        let u = fb.binary(BinOp::FDiv, codes, max)?;
++        let one = fsplat(fb, f, 1.0)?;
++        return fb.vector_shuffle(u, one, &[0, 1, 2, 7]);
++    }
++    let c = match form.srgb() {
++        true => codes,
++        false => {
++            let scale = fsplat(fb, f, 510.0)?;
++            let bias = fsplat(fb, f, 384.0)?;
++            let c = fb.binary(BinOp::FMul, v, scale)?;
++            fb.binary(BinOp::FAdd, c, bias)?
++        }
++    };
++    let nan = fb.unary(crate::spirv::ir::UnOp::IsNan, c)?;
++    let c = fb.select(nan, zero, c)?;
++    let top = fsplat(fb, f, 1022.0)?;
++    let c = fb.glsl(GlslOp::FClamp, &[c, zero, top])?;
++    // The source's alpha, clamped as Metal's blend clamps it.
++    let a = fb.composite_extract(v, &[3])?;
++    let a_nan = fb.unary(crate::spirv::ir::UnOp::IsNan, a)?;
++    let fzero = fb.module().constant(Constant::Scalar {
++        ty: f1,
++        bits: ConstBits(u64::from(0.0f32.to_bits())),
++    })?;
++    let fzero = fb.module().const_value(fzero)?;
++    let fone = fb.module().constant(Constant::Scalar {
++        ty: f1,
++        bits: ConstBits(u64::from(1.0f32.to_bits())),
++    })?;
++    let fone = fb.module().const_value(fone)?;
++    let a = fb.select(a_nan, fzero, a)?;
++    let a = fb.glsl(GlslOp::FClamp, &[a, fzero, fone])?;
++    let c = match write {
++        UnormWrite::Codes | UnormWrite::Over => c,
++        UnormWrite::Added => {
++            let bias = fsplat(fb, f, 384.0)?;
++            fb.binary(BinOp::FSub, c, bias)?
++        }
++        UnormWrite::Premultiplied => {
++            // 384 (1 - a) left out.
++            let k = fb.module().constant(Constant::Scalar {
++                ty: f1,
++                bits: ConstBits(u64::from(384.0f32.to_bits())),
++            })?;
++            let k = fb.module().const_value(k)?;
++            let kept = fb.binary(BinOp::FSub, fone, a)?;
++            let off = fb.binary(BinOp::FMul, kept, k)?;
++            let off = fb.composite_construct(ft, &[off, off, off, fzero])?;
++            fb.binary(BinOp::FSub, c, off)?
++        }
++    };
++    let u = fb.binary(BinOp::FDiv, c, max)?;
++    let r = fb.composite_extract(u, &[0])?;
++    let g = fb.composite_extract(u, &[1])?;
++    let b = fb.composite_extract(u, &[2])?;
++    fb.composite_construct(ft, &[r, g, b, a])
++}
++
+ /// The lanes a bfloat form keeps of a first vector, the rest taken from a second: red; red and
+ /// green; or all four.
+ fn bfloat_lanes(form: ExtendedRange) -> &'static [u32] {
+--- a/crates/metal2vulkan/src/lower/stage_io/extended_color.rs
++++ b/crates/metal2vulkan/src/lower/stage_io/extended_color.rs
+@@ -27,6 +27,12 @@
+ //! bfloat one's blend) and a dual-source second output to one. A `bfloat` output is refused
+ //! before, as Metal's compiler rejects it.
+ //!
++//! A `BGR10_XR` or `BGR10_XR_sRGB` attachment a device without framebuffer fetch renders through
++//! the `A2R10G10B10_UNORM_PACK32` view of its word (`ExtendedRangeColor::unorm`) is written through
++//! an output variable of four `float`s instead ([`unorm_output`]): its codes over 1023, unblended
++//! the codes Metal stores, blended the codes the device's blend works on (`UnormWrite`), where
++//! the pipeline's blend is one of those; every other blend stays refused.
++//!
+ //! On a device that orders framebuffer fetch through rasterization-order input attachments, a blend
+ //! the function computes over the attachment's input attachment (`lower::fragment`'s `input_blend`)
+ //! is built: the output's write stores the raw texel of Metal's blend over the texel the input
+@@ -49,7 +55,8 @@
+ 
+ /// An upper estimate of the SPIR-V words of one output's [`encode`]: the lanes completed to four,
+ /// the rounding to `half`, the texel's encode, and the raw components' extract.
+-pub(crate) const WORDS: u64 = 60 * 6 + extended_range::ENCODE_WORDS as u64;
++pub(crate) const WORDS: u64 =
++    60 * 6 + extended_range::ENCODE_WORDS as u64 + extended_range::UNORM_WORDS as u64;
+ 
+ /// Plan output `f` (dual-source `index`) of a fragment function to color attachment `color`: where
+ /// `LoweringInputs::extended_range_colors` lists the attachment and the output is `float` or
+@@ -72,7 +79,9 @@
+     let Some(fmt) = f.float_fmt() else {
+         return Ok(None);
+     };
+-    let blended = e.blended && !cx.families.fragment.input_blends.contains_key(&color);
++    let blended = e.blended
++        && e.unorm.is_none()
++        && !cx.families.fragment.input_blends.contains_key(&color);
+     if index != 0 || blended || !matches!(fmt, FloatFmt::F32 | FloatFmt::Half) {
+         return Err(Unsupported::not_implemented(Feature::Format).into());
+     }
+@@ -83,12 +92,26 @@
+         .insert(color, e);
+     cx.families.arith.converts(e.form);
+     cx.families.stage_io.extended.insert(color, e);
+-    Ok(Some(IoType {
+-        numeric: IoNumeric::Uint,
+-        components: e.form.raw_components() as u8,
+-        source_bits: 32,
+-        bits: 32,
+-    }))
++    Ok(Some(declared(e)))
++}
++
++/// The type of the output variable that writes attachment `e`: the raw texel's unsigned
++/// components, or, through the unsigned normalized view of the word, four `float`s.
++pub(crate) fn declared(e: ExtendedRangeColor) -> IoType {
++    match e.unorm {
++        Some(_) => IoType {
++            numeric: IoNumeric::Float,
++            components: 4,
++            source_bits: 32,
++            bits: 32,
++        },
++        None => IoType {
++            numeric: IoNumeric::Uint,
++            components: e.form.raw_components() as u8,
++            source_bits: 32,
++            bits: 32,
++        },
++    }
+ }
+ 
+ /// The raw texel Metal stores for output `x` (form `f`, `float` or `half` lanes) to the
+@@ -101,6 +124,9 @@
+     f: Form,
+     x: Value,
+ ) -> BResult<Value> {
++    if let Some(write) = e.unorm {
++        return unorm_output(cx, fb, (e.form, write), f, x);
++    }
+     let form = e.form;
+     let texel = match form.bfloat() {
+         true => bfloat_output(fb, e, f, x)?,
+@@ -109,6 +135,22 @@
+     raw_components(fb, form, texel)
+ }
+ 
++/// What output `x` (form `f`, `float` or `half` lanes) writes to an attachment held in `form` and
++/// rendered through the unsigned normalized view of its word as `write` writes it
++/// (`arith::extended_range::unorm_codes`): the lanes completed to four and rounded to `half` as
++/// [`held`] rounds them, then their codes over 1023.
++fn unorm_output(
++    cx: &mut EmitCx<'_>,
++    fb: &mut FunctionBuilder<'_>,
++    (form, write): (ExtendedRange, crate::pipeline::lower_inputs::UnormWrite),
++    f: Form,
++    x: Value,
++) -> BResult<Value> {
++    let v = held(fb, form, f, x)?;
++    let table = crate::lower::texture::extended_table(cx, form)?;
++    extended_range::unorm_codes(fb, form, v, table, write)
++}
++
+ /// The raw format's components of `texel`, a `uvec4` raw texel of an attachment held in `form`:
+ /// what the output variable holds.
+ pub(super) fn raw_components(
+--- a/crates/metal2vulkan/src/metal/format/mod.rs
++++ b/crates/metal2vulkan/src/metal/format/mod.rs
+@@ -299,6 +299,30 @@
+     Rgba16Bfloat,
+ }
+ 
++/// The format a color attachment of `pf` renders in on `profile` where it renders through the
++/// unsigned normalized view of its raw word (`LoweringInputs::extended_range_colors`,
++/// `pipeline::lower_inputs::UnormWrite`): `A2R10G10B10_UNORM_PACK32` for `BGR10_XR` and
++/// `BGR10_XR_sRGB` on a device that orders no framebuffer fetch (neither rasterization-order
++/// color attachment access nor the pixel interlock), where a blend into such an attachment has no
++/// other form, and that renders and blends the view's format. The view holds the word's bytes
++/// exactly as `R32_UINT` does: red's code in bits 20 to 29, green's in 10 to 19, blue's in 0 to
++/// 9 and Metal's two unused bits as alpha, so an unblended write of `c / 1023` stores Metal's code
++/// `c`, a clear Metal's texel, and a load and store keep every bit. Every pipeline and pass on the
++/// device renders such an attachment so, so that the pass and its pipelines agree on its format.
++/// `None` for every other format and device.
++pub fn unorm_codes_view(pf: PixelFormat, profile: &DeviceProfile) -> Option<vk::Format> {
++    let fragment = profile.fields().fragment;
++    let format = vk::Format::A2R10G10B10_UNORM_PACK32;
++    let renders = [FormatUsage::ColorAttachment, FormatUsage::ColorAttachmentBlend]
++        .into_iter()
++        .all(|usage| profile.supports_format(format, usage));
++    (matches!(ExtendedRange::of(pf), Some(ExtendedRange::Bgr10 { .. }))
++        && !fragment.rasterization_order_color_access
++        && !fragment.pixel_interlock
++        && renders)
++        .then_some(format)
++}
++
+ impl ExtendedRange {
+     /// The extended-range format `pf` is, if it is one held in one image.
+     pub fn of(pf: PixelFormat) -> Option<ExtendedRange> {
+--- a/crates/metal2vulkan/src/pipeline/color_writes.rs
++++ b/crates/metal2vulkan/src/pipeline/color_writes.rs
+@@ -45,7 +45,7 @@
+ use crate::pipeline::facts::RuntimeFact;
+ use crate::pipeline::graphics::ColorAttachmentState;
+ use crate::pipeline::lower_inputs::{
+-    ChannelWrite, ExtendedRangeColor, FactorLane, HalfOutputLane, RotatedBlendForm,
++    ChannelWrite, ExtendedRangeColor, FactorLane, HalfOutputLane, RotatedBlendForm, UnormWrite,
+ };
+ use crate::pipeline::rotated_blend::{rotated_blend, rotated_form, RotatedBlend};
+ use crate::pipeline::stage_io::{IoRole, SelectedWrite};
+@@ -363,7 +363,7 @@
+         colors.get(c as usize).copied().flatten().is_none() && !(alpha_to_coverage && c == 0)
+     });
+     if writes_hold(fragment, colors, (alpha_to_coverage, rounding), p)
+-        && wanted_extended_range(fragment, colors, rounding) == io.extended_range_colors
++        && wanted_extended_range(fragment, colors, rounding, p) == io.extended_range_colors
+         && wanted_srgb_fetches(fragment, colors) == io.srgb_fetches
+         && wanted_rotated(fragment, colors) == io.rotated_colors
+         && wanted_rotated_factors(fragment, colors, p) == io.rotated_factors
+@@ -414,13 +414,15 @@
+ }
+ 
+ /// The extended-range color attachments of a render pipeline whose color attachments are
+-/// `colors` and whose `textureWriteRoundingMode` is `rounding`, by color index
++/// `colors` and whose `textureWriteRoundingMode` is `rounding`, on `p`, by color index
+ /// (`LoweringInputs::extended_range_colors`): every attachment of one of Apple's extended-range
+ /// formats, blended where the pipeline enables blending there, a bfloat one rounding by the mode
+-/// (`ExtendedRangeColor::nearest_even`).
++/// (`ExtendedRangeColor::nearest_even`), one rendered through the unsigned normalized view of its
++/// word by its write there ([`unorm_write`]).
+ pub(crate) fn extended_range_colors(
+     colors: &[Option<ColorAttachmentDescriptor>],
+     rounding: TextureWriteRoundingMode,
++    p: &DeviceProfile,
+ ) -> BTreeMap<u32, ExtendedRangeColor> {
+     colors
+         .iter()
+@@ -428,12 +430,46 @@
+         .filter_map(|(i, c)| {
+             let c = c.as_ref()?;
+             let form = metal::format::ExtendedRange::of(c.pixel_format)?;
+-            let write = ExtendedRangeColor::new(form, c.blending_enabled).with_rounding(rounding);
++            let write = ExtendedRangeColor::new(form, c.blending_enabled)
++                .with_rounding(rounding)
++                .with_unorm(unorm_write(c, p));
+             Some((i as u32, write))
+         })
+         .collect()
+ }
+ 
++/// How a fragment function writes attachment `c` on `p` where it renders through the unsigned
++/// normalized view of its word (`metal::format::unorm_codes_view`): unblended, its codes; blended,
++/// added, by the share of the codes' bias the source keeps (`UnormWrite`), for the factors that
++/// keep a share the function can write: those that read neither the destination, nor the source's
++/// color (the function writes codes there, not Metal's value), nor a second output. `None` where
++/// the attachment holds its raw word, and for every other blend, which stays refused
++/// (`NotImplemented(Format)`).
++pub(crate) fn unorm_write(c: &ColorAttachmentDescriptor, p: &DeviceProfile) -> Option<UnormWrite> {
++    use metal::BlendFactor as F;
++    metal::format::unorm_codes_view(c.pixel_format, p)?;
++    if !c.blending_enabled {
++        return Some(UnormWrite::Codes);
++    }
++    if c.rgb_blend_operation != metal::BlendOperation::Add {
++        return None;
++    }
++    let source = c.source_rgb_blend_factor;
++    let constant = matches!(
++        source,
++        F::Zero | F::One | F::SourceAlpha | F::BlendColor | F::BlendAlpha
++    );
++    match (source, c.destination_rgb_blend_factor) {
++        (F::SourceAlpha, F::OneMinusSourceAlpha)
++        | (F::BlendColor, F::OneMinusBlendColor)
++        | (F::BlendAlpha, F::OneMinusBlendAlpha)
++        | (F::One, F::Zero) => Some(UnormWrite::Over),
++        (F::One, F::OneMinusSourceAlpha) => Some(UnormWrite::Premultiplied),
++        (_, F::One) if constant => Some(UnormWrite::Added),
++        _ => None,
++    }
++}
++
+ /// The color attachments of a render pipeline whose color attachments are `colors` held with
+ /// their channels rotated, by color index (`LoweringInputs::rotated_colors`): every attachment
+ /// of a format `metal::format::rotated_channels` names (`ARGB8Unorm`).
+@@ -649,6 +685,7 @@
+     fragment: &FunctionArtifact,
+     colors: &[Option<ColorAttachmentDescriptor>],
+     rounding: TextureWriteRoundingMode,
++    p: &DeviceProfile,
+ ) -> BTreeMap<u32, ExtendedRangeColor> {
+     let interface = &fragment.interface;
+     let written: std::collections::BTreeSet<u32> = interface
+@@ -672,7 +709,7 @@
+                 }),
+         )
+         .collect();
+-    let mut out = extended_range_colors(colors, rounding);
++    let mut out = extended_range_colors(colors, rounding, p);
+     out.retain(|a, _| written.contains(a));
+     out
+ }
+--- a/crates/metal2vulkan/src/pipeline/compile.rs
++++ b/crates/metal2vulkan/src/pipeline/compile.rs
+@@ -1637,6 +1637,7 @@
+     out.extended_range_colors = crate::pipeline::color_writes::extended_range_colors(
+         d.color_attachments,
+         d.texture_write_rounding_mode,
++        p,
+     );
+     out.rotated_colors = crate::pipeline::color_writes::rotated_colors(d.color_attachments);
+     out.rotated_factors = crate::pipeline::color_writes::rotated_factors(d.color_attachments, p);
+--- a/crates/metal2vulkan/src/pipeline/link/graphics.rs
++++ b/crates/metal2vulkan/src/pipeline/link/graphics.rs
+@@ -40,6 +40,11 @@
+ //!   too. With no attachment of the first kind, every attachment takes an empty mask without
+ //!   blending. On a device with `independentBlend` the states stay as above, and the pipeline's
+ //!   requirements name the feature when they differ.
++//! - **A `BGR10_XR` attachment through the unsigned normalized view of its word**
++//!   (`metal::format::unorm_codes_view`, a device without framebuffer fetch): the view's format,
++//!   the descriptor's mask of red, green and blue (and alpha, the word's top bits, where the write
++//!   is unblended, as Metal writes them), and Metal's color factors and operation on the codes the
++//!   function writes (`color_writes::unorm_write`; alpha is kept).
+ //! - **Depth and stencil** formats for `DepthStencilAttachment`.
+ //! - **Dynamic states**: what Metal sets per encoder rather than per pipeline. Always viewport,
+ //!   scissor, depth bias, blend constants, and the stencil reference and masks; with extended
+@@ -326,6 +331,11 @@
+                     // output, the descriptor's mask rotated, and the blend `rotated_blend`
+                     // finds Metal's in Vulkan's factors.
+                     let rotated = metal::format::rotated_channels(a.pixel_format);
++                    // A `BGR10_XR` attachment rendered through the unsigned normalized view of
++                    // its word takes the view's format and the codes' blend.
++                    if let Some(write) = color_writes::unorm_write(a, p) {
++                        return unorm_state(a, write, written.contains(&(index as u32)), p);
++                    }
+                     let blended = a.blending_enabled && !replaced && input_blend.is_none();
+                     let mut usages = BTreeSet::from([FormatUsage::ColorAttachment]);
+                     if blended {
+@@ -932,6 +942,44 @@
+ /// `bind::unused_bits_module`), so a channel the mask leaves out keeps the word Metal's pass
+ /// leaves. A bfloat form's channels are its own (red; red and green; all four), each a raw
+ /// component; a mask of some of them is unmeasured and refused as above.
++/// The state of attachment `a` rendered through the unsigned normalized view of its word
++/// (`metal::format::unorm_codes_view`), whose fragment function writes it as `write`
++/// (`color_writes::unorm_write`) where `written`, else not at all: the view's format; the
++/// descriptor's red, green and blue, and, unblended, alpha, which stores the word's top two bits
++/// as Metal writes them (a blend keeps them as they are); and the pipeline's color factors and
++/// operation, alpha's `One`, `Zero`, add (masked out).
++fn unorm_state(
++    a: &crate::pipeline::descriptor::ColorAttachmentDescriptor,
++    write: crate::pipeline::lower_inputs::UnormWrite,
++    written: bool,
++    p: &DeviceProfile,
++) -> Result<ColorAttachmentState, Error> {
++    use crate::pipeline::lower_inputs::UnormWrite;
++    use vk::ColorComponentFlags as C;
++    let format = metal::format::unorm_codes_view(a.pixel_format, p)
++        .ok_or_else(|| Error::from(Unsupported::not_implemented(Feature::Format)))?;
++    let rgb = color_write_mask(a.write_mask)? & (C::R | C::G | C::B);
++    let write_mask = match (written, rgb.is_empty(), write) {
++        (false, _, _) | (_, true, _) => C::empty(),
++        (true, false, UnormWrite::Codes) => rgb | C::A,
++        (true, false, _) => rgb,
++    };
++    let blend = match write {
++        UnormWrite::Codes => None,
++        _ => blend_factors(a, p)?.map(|b| crate::pipeline::graphics::BlendState {
++            src_alpha: vk::BlendFactor::ONE,
++            dst_alpha: vk::BlendFactor::ZERO,
++            alpha_op: vk::BlendOp::ADD,
++            ..b
++        }),
++    };
++    Ok(ColorAttachmentState {
++        format,
++        write_mask,
++        blend,
++    })
++}
++
+ fn extended_write_mask(
+     form: ExtendedRange,
+     mask: vk::ColorComponentFlags,
+--- a/crates/metal2vulkan/src/pipeline/lower_inputs.rs
++++ b/crates/metal2vulkan/src/pipeline/lower_inputs.rs
+@@ -722,6 +722,48 @@
+     /// alone: an extended-range form's `float` output rounds to nearest even, a padded one's toward
+     /// zero.
+     pub nearest_even: bool,
++    /// A `BGR10_XR` or `BGR10_XR_sRGB` attachment rendered through the `A2R10G10B10_UNORM_PACK32`
++    /// view of its raw word (`metal::format::unorm_codes_view`): the function writes its codes as
++    /// normalized values, and the device's blend, where the pipeline blends, works on them
++    /// ([`UnormWrite`]). `None` where the attachment holds its raw word as `R32_UINT`.
++    pub unorm: Option<UnormWrite>,
++}
++
++/// How a fragment function writes a `BGR10_XR` (or `_sRGB`) attachment rendered through the
++/// `A2R10G10B10_UNORM_PACK32` view of its word (`ExtendedRangeColor::unorm`): a device without
++/// framebuffer fetch's form of Metal's store and blend there.
++///
++/// The view reads the word's three 10-bit fields as `code / 1023` and its top two bits as alpha,
++/// and stores a value `u` as the code nearest `u * 1023`. Metal's value of a linear code `c` is
++/// `(c - 384) / 510`, so the code of a value is `u(v) = (384 + 510 v) / 1023`, affine in the value:
++/// the device's blend `s u_s + d u_d` of codes is the code of Metal's blend `s v_s + d v_d` where
++/// the function writes `u_s = (510 v_s + 384 b) / 1023` with `b = (1 - d) / s`, the share of the
++/// bias the source keeps. That `b` is a constant, or the source's alpha, for the blends below,
++/// which are then Metal's up to the device's rounding of the blended code (the source is not
++/// rounded to a code first); every other blend stays refused.
++///
++/// An `_sRGB` attachment's codes hold the value encoded through Metal's sRGB tables, so a blend
++/// of codes is a blend of the encoded values, not Metal's blend of the linear ones: the function
++/// writes the code of Metal's encode of the source (`extended_range::encode`), and the device
++/// blends codes as a device without sRGB blending blends 8-bit sRGB bytes. That is an
++/// approximation: exact at the factors' ends (a source alpha of 0 or 1, an unblended write), and
++/// in between the blend of two colors comes out darker than Metal's where they differ.
++#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
++pub enum UnormWrite {
++    /// Unblended: the code Metal stores, exactly (`u = c / 1023`), and alpha 1, the word's top
++    /// two bits as Metal writes them.
++    Codes,
++    /// Blended, added, with a destination factor of one minus the source factor (`SourceAlpha`
++    /// and `OneMinusSourceAlpha`, a blend color's or blend alpha's pair, `One` and `Zero`): the
++    /// source keeps the whole bias (`b = 1`).
++    Over,
++    /// Blended, added, with a destination factor of `One`: the source keeps none of the bias
++    /// (`b = 0`; a source below the code of 0 stores as 0, as the view clamps it).
++    Added,
++    /// Blended, added, with `One` and `OneMinusSourceAlpha`: the source keeps its alpha's share
++    /// of the bias (`b = a`).
++    Premultiplied,
+ }
+ 
+ impl ExtendedRangeColor {
+@@ -732,9 +774,16 @@
+             form,
+             blended,
+             nearest_even: false,
++            unorm: None,
+         }
+     }
+ 
++    /// This write, rendered through the unsigned normalized view of its word as `unorm` writes
++    /// it (`ExtendedRangeColor::unorm`).
++    pub fn with_unorm(self, unorm: Option<UnormWrite>) -> ExtendedRangeColor {
++        ExtendedRangeColor { unorm, ..self }
++    }
++
+     /// This write in a pipeline of `textureWriteRoundingMode` `rounding`: `nearest_even` where
+     /// the form is a bfloat one and `rounding` is `NearestEven`.
+     pub fn with_rounding(self, rounding: metal::TextureWriteRoundingMode) -> ExtendedRangeColor {
+--- a/crates/metal2vulkan/src/pipeline/mod.rs
++++ b/crates/metal2vulkan/src/pipeline/mod.rs
+@@ -133,8 +133,8 @@
+ pub use lower_inputs::{
+     AliasView, AmplificationDraws, BlendEquation, CaptureForm, ChannelWrite, ExtendedRangeColor,
+     FactorLane, FetchedAttachment, FramebufferFetchInputs, HalfOutputLane, LoweringInputs,
+-    RotatedBlendForm, StorageImageChoice, StorageImageClass, VertexFetch, VertexFetchProjection,
+-    ViewportCompensation,
++    RotatedBlendForm, StorageImageChoice, StorageImageClass, UnormWrite, VertexFetch,
++    VertexFetchProjection, ViewportCompensation,
+ };
+ pub use table::FunctionHandle;
+ // The vocabulary the pipeline surface reaches: render-pipeline keys, runtime facts and their
+--- a/crates/metal2vulkan/src/pipeline/stage_io.rs
++++ b/crates/metal2vulkan/src/pipeline/stage_io.rs
+@@ -422,7 +422,8 @@
+ 
+     /// The type variable `v` is declared with: its `ty`, but for a color output of dual-source
+     /// index 0 to an attachment among `extended_range_colors` the raw texel's, the raw format's
+-    /// unsigned 32-bit components.
++    /// unsigned 32-bit components (four `float`s where the attachment renders through the
++    /// unsigned normalized view of its word, `ExtendedRangeColor::unorm`).
+     pub(crate) fn declared_type(&self, v: &IoVariable) -> IoType {
+         let IoRole::Color {
+             attachment,
+@@ -432,12 +433,7 @@
+             return v.ty;
+         };
+         match self.extended_range_colors.get(&attachment) {
+-            Some(e) => IoType {
+-                numeric: IoNumeric::Uint,
+-                components: e.form.raw_components() as u8,
+-                source_bits: 32,
+-                bits: 32,
+-            },
++            Some(&e) => crate::lower::stage_io::extended_color::declared(e),
+             None => v.ty,
+         }
+     }
+--- a/crates/metal2vulkan/src/pipeline/testing.rs
++++ b/crates/metal2vulkan/src/pipeline/testing.rs
+@@ -161,6 +161,7 @@
+     inputs.extended_range_colors = crate::pipeline::color_writes::extended_range_colors(
+         &r.color_attachments,
+         r.texture_write_rounding_mode,
++        p,
+     );
+     inputs.rotated_colors = crate::pipeline::color_writes::rotated_colors(&r.color_attachments);
+     inputs.half_output_lanes =
+--- a/crates/metal2vulkan-runtime/src/clear_reach.rs
++++ b/crates/metal2vulkan-runtime/src/clear_reach.rs
+@@ -535,7 +535,13 @@
+                 rects,
+                 layers: color.target.layers,
+                 aspects: vk::ImageAspectFlags::COLOR,
+-                value: vk::ClearValue { color: color.clear },
++                value: vk::ClearValue {
++                    color: clear_value::in_format(
++                        color.target.texture.pixel_format(),
++                        color.target.format,
++                        color.clear,
++                    ),
++                },
+             });
+         }
+         if let Some(ds) = layout
+--- a/crates/metal2vulkan-runtime/src/clear_value.rs
++++ b/crates/metal2vulkan-runtime/src/clear_value.rs
+@@ -253,6 +253,35 @@
+     })
+ }
+ 
++/// The clear value [`color`] gives an attachment of `pf` (`clear`) as the pass's attachment of
++/// Vulkan format `format` takes it: an extended-range attachment's raw texel, where it renders
++/// through the unsigned normalized view of its word (`A2R10G10B10_UNORM_PACK32`,
++/// `metal::format::unorm_codes_view`), as that view's values, which store the texel's bits
++/// exactly (each field's code over its largest); every other clear as it is.
++pub(super) fn in_format(
++    pf: PixelFormat,
++    format: Format,
++    clear: vk::ClearColorValue,
++) -> vk::ClearColorValue {
++    if format != Format::A2R10G10B10_UNORM_PACK32
++        || !matches!(ExtendedRange::of(pf), Some(ExtendedRange::Bgr10 { .. }))
++    {
++        return clear;
++    }
++    // SAFETY: an extended-range attachment's clear value is its raw texel's `uint32`s
++    // ([`color`]).
++    let word = unsafe { clear.uint32[0] };
++    let field = |shift: u32, max: u32| ((word >> shift) & max) as f32 / max as f32;
++    vk::ClearColorValue {
++        float32: [
++            field(20, 0x3ff),
++            field(10, 0x3ff),
++            field(0, 0x3ff),
++            field(30, 0x3),
++        ],
++    }
++}
++
+ /// Where a `half` or small-float channel of `value`, the Vulkan clear value [`color`] gives an
+ /// attachment of `pf`, is a NaN, whose bits Vulkan leaves to the device's conversion
+ /// (`nan_clear.rs`): the unsigned-integer format of the texel's size and the clear value that
+--- a/crates/metal2vulkan-runtime/src/image_plan.rs
++++ b/crates/metal2vulkan-runtime/src/image_plan.rs
+@@ -75,7 +75,7 @@
+ };
+ use metal2vulkan::metal::format::{
+     direct_format, image_type, is_depth_stencil, srgb_raw_twin, storage_image_choice,
+-    storage_view_formats, vk_format, FormatEmulation, FormatMapping,
++    storage_view_formats, unorm_codes_view, vk_format, FormatEmulation, FormatMapping,
+ };
+ use metal2vulkan::metal::{PixelFormat, TextureType, TextureUsage};
+ use metal2vulkan::vk::{
+@@ -640,6 +640,13 @@
+         if layout.texture_type == TextureType::Type3D && !depth_stencil {
+             flags |= render_3d_flags(profile);
+         }
++        // A `BGR10_XR` attachment renders through the unsigned normalized view of its word where
++        // the device orders no fetch (`unorm_codes_view`).
++        let mut view_formats = Vec::new();
++        if let Some(view) = unorm_codes_view(pf, profile) {
++            flags |= ImageCreateFlags::MUTABLE_FORMAT;
++            view_formats = vec![direct, view];
++        }
+         return Ok(ImagePlan {
+             pixel_format: pf,
+             flags,
+@@ -650,7 +657,7 @@
+             layers: layout.layers,
+             samples,
+             usage: attachment_flag(depth_stencil, profile) | ImageUsageFlags::TRANSIENT_ATTACHMENT,
+-            view_formats: Vec::new(),
++            view_formats,
+             mapping,
+             // A memoryless texture is a render target only.
+             unavailable: usage.difference(TextureUsage::RENDER_TARGET),
+@@ -773,6 +780,11 @@
+         if wants_attachment && format == direct {
+             usage_flags |= attachment_flag(depth_stencil, profile);
+             views.insert(format);
++            // A `BGR10_XR` attachment renders through the unsigned normalized view of its word
++            // where the device orders no fetch (`unorm_codes_view`), which holds the same bytes.
++            views.extend(
++                unorm_codes_view(pf, profile).filter(|&view| compatible(format, view, false)),
++            );
+             // A multisampled depth attachment is made for a pass's custom sample positions
+             // where the device takes them (`sample_positions::compatible_depth`).
+             if depth_stencil {
+--- a/crates/metal2vulkan-runtime/src/render_pass.rs
++++ b/crates/metal2vulkan-runtime/src/render_pass.rs
+@@ -1639,11 +1639,23 @@
+     device: &Device,
+ ) -> Result<metal2vulkan::vk::Format, Error> {
+     use metal2vulkan::device::FormatUsage;
++    let not_built = || Error::NotImplemented(RuntimeGap::Render);
++    let profile = device.compile_device().profile();
++    // A `BGR10_XR` color renders through the unsigned normalized view of its word where the
++    // device orders no fetch, as every pipeline's attachment of it does
++    // (`metal2vulkan::metal::format::unorm_codes_view`); an image made without that view (a
++    // caller's) is not built.
++    if let (Attachment::Color(_), true) = (which, plan.pixel_format == pixel_format) {
++        if let Some(view) = metal2vulkan::metal::format::unorm_codes_view(pixel_format, profile) {
++            return match views_as(plan, view, false) {
++                true => Ok(view),
++                false => Err(not_built()),
++            };
++        }
++    }
+     if plan.pixel_format == pixel_format {
+         return Ok(plan.format);
+     }
+-    let not_built = || Error::NotImplemented(RuntimeGap::Render);
+-    let profile = device.compile_device().profile();
+     if let Attachment::Depth | Attachment::Stencil = which {
+         let usages: std::collections::BTreeSet<_> = [FormatUsage::DepthStencilAttachment].into();
+         return match vk_format(pixel_format, &usages, profile) {
+--- a/crates/metal2vulkan-runtime/src/render_target.rs
++++ b/crates/metal2vulkan-runtime/src/render_target.rs
+@@ -1516,7 +1516,13 @@
+         .colors
+         .iter()
+         .flatten()
+-        .map(|color| vk::ClearValue { color: color.clear })
++        .map(|color| vk::ClearValue {
++            color: super::clear_value::in_format(
++                color.target.texture.pixel_format(),
++                color.target.format,
++                color.clear,
++            ),
++        })
+         .collect();
+     if let Some(ds) = &layout.depth_stencil {
+         let mut value = vk::ClearDepthStencilValue::default();
