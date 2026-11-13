@@ -361,9 +361,12 @@ hakios_drm_unmap(int fd, uint32_t handle, void *address)
 		return;                 /* (the memory goes with the buffer: GEM_CLOSE) */
 	}
 	pthread_mutex_lock(&map_lock);
-	if ((m = mapped_of(handle)) != NULL && --m->users != 0) {
-		pthread_mutex_unlock(&map_lock);
-		return;                 /* (another user still has it) */
+	if ((m = mapped_of(handle)) != NULL) {
+		if (--m->users != 0) {
+			pthread_mutex_unlock(&map_lock);
+			return;         /* (another user still has it) */
+		}
+		address = (void *)(uintptr_t)m->address;   /* (the user may hold a pointer into it, not its start) */
 	}
 	pthread_mutex_unlock(&map_lock);
 	IOConnectUnmapMemory64(connection, handle, mach_task_self(), (mach_vm_address_t)(uintptr_t)address);

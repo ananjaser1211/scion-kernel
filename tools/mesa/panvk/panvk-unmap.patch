@@ -1,22 +1,42 @@
-panvk: a buffer's CPU mapping undone through the libdrm stand-in on Darwin, not munmap()
+panvk: a buffer's CPU mappings through the libdrm stand-in on Darwin: parts of a buffer, and undone without munmap()
 
 Applied by tools/mk-panvk.sh only, after tools/mesa/*.patch (pan_kmod.h's __APPLE__ mapping is panfrost-darwin.patch's) and the
 other panvk patches, to Mesa 25.0.7 (Mesa's own licence, MIT, applies to the lines it changes). Written for Scion.
-  - pan_kmod.h: pan_kmod_bo_munmap(), hakios_drm_unmap() on Darwin, os_munmap() elsewhere.
-  - panvk_buffer.c, panvk_device_memory.c, panvk_image.c, panvk_priv_bo.c: their os_munmap() of a buffer's mapping is that.
+  - pan_kmod.h: pan_kmod_bo_mmap() of a part of a buffer is the buffer's one mapping from that offset on (it was refused, and
+    PanVK's index-buffer mapping then pointed at nothing: SpringBoard's Siri orb, SIGBUS, build 46); pan_kmod_bo_munmap(),
+    hakios_drm_unmap() on Darwin, os_munmap() elsewhere.
+  - panvk_buffer.c, panvk_device_memory.c, panvk_image.c, panvk_priv_bo.c: their os_munmap() of a buffer's mapping is that;
+    panvk_buffer.c's index-buffer pointer adds the offset into the page (upstream adds offset & pgsize).
 On Darwin a buffer has one mapping per process (IOKit's), so a VkBuffer covering its whole VkDeviceMemory got the memory's own
 mapping, and vkDestroyBuffer's munmap() took it away under vkFreeMemory, whose munmap() then fell on a hole: a VM guard
 exception (kGUARD_EXC_DEALLOC_GAP), fatal in applications and app extensions (every Metal client on the S9, build 45).
 
 --- a/src/panfrost/lib/kmod/pan_kmod.h
 +++ b/src/panfrost/lib/kmod/pan_kmod.h
-@@ -634,6 +634,21 @@
+@@ -617,10 +617,12 @@
+ 
+ #ifdef __APPLE__
+    /* no mmap() on a device here: the kernel's driver maps the buffer, all of
+-    * it (src/hakios-drm), which is what panfrost asks for (pan_bo.c) */
+-   host_addr = bo_offset == 0 && size == bo->size
+-                  ? hakios_drm_map(bo->dev->fd, bo->handle, size)
+-                  : MAP_FAILED;
++    * it (src/hakios-drm), which is what panfrost asks for (pan_bo.c).
++    * Scion: a part of it (PanVK maps an index buffer's range of its memory)
++    * is that one mapping from bo_offset on. */
++   host_addr = hakios_drm_map(bo->dev->fd, bo->handle, bo->size);
++   if (host_addr != MAP_FAILED)
++      host_addr = (char *)host_addr + bo_offset;
+ #else
+    host_addr = os_mmap(host_addr, size, prot, flags, bo->dev->fd,
+                        mmap_offset + bo_offset);
+@@ -634,6 +636,21 @@
     return host_addr;
  }
  
 +/* Scion: undo pan_kmod_bo_mmap(). On Darwin the kernel's driver made the mapping, one per buffer
 + * and process, which src/hakios-drm counts and unmaps when its last user does; munmap() would take
-+ * it away from every user at once. */
++ * it away from every user at once. host_addr may be anywhere in it. */
 +static inline int
 +pan_kmod_bo_munmap(struct pan_kmod_bo *bo, void *host_addr, size_t size)
 +{
@@ -34,7 +54,17 @@ exception (kGUARD_EXC_DEALLOC_GAP), fatal in applications and app extensions (ev
  {
 --- a/src/panfrost/vulkan/panvk_buffer.c
 +++ b/src/panfrost/vulkan/panvk_buffer.c
-@@ -136,7 +136,7 @@
+@@ -91,7 +91,8 @@
+                              PROT_WRITE, MAP_SHARED, NULL);
+ 
+          assert(map_addr != MAP_FAILED);
+-         buffer->host_ptr = map_addr + (offset & pgsize);
++         /* Scion: the offset into the page (upstream adds offset & pgsize) */
++         buffer->host_ptr = map_addr + (offset - map_start);
+       }
+ 
+       pan_kmod_bo_put(old_bo);
+@@ -136,7 +137,7 @@
        uintptr_t map_start = (uintptr_t)buffer->host_ptr & ~(pgsize - 1);
        uintptr_t map_end =
           ALIGN_POT((uintptr_t)buffer->host_ptr + buffer->vk.size, pgsize);
