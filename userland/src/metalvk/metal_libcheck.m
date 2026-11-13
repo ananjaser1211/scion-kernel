@@ -9,11 +9,12 @@
  *   metal_libcheck [--bundle DIR] [--format PIXELFORMAT] LIBRARY.metallib...
  *
  * The device is made as metal_tri makes it (the plug-in's class, by hand: run as metal_libcheck, named in HakiosMetal.clients beside the
- * bundle). For each library: every kernel function is a compute pipeline; every vertex function a render pipeline with rasterization
- * off; every fragment function is tried with the library's vertex functions, the one whose name shares the longest beginning with it
- * first, until one makes a pipeline with it (a colour attachment of PIXELFORMAT, default 80, BGRA8Unorm, on each of the first four
- * indices and a Depth32Float attachment). A fragment function that no vertex function pairs with is listed with the last refusal; that
- * may be the pairing, not the function. Function constants a function declares are not set, so a function that needs them is refused.
+ * bundle). For each library: every kernel function is a compute pipeline; every fragment function is tried with the library's vertex
+ * functions, the one whose name shares the longest beginning with it first, until one makes a pipeline with it (a colour attachment of
+ * PIXELFORMAT, default 80, BGRA8Unorm, on each of the first four indices and a Depth32Float attachment); a vertex function that no
+ * fragment function took is tried the same way with the fragment functions. A function that no partner pairs with is listed with the
+ * last refusal; that may be the pairing, not the function. The function constants a function declares are all set to zero (a program
+ * sets its own), so what is checked is the translation of the function, not one particular variant.
  */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -63,13 +64,52 @@ common_prefix(NSString *a, NSString *b)
 	return n;
 }
 
-static void
-attachments(MTLRenderPipelineDescriptor *pd, MTLPixelFormat format)
+/* the frontend's own (NativeBridgeMetalFrontend.mm, its shader priming): a function with each of its function constants set to zero */
+@interface NSObject (HakiosMetalLibrary)
+- (id<MTLFunction>)nb_newFunctionWithZeroConstants:(NSString *)name;
+@end
+
+/* NAME of LIBRARY, its function constants (if it declares any) all zero where the plug-in can do that */
+static id<MTLFunction>
+function_named(id<MTLLibrary> library, NSString *name, NSError **error)
 {
+	id<MTLFunction> function = nil;
+
+	if ([(id)library respondsToSelector:@selector(nb_newFunctionWithZeroConstants:)]) {
+		function = [(id)library nb_newFunctionWithZeroConstants:name];
+	}
+	if (function == nil) {
+		function = [library newFunctionWithName:name];
+	}
+	if (function == nil && error != NULL) {
+		*error = [NSError errorWithDomain:@"metal_libcheck" code:1 userInfo:@{NSLocalizedDescriptionKey: @"the library refused it"}];
+	}
+	return function;
+}
+
+/* a render pipeline of VERTEX and FRAGMENT into the test's attachments, or nil and ERROR */
+static id<MTLRenderPipelineState>
+pair(id<MTLDevice> device, id<MTLFunction> vertex, id<MTLFunction> fragment, MTLPixelFormat format, NSError **error)
+{
+	MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+
+	pd.vertexFunction = vertex;
+	pd.fragmentFunction = fragment;
 	for (unsigned i = 0; i < 4; i++) {
 		pd.colorAttachments[i].pixelFormat = format;
 	}
 	pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+	return [device newRenderPipelineStateWithDescriptor:pd error:error];
+}
+
+/* FUNCTIONS ordered by how long a beginning of its name each shares with NAME, longest first */
+static NSArray<id<MTLFunction>> *
+nearest(NSArray<id<MTLFunction>> *functions, NSString *name)
+{
+	return [functions sortedArrayUsingComparator:^NSComparisonResult(id<MTLFunction> a, id<MTLFunction> b) {
+		size_t pa = common_prefix(a.name, name), pb = common_prefix(b.name, name);
+		return pa > pb ? NSOrderedAscending : pa < pb ? NSOrderedDescending : NSOrderedSame;
+	}];
 }
 
 static const char *
@@ -95,10 +135,11 @@ check(id<MTLDevice> device, const char *path, MTLPixelFormat format)
 		return 1;
 	}
 	for (NSString *name in [library.functionNames sortedArrayUsingSelector:@selector(compare:)]) {
-		id<MTLFunction> function = [library newFunctionWithName:name];
+		error = nil;
+		id<MTLFunction> function = function_named(library, name, &error);
 
 		if (function == nil) {
-			printf("FAIL  %s: no function\n", name.UTF8String);
+			printf("FAIL  %s: no function: %s\n", name.UTF8String, reason(error));
 			refused++;
 		} else if (function.functionType == MTLFunctionTypeVertex) {
 			[vertex addObject:function];
@@ -122,36 +163,15 @@ check(id<MTLDevice> device, const char *path, MTLPixelFormat format)
 			refused++;
 		}
 	}
-	for (id<MTLFunction> function in vertex) {
-		MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
-
-		pd.vertexFunction = function;
-		pd.rasterizationEnabled = NO;
-		error = nil;
-		if ([device newRenderPipelineStateWithDescriptor:pd error:&error] != nil) {
-			printf("ok    vertex   %s\n", function.name.UTF8String);
-			made++;
-		} else {
-			printf("FAIL  vertex   %s: %s\n", function.name.UTF8String, reason(error));
-			refused++;
-		}
-	}
+	NSMutableSet<NSString *> *paired = [NSMutableSet new];
 	for (id<MTLFunction> function in fragment) {
-		NSArray<id<MTLFunction>> *order = [vertex sortedArrayUsingComparator:^NSComparisonResult(id<MTLFunction> a, id<MTLFunction> b) {
-			size_t pa = common_prefix(a.name, function.name), pb = common_prefix(b.name, function.name);
-			return pa > pb ? NSOrderedAscending : pa < pb ? NSOrderedDescending : NSOrderedSame;
-		}];
 		const char *with = NULL;
 
 		error = nil;
-		for (id<MTLFunction> partner in order) {
-			MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
-
-			pd.vertexFunction = partner;
-			pd.fragmentFunction = function;
-			attachments(pd, format);
-			if ([device newRenderPipelineStateWithDescriptor:pd error:&error] != nil) {
+		for (id<MTLFunction> partner in nearest(vertex, function.name)) {
+			if (pair(device, partner, function, format, &error) != nil) {
 				with = partner.name.UTF8String;
+				[paired addObject:partner.name];
 				break;
 			}
 		}
@@ -159,7 +179,30 @@ check(id<MTLDevice> device, const char *path, MTLPixelFormat format)
 			printf("ok    fragment %s (with %s)\n", function.name.UTF8String, with);
 			made++;
 		} else {
-			printf("FAIL  fragment %s: %s\n", function.name.UTF8String, order.count ? reason(error) : "no vertex function to pair");
+			printf("FAIL  fragment %s: %s\n", function.name.UTF8String, vertex.count ? reason(error) : "no vertex function to pair");
+			refused++;
+		}
+	}
+	for (id<MTLFunction> function in vertex) {
+		const char *with = NULL;
+
+		if ([paired containsObject:function.name]) {
+			printf("ok    vertex   %s\n", function.name.UTF8String);
+			made++;
+			continue;
+		}
+		error = nil;
+		for (id<MTLFunction> partner in nearest(fragment, function.name)) {
+			if (pair(device, function, partner, format, &error) != nil) {
+				with = partner.name.UTF8String;
+				break;
+			}
+		}
+		if (with != NULL) {
+			printf("ok    vertex   %s (with %s)\n", function.name.UTF8String, with);
+			made++;
+		} else {
+			printf("FAIL  vertex   %s: %s\n", function.name.UTF8String, fragment.count ? reason(error) : "no fragment function to pair");
 			refused++;
 		}
 	}
