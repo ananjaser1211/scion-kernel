@@ -276,7 +276,10 @@ static void noteProblem(NSString *what) {
  memcpy(gLastProblems[1],gLastProblems[0],sizeof gLastProblems[0]);
  strlcpy(gLastProblems[0],what.UTF8String?:"?",sizeof gLastProblems[0]);
 }
-#define NBLOG(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];NSLog(@"%@",nbText);noteProblem(nbText);}while(0)
+// Scion: every line also to the plug-in's own log (HakiosMetalVK.mm: the console and a file), where a system process's NSLog is not seen.
+void (*native_bridge_metal_log_hook)(const char *);
+#define NBLOG(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];NSLog(@"%@",nbText);\
+ if(native_bridge_metal_log_hook)native_bridge_metal_log_hook(nbText.UTF8String?:"?");noteProblem(nbText);}while(0)
 // The pixel formats textures were asked for (first eight distinct), with how many were refused: native_bridge_metal_formats.
 static uint32_t gFormats[8];static unsigned gFormatCount;static std::atomic<uint64_t> gTextureRefusals;
 // Textures over IOSurfaces: made, refused, and how many of the requests named a planar surface.
@@ -1839,24 +1842,40 @@ static void installAnswers(Class cls) {
    // swap's surface was '&w4a', 8 bytes per pixel, and every swap was refused).
    if(!strcmp(name,"supportsExtendedXR10Formats"))value=0;
    gAnswers[sel]=value;
-   class_addMethod(cls,sel,kind==NMB_ANSWER_COUNT?(IMP)countAnswer:(IMP)flagAnswer,kind==NMB_ANSWER_COUNT?"Q16@0:8":"B16@0:8");
+   // Scion: replaced, not added: the class may be the plug-in's own (native_bridge_metal_adopt), which has methods of these names already
+   class_replaceMethod(cls,sel,kind==NMB_ANSWER_COUNT?(IMP)countAnswer:(IMP)flagAnswer,kind==NMB_ANSWER_COUNT?"Q16@0:8":"B16@0:8");
    break;
-  case NMB_ANSWER_COUNT_ARG: class_addMethod(cls,sel,(IMP)countArgAnswer,"Q24@0:8Q16");break;
-  case NMB_ANSWER_FLAG_ARG: class_addMethod(cls,sel,(IMP)flagArgAnswer,"B24@0:8Q16");break;
+  case NMB_ANSWER_COUNT_ARG: class_replaceMethod(cls,sel,(IMP)countArgAnswer,"Q24@0:8Q16");break;
+  case NMB_ANSWER_FLAG_ARG: class_replaceMethod(cls,sel,(IMP)flagArgAnswer,"B24@0:8Q16");break;
   }
  }
 }
 
-extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint64_t registryID,void (*missing)(const char *,const char *)) {
- if(gDeviceObject)return gDeviceObject;
+// Scion: the runtime's device, opened once per process (the first half of what native_bridge_metal_open did).
+static bool openRuntimeDevice(const char *loader,const char *cache,uint64_t registryID,void (*missing)(const char *,const char *)) {
+ if(gDevice)return true;
  gMissing=missing;gInFlight=[NSMutableSet set];
  gDevice=nmb_device_open(loader,cache);
- if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
+ if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return false;}
  if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}
  char name[128]={};nmb_device_name(gDevice,name,sizeof name);gName=[NSString stringWithUTF8String:name];gRegistryID=registryID;
  // The target families supportsFamily: answers true, with the rows of Apple's tables the device does not meet in them (nmb_device_family_waivers).
  {char waived[4096]={};nmb_device_family_waivers(gDevice,waived,sizeof waived);
   for(char *line=waived,*next;*line;line=next){next=strchr(line,'\n');if(next)*next++=0;else next=line+strlen(line);journal(std::string("F ")+line);}}
+ return true;
+}
+
+// Scion: this file's device methods and the runtime's answers, put on a device class (the second half of what native_bridge_metal_open
+// did). Replaced rather than added, so that the class can be one that has methods of these names already (native_bridge_metal_adopt).
+static void installDeviceMethods(Class cls) {
+ unsigned count=0;Method *methods=class_copyMethodList([NBDeviceMethods class],&count);
+ for(unsigned i=0;i<count;i++)class_replaceMethod(cls,method_getName(methods[i]),method_getImplementation(methods[i]),method_getTypeEncoding(methods[i]));
+ free(methods);installAnswers(cls);
+}
+
+extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint64_t registryID,void (*missing)(const char *,const char *)) {
+ if(gDeviceObject)return gDeviceObject;
+ if(!openRuntimeDevice(loader,cache,registryID,missing))return nil;
  Class base=objc_getClass("_MTLDevice");
 #if !TARGET_OS_IPHONE
  // Host instrument: on NSObject every selector a client sends that this file lacks reaches the missing hook, instead of the host's
@@ -1872,15 +1891,25 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
 #endif
  if(!base)base=[NSObject class];
  Class cls=objc_allocateClassPair(base,"NativeBridgeMetalDevice",0);if(!cls)return nil;
- unsigned count=0;Method *methods=class_copyMethodList([NBDeviceMethods class],&count);
- for(unsigned i=0;i<count;i++)class_addMethod(cls,method_getName(methods[i]),method_getImplementation(methods[i]),method_getTypeEncoding(methods[i]));
- free(methods);installAnswers(cls);class_addProtocol(cls,@protocol(MTLDevice));
+ installDeviceMethods(cls);class_addProtocol(cls,@protocol(MTLDevice));
  // The original registration (_MTLAddDevice) asserts that a plugin's device conforms to Metal's private device protocol as well; the target's own
  // drivers get it from their IOGPU base class. Conformance only answers conformsToProtocol:, the methods are still looked up one by one.
  if(Protocol *spi=objc_getProtocol("MTLDeviceSPI"))class_addProtocol(cls,spi);
  objc_registerClassPair(cls);
  gDeviceObject=[cls new];
  return gDeviceObject;
+}
+
+// Scion: the runtime's device for an object Metal holds already. The plug-in (HakiosMetalVK.mm) gives a process it shows the device an
+// object of its own class at once, and loads this library only when that object is first asked for something only the runtime can
+// answer; then this file's methods go onto that object's class, so the object Metal and the program hold IS the device from then on
+// (every resource answers it as its -device). Its class is a subclass of _MTLDevice that declares MTLDevice and MTLDeviceSPI already.
+extern "C" bool native_bridge_metal_adopt(id object,const char *loader,const char *cache,uint64_t registryID,void (*missing)(const char *,const char *)) {
+ if(gDeviceObject)return gDeviceObject==object;
+ if(!object || !openRuntimeDevice(loader,cache,registryID,missing))return false;
+ installDeviceMethods(object_getClass(object));
+ gDeviceObject=object;
+ return true;
 }
 
 // Bare AIR bitcode (no metallib wrapper), which Metal itself refuses: for the bridge's own fixtures only.

@@ -103,6 +103,8 @@
 #                                   (lib/HakiosMetal.icd). Plus bin/m2v_test and share/m2v_test.metallib: the same checks as on a
 #                                   Mac, on the guest's driver (RC_JOBS=rc.jobs.metalvk). Still behind boot-arg metal=N like the
 #                                   other plug-in; with no driver at that path there is simply no device. docs/metal-plan.md.
+#                                   The bundle's executable links none of it: HakiosMetal.bundle/HakiosMetalVK.dylib (the
+#                                   frontend) and through it the runtime and the driver are loaded at the device's first use.
 #                                   Also bin/metal_tri, share/metal_tri.metallib and MetalTri.app (a triangle through the Metal
 #                                   API, src/metalvk/metal_tri.m), which open the plug-in themselves, shown the device by
 #                                   lib/HakiosMetal.clients: no boot-arg needed. M2V_DIR=DIR takes a libmetal2vulkan.dylib
@@ -561,10 +563,15 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 					sha256sum)" ] || ../tools/metal/mk-metal2vulkan.sh ios
 			fi
 			$DYN -c -o obj/hakios_metal_shown.o src/hakios_metal_shown.c
-			xnu-clang++ -arch arm64 -isysroot ${THEOS:-$HOME/theos}/sdks/iPhoneOS16.5.sdk -O1 -fuse-cxa-atexit -std=c++17 -stdlib=libc++ \
-				-fobjc-arc -I../tools/metal -Isrc/metalvk -bundle -framework Foundation -framework Metal -framework IOSurface \
-				-framework IOKit -framework CoreFoundation -lobjc -o obj/HakiosMetal src/metalvk/HakiosMetalVK.mm \
-				src/metalvk/NativeBridgeMetalFrontend.mm obj/hakios_metal_shown.o $V/libmetal2vulkan.dylib
+			# the bundle's executable: the device class and who is shown it, nothing of the runtime's (no ARC: it keeps its device
+			# by hand); then HakiosMetalVK.dylib, the Metal API and the opening of the Vulkan device, which it loads at first use
+			MVKXX="xnu-clang++ -arch arm64 -isysroot ${THEOS:-$HOME/theos}/sdks/iPhoneOS16.5.sdk -O1 -fuse-cxa-atexit -std=c++17 -stdlib=libc++"
+			$MVKXX -fno-objc-arc -bundle -framework Foundation -framework Metal -framework IOKit -framework CoreFoundation -lobjc \
+				-o obj/HakiosMetal src/metalvk/HakiosMetalVK.mm obj/hakios_metal_shown.o
+			$MVKXX -fobjc-arc -I../tools/metal -Isrc/metalvk -dynamiclib -install_name /redwood/lib/HakiosMetal.bundle/HakiosMetalVK.dylib \
+				-framework Foundation -framework Metal -framework IOSurface -framework IOKit -framework CoreFoundation -lobjc \
+				-o obj/HakiosMetalVK.dylib src/metalvk/HakiosMetalVKOpen.mm src/metalvk/NativeBridgeMetalFrontend.mm \
+				obj/hakios_metal_shown.o $V/libmetal2vulkan.dylib
 			cp $V/libmetal2vulkan.dylib obj/
 			# m2v_test and its metallib only where Xcode made them (not on Linux)
 			[ -f $V/m2v_test ] && [ -f $V/m2v_test.metallib ] && cp $V/m2v_test $V/m2v_test.metallib obj/
@@ -815,6 +822,8 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 		mkdir -p root/lib/HakiosMetal.bundle
 		cp obj/HakiosMetal root/lib/HakiosMetal.bundle/
 		cp src/HakiosMetal.plist root/lib/HakiosMetal.bundle/Info.plist
+		# METAL=vk: the half the bundle loads when a device is first used (src/metalvk/HakiosMetalVK.mm)
+		if [ "$METAL" = vk ]; then cp obj/HakiosMetalVK.dylib root/lib/HakiosMetal.bundle/; fi
 	fi
 	# METAL=vk: the runtime the plug-in links, the guest's test of it, and the Vulkan driver it opens if not the default
 	if [ -f obj/libmetal2vulkan.dylib ]; then

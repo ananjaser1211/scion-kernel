@@ -12,6 +12,11 @@ extern "C" {
 // Opens the process's one device: loader exports vkGetInstanceProcAddr (Turnip), cache is a writable shader-cache directory, registryID is the
 // accelerator service's registry entry. missing (may be null) is told the class and selector of every unimplemented call.
 id native_bridge_metal_open(const char *loader, const char *cache, uint64_t registryID, void (*missing)(const char *, const char *));
+// Scion: the same device for an object of the plug-in's own _MTLDevice subclass that Metal holds already (HakiosMetalVK.mm): this file's
+// methods go onto that object's class and the object becomes the device. True when it is (or already was) the process's device.
+bool native_bridge_metal_adopt(id object, const char *loader, const char *cache, uint64_t registryID, void (*missing)(const char *, const char *));
+// Scion: told every line the frontend logs (may be null).
+extern void (*native_bridge_metal_log_hook)(const char *);
 // Bare AIR bitcode as a library (the bridge's fixtures; Metal itself accepts only metallibs).
 id native_bridge_metal_library_with_air(const void *bytes, size_t length);
 // One line for the plugin's status report: command buffers committed/failed locally, pipelines made, refusals, the last refusal's text.
