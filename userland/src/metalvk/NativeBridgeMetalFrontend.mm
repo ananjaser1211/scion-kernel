@@ -1840,7 +1840,9 @@ static void installAnswers(Class cls) {
    // Extended-range 10-bit (XR10) framebuffers are withheld: this display chain presents 8-bit BGRX scanout only. The render server picks its
    // wide-gamut 64-bit (and Apple-compressed) framebuffer when a device offers them, and the display driver could not show it (int-089: the
    // swap's surface was '&w4a', 8 bytes per pixel, and every swap was refused).
-   if(!strcmp(name,"supportsExtendedXR10Formats"))value=0;
+   // Scion: withheld from the render server only. A client's CAMetalLayer with an extended-range format (ClockKitUI's, for
+   // the Astronomy wallpaper) is refused with CAMetalLayerInvalid "unsupported extended range format" when the device says no.
+   if(!strcmp(name,"supportsExtendedXR10Formats") && !strcmp(getprogname(),"backboardd"))value=0;
    gAnswers[sel]=value;
    // Scion: replaced, not added: the class may be the plug-in's own (native_bridge_metal_adopt), which has methods of these names already
    class_replaceMethod(cls,sel,kind==NMB_ANSWER_COUNT?(IMP)countAnswer:(IMP)flagAnswer,kind==NMB_ANSWER_COUNT?"Q16@0:8":"B16@0:8");
