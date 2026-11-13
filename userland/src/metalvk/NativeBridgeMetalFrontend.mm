@@ -904,6 +904,7 @@ static void waitForResource(id resource) {
 - (void)setCullMode:(MTLCullMode)m {objc_setAssociatedObject(self,"cull",@(m),OBJC_ASSOCIATION_RETAIN);[self raster];}
 - (void)setFrontFacingWinding:(MTLWinding)w {objc_setAssociatedObject(self,"winding",@(w),OBJC_ASSOCIATION_RETAIN);[self raster];}
 - (void)setTriangleFillMode:(MTLTriangleFillMode)f {objc_setAssociatedObject(self,"fill",@(f),OBJC_ASSOCIATION_RETAIN);[self raster];}
+- (void)setDepthClipMode:(MTLDepthClipMode)m {[self check:nmb_render_set_depth_clip_mode(self.handle,m) what:"setDepthClipMode"];}
 - (void)setDepthBias:(float)bias slopeScale:(float)slope clamp:(float)clamp {
  [self check:nmb_render_set_depth_bias(self.handle,bias,slope,clamp) what:"setDepthBias"];
 }

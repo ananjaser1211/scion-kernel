@@ -259,6 +259,7 @@ bool nmb_render_set_depth_stencil(NmbEncoder *, NmbDepthStencil *);
 bool nmb_render_set_viewport(NmbEncoder *, const double viewport[6]);
 bool nmb_render_set_scissor(NmbEncoder *, const uint64_t rect[4]);
 bool nmb_render_set_raster(NmbEncoder *, uint64_t cull_mode, uint64_t winding, uint64_t fill_mode);
+bool nmb_render_set_depth_clip_mode(NmbEncoder *, uint64_t mode);
 bool nmb_render_set_stencil_reference(NmbEncoder *, uint32_t front, uint32_t back);
 bool nmb_render_set_blend_color(NmbEncoder *, const float color[4]);
 bool nmb_render_set_depth_bias(NmbEncoder *, float bias, float slope_scale, float clamp);
