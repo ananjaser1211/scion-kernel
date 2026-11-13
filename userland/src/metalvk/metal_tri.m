@@ -7,6 +7,7 @@
  * render pass, read back, on metal2vulkan's runtime over PanVK on the Mali-G72.
  *
  *   metal_tri [--bundle DIR] [--metallib FILE] [--size N] [--out FILE.ppm] [--surface] [--register] [--hold SECONDS]
+ *             [--xr none|over|add]
  *
  * The device: MTLCreateSystemDefaultDevice() first, Metal's own discovery (the kernel names the plug-in with boot-arg metal=N). When it
  * answers nil, the plug-in at --bundle (default /redwood/lib/HakiosMetal.bundle) is loaded and its class made the way Metal makes it,
@@ -25,6 +26,13 @@
  * the clear colour exactly; pixels near an edge are not judged. --surface renders into a texture over an IOSurface (what a
  * CAMetalLayer's drawable is) and reads the surface's own memory, instead of a Shared texture's getBytes:. The picture is written as a
  * PPM with --out.
+ *
+ * --xr draws the same triangle into a BGR10_XR target (the extended-range format of a CAMetalLayer's wide-colour drawable) and judges
+ * each pixel's three 10-bit codes against Metal's store of the expected value v, code = round(384 + 510 v) of v rounded to half: none
+ * unblended (v the corners' mix), over blended with BlendAlpha and OneMinusBlendAlpha at a blend colour alpha of 0.25
+ * (v = 0.25 mix + 0.75 clear), add with One and One (v = mix + clear). Inside within 2 codes, outside the clear's codes exactly. On a
+ * device without framebuffer fetch the runtime blends such a target's codes through a unorm view of its word (metal2vulkan,
+ * tools/metal/m2v/0004-xr10-unorm-blend.patch), and this is its check.
  */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -287,6 +295,185 @@ judge(const unsigned char *pixels, unsigned n, const double clear[3], unsigned *
 	return bad_in + bad_out;
 }
 
+/* ---------------------------------------------------------------------------------------------------------- the BGR10_XR check (--xr) */
+
+/* the code Metal stores for a channel's value V in an extended-range format: V rounded to half, then 384 + 510 V, clamped */
+static int
+xr_code(double v)
+{
+	double h = (double)(__fp16)(float)v;
+	long c = lround(384 + 510 * h);
+	return c < 0 ? 0 : c > 1023 ? 1023 : (int)c;
+}
+
+/* --xr's blend colour alpha, over's factor */
+static const double xr_k = 0.25;
+
+/* the pipeline of tri_vertex and tri_fragment into FORMAT (BGR10_XR or its _sRGB twin), blended by MODE (none, over, add); nil if refused */
+static id<MTLRenderPipelineState>
+xr_pipeline(id<MTLDevice> device, const char *metallib, const char *mode, MTLPixelFormat format)
+{
+	bool over = strcmp(mode, "over") == 0, add = strcmp(mode, "add") == 0;
+	NSError *error = nil;
+
+	if (!over && !add && strcmp(mode, "none") != 0) {
+		printf("metal_tri: --xr none, over or add\n");
+		return nil;
+	}
+	id<MTLLibrary> library = [device newLibraryWithURL:[NSURL fileURLWithPath:@(metallib)] error:&error];
+	if (library == nil) {
+		printf("metal_tri: FAIL: newLibraryWithURL: %s: %s\n", metallib, error.description.UTF8String);
+		return nil;
+	}
+	MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+	pd.vertexFunction = [library newFunctionWithName:@"tri_vertex"];
+	pd.fragmentFunction = [library newFunctionWithName:@"tri_fragment"];
+	MTLRenderPipelineColorAttachmentDescriptor *a = pd.colorAttachments[0];
+	a.pixelFormat = format;
+	a.blendingEnabled = over || add;
+	a.sourceRGBBlendFactor = a.sourceAlphaBlendFactor = over ? MTLBlendFactorBlendAlpha : MTLBlendFactorOne;
+	a.destinationRGBBlendFactor = a.destinationAlphaBlendFactor = over ? MTLBlendFactorOneMinusBlendAlpha : MTLBlendFactorOne;
+	id<MTLRenderPipelineState> pipeline = [device newRenderPipelineStateWithDescriptor:pd error:&error];
+	if (pipeline == nil) {
+		printf("metal_tri: FAIL: a pipeline into pixel format %lu blended %s: %s\n", (unsigned long)format, mode,
+		    error.description.UTF8String);
+	}
+	return pipeline;
+}
+
+/* a pass into TARGET: a clear to CLEAR and the triangle, at --xr's blend colour; the drawable presented if there is one */
+static bool
+xr_render(id<MTLCommandQueue> queue, id<MTLRenderPipelineState> pipeline, id<MTLTexture> target, const double clear[3],
+    id<CAMetalDrawable> drawable)
+{
+	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+	rp.colorAttachments[0].texture = target;
+	rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+	rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+	rp.colorAttachments[0].clearColor = MTLClearColorMake(clear[0], clear[1], clear[2], 1);
+	id<MTLCommandBuffer> cb = [queue commandBuffer];
+	id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+	[enc setRenderPipelineState:pipeline];
+	[enc setBlendColorRed:0 green:0 blue:0 alpha:(float)xr_k];
+	[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	[enc endEncoding];
+	if (drawable != nil) {
+		[cb presentDrawable:drawable];
+	}
+	[cb commit];
+	[cb waitUntilCompleted];
+	if (cb.status != MTLCommandBufferStatusCompleted) {
+		printf("FAIL  render pass: status %ld%s%s\n", (long)cb.status, cb.error ? ": " : "", cb.error ? cb.error.description.UTF8String : "");
+		return false;
+	}
+	return true;
+}
+
+/*
+ * The n x n BGR10_XR words of a pass xr_render made, blended by MODE over CLEAR: each pixel clearly inside within 2 codes of Metal's
+ * store of the expected value, each clearly outside the clear's codes exactly. The number wrong; INSIDE, OUTSIDE and WORST (the largest
+ * error inside, in codes) said back.
+ */
+static unsigned
+xr_judge(const uint32_t *words, unsigned n, const char *mode, const double clear[3], unsigned *inside, unsigned *outside,
+    unsigned *worst, bool say)
+{
+	bool over = strcmp(mode, "over") == 0, add = strcmp(mode, "add") == 0;
+	unsigned bad_in = 0, bad_out = 0;
+
+	*inside = *outside = *worst = 0;
+	for (unsigned y = 0; y < n; y++) {
+		for (unsigned x = 0; x < n; x++) {
+			uint32_t w = words[(size_t)y * n + x];
+			int got[3] = { (int)(w >> 20 & 0x3ff), (int)(w >> 10 & 0x3ff), (int)(w & 0x3ff) };   /* R G B */
+			double b[3], margin = 2.5 / n;
+			barycentric(x, y, n, b);
+			bool in = b[0] > margin && b[1] > margin && b[2] > margin;
+			bool out = b[0] < -margin || b[1] < -margin || b[2] < -margin;
+			if (!in && !out) {
+				continue;
+			}
+			int want[3];
+			for (int c = 0; c < 3; c++) {
+				double d = (double)(__fp16)(float)clear[c], s = (double)(__fp16)(float)b[c];
+				double v = !in ? d : over ? xr_k * s + (1 - xr_k) * d : add ? s + d : s;
+				want[c] = in ? xr_code(v) : xr_code(clear[c]);
+			}
+			unsigned far = 0;
+			for (int c = 0; c < 3; c++) {
+				unsigned e = (unsigned)abs(got[c] - want[c]);
+				far = e > far ? e : far;
+			}
+			bool ok = in ? far <= 2 : far == 0;
+			if (in) {
+				(*inside)++;
+				*worst = far > *worst ? far : *worst;
+			} else {
+				(*outside)++;
+			}
+			if (!ok && (in ? bad_in++ : bad_out++) < 4 && say) {
+				printf("      %s (%u,%u): codes %d %d %d (top bits %u), want %d %d %d\n", in ? "inside" : "outside", x, y, got[0],
+				    got[1], got[2], w >> 30, want[0], want[1], want[2]);
+			}
+		}
+	}
+	return bad_in + bad_out;
+}
+
+/* the triangle into an n x n BGR10_XR target, blended by MODE (none, over, add), judged code by code; whether it passed */
+static bool
+xr_check(id<MTLDevice> device, const char *metallib, unsigned n, const char *mode, bool surface)
+{
+	id<MTLRenderPipelineState> pipeline = xr_pipeline(device, metallib, mode, MTLPixelFormatBGR10_XR);
+	if (pipeline == nil) {
+		return false;
+	}
+	printf("ok    BGR10_XR render pipeline, blended %s\n", mode);
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGR10_XR width:n height:n
+	    mipmapped:NO];
+	td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	td.storageMode = MTLStorageModeShared;
+	IOSurfaceRef ios = NULL;
+	if (surface) {
+		NSDictionary *props = @{ (id)kIOSurfaceWidth: @(n), (id)kIOSurfaceHeight: @(n), (id)kIOSurfaceBytesPerElement: @4,
+			(id)kIOSurfaceBytesPerRow: @(n * 4), (id)kIOSurfacePixelFormat: @((unsigned)'w30r') };
+		ios = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+	}
+	id<MTLTexture> target = surface ? (ios ? [device newTextureWithDescriptor:td iosurface:ios plane:0] : nil)
+	    : [device newTextureWithDescriptor:td];
+	if (target == nil) {
+		printf("metal_tri: FAIL: no %ux%u BGR10_XR %s\n", n, n, surface ? "texture over an IOSurface" : "Shared texture");
+		return false;
+	}
+	if (!xr_render([device newCommandQueue], pipeline, target, clear_rgb, nil)) {
+		return false;
+	}
+	uint32_t *words = calloc(n, (size_t)n * 4);
+	if (ios != NULL) {
+		IOSurfaceLock(ios, kIOSurfaceLockReadOnly, NULL);
+		const unsigned char *base = IOSurfaceGetBaseAddress(ios);
+		for (unsigned y = 0; y < n; y++) {
+			memcpy(words + (size_t)y * n, base + y * IOSurfaceGetBytesPerRow(ios), (size_t)n * 4);
+		}
+		IOSurfaceUnlock(ios, kIOSurfaceLockReadOnly, NULL);
+	} else {
+		[target getBytes:words bytesPerRow:(size_t)n * 4 fromRegion:MTLRegionMake2D(0, 0, n, n) mipmapLevel:0];
+	}
+	unsigned inside, outside, worst, wrong = xr_judge(words, n, mode, clear_rgb, &inside, &outside, &worst, true);
+	uint32_t centre = words[(size_t)(n * 2 / 3) * n + n / 2], corner_word = words[0];
+	printf("      a pixel inside: 0x%08x (top bits %u); the corner outside: 0x%08x (top bits %u)\n", centre, centre >> 30,
+	    corner_word, corner_word >> 30);
+	bool pass = inside > 0 && wrong == 0;
+	printf("%s BGR10_XR triangle blended %s: %ux%u %s, %u inside (largest error %u codes) and %u outside judged, %u wrong\n",
+	    pass ? "ok   " : "FAIL ", mode, n, n, surface ? "read from the IOSurface's own memory" : "read with getBytes:", inside, worst,
+	    outside, wrong);
+	free(words);
+	if (ios != NULL) {
+		CFRelease(ios);
+	}
+	return pass;
+}
+
 /* ------------------------------------------------------------------------------------------------------------------ the application */
 
 /*
@@ -299,6 +486,11 @@ judge(const unsigned char *pixels, unsigned n, const double clear[3], unsigned *
  * (HakiosMetal.bundle, HakiosMetal.icd naming libvulkan_panfrost.dylib there, HakiosMetal.clients naming metal_tri, metal_tri.metallib:
  * a hand test that needs nothing in the image), else from the image's (/redwood/lib/HakiosMetal.bundle, /redwood/share/metal_tri.metallib,
  * userland/build.sh METAL=vk).
+ *
+ * With MTXRBlend (none, over or add) in the application's Info.plist (a copy of MetalTri.app under another identifier beginning
+ * com.hakios.metaltri), the window shows a CAMetalLayer instead, of pixel format BGR10_XR (MTXRFormat BGR10_XR_sRGB: its sRGB twin, the
+ * format of the Astronomy wallpaper's layer), into whose drawables --xr's triangle is drawn and presented, so the panel shows an
+ * extended-range drawable through the window server's compositor. A linear drawable is read back and judged as --xr judges.
  */
 @interface MTApp : UIResponder <UIApplicationDelegate>
 @property (strong) UIWindow *window;
@@ -318,6 +510,10 @@ static struct {
 	CALayer *picture;
 	UILabel *label;
 	NSString *status;
+	const char *xr;                  /* MTXRBlend: the CAMetalLayer form, blended so; NULL for the IOSurface one */
+	MTLPixelFormat xr_format;
+	CAMetalLayer *xr_layer;
+	uint32_t *xr_words;
 } app;
 
 @implementation MTView
@@ -327,7 +523,16 @@ static struct {
 	self.view.backgroundColor = UIColor.blackColor;
 	CGRect b = self.view.bounds;
 	CGFloat side = MIN(b.size.width, b.size.height) - 32;
-	app.picture = [CALayer layer];
+	if (app.xr != NULL) {
+		app.xr_layer = [CAMetalLayer layer];
+		app.xr_layer.device = app.device;
+		app.xr_layer.pixelFormat = app.xr_format;
+		app.xr_layer.framebufferOnly = NO;
+		app.xr_layer.drawableSize = CGSizeMake(app.n, app.n);
+		app.picture = app.xr_layer;
+	} else {
+		app.picture = [CALayer layer];
+	}
 	app.picture.frame = CGRectMake((b.size.width - side) / 2, 120, side, side);
 	app.picture.magnificationFilter = kCAFilterNearest;
 	[self.view.layer addSublayer:app.picture];
@@ -359,27 +564,45 @@ static struct {
 		clear[c] = round(clear[c] * 255) / 255;
 	}
 	CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
-	bool done = render(app.queue, app.pipeline, app.target[i], clear, true);
-	double ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000;
-	unsigned inside = 0, outside = 0, wrong = 1;
-	if (done) {
-		read_surface(app.surface[i], app.pixels, app.n);
-		wrong = judge(app.pixels, app.n, clear, &inside, &outside, false);
+	bool done;
+	unsigned inside = 0, outside = 0, wrong = 1, worst = 0;
+	double ms;
+	if (app.xr != NULL) {
+		/* a drawable of the CAMetalLayer, presented; a linear one read back and judged (an sRGB one is shown only) */
+		id<CAMetalDrawable> drawable = [app.xr_layer nextDrawable];
+		done = drawable != nil && xr_render(app.queue, app.pipeline, drawable.texture, clear, drawable);
+		ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000;
+		if (done && app.xr_format == MTLPixelFormatBGR10_XR) {
+			[drawable.texture getBytes:app.xr_words bytesPerRow:(size_t)app.n * 4 fromRegion:MTLRegionMake2D(0, 0, app.n, app.n)
+			    mipmapLevel:0];
+			wrong = xr_judge(app.xr_words, app.n, app.xr, clear, &inside, &outside, &worst, false);
+		} else {
+			wrong = done ? 0 : 1;
+		}
+	} else {
+		done = render(app.queue, app.pipeline, app.target[i], clear, true);
+		ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000;
+		if (done) {
+			read_surface(app.surface[i], app.pixels, app.n);
+			wrong = judge(app.pixels, app.n, clear, &inside, &outside, false);
+		}
 	}
 	if (done && wrong == 0) {
 		app.good++;
 	} else {
 		app.bad++;
 	}
-	[CATransaction begin];
-	[CATransaction setDisableActions:YES];
-	app.picture.contents = (__bridge id)app.surface[i];
-	[CATransaction commit];
-	app.label.text = [NSString stringWithFormat:@"%@\n\nframe %u: %s in %.1f ms\n%u px inside, %u outside judged, %u wrong\nframes right %u, wrong %u",
-	    app.status, app.frame, done ? "rendered" : "FAILED", ms, inside, outside, wrong, app.good, app.bad];
+	if (app.xr == NULL) {
+		[CATransaction begin];
+		[CATransaction setDisableActions:YES];
+		app.picture.contents = (__bridge id)app.surface[i];
+		[CATransaction commit];
+	}
+	app.label.text = [NSString stringWithFormat:@"%@\n\nframe %u: %s in %.1f ms\n%u px inside (largest error %u), %u outside judged, %u wrong\nframes right %u, wrong %u",
+	    app.status, app.frame, done ? "rendered" : "FAILED", ms, inside, worst, outside, wrong, app.good, app.bad];
 	if (app.frame <= 2 || app.frame % 20 == 0) {
-		NSLog(@"metal_tri: frame %u: %s, %.1f ms, %u inside %u outside judged, %u wrong; right %u wrong %u", app.frame,
-		    done ? "rendered" : "FAILED", ms, inside, outside, wrong, app.good, app.bad);
+		NSLog(@"metal_tri: frame %u: %s, %.1f ms, %u inside (largest error %u) %u outside judged, %u wrong; right %u wrong %u",
+		    app.frame, done ? "rendered" : "FAILED", ms, inside, worst, outside, wrong, app.good, app.bad);
 	}
 }
 @end
@@ -395,7 +618,15 @@ static struct {
 	}
 	app.n = 512;
 	app.device = make_device(plugin.UTF8String, true);
-	if (app.device != nil) {
+	NSString *xr = [NSBundle.mainBundle objectForInfoDictionaryKey:@"MTXRBlend"];
+	if (app.device != nil && xr != nil) {
+		app.xr = strdup(xr.UTF8String);
+		app.xr_format = [[NSBundle.mainBundle objectForInfoDictionaryKey:@"MTXRFormat"] isEqual:@"BGR10_XR_sRGB"]
+		    ? MTLPixelFormatBGR10_XR_sRGB : MTLPixelFormatBGR10_XR;
+		app.pipeline = xr_pipeline(app.device, metallib.UTF8String, app.xr, app.xr_format);
+		app.queue = [app.device newCommandQueue];
+		app.xr_words = calloc(app.n, (size_t)app.n * 4);
+	} else if (app.device != nil) {
 		app.pipeline = make_pipeline(app.device, metallib.UTF8String);
 		app.queue = [app.device newCommandQueue];
 		for (int i = 0; i < 2 && app.pipeline != nil; i++) {
@@ -407,8 +638,11 @@ static struct {
 		}
 		app.pixels = calloc(app.n, (size_t)app.n * 4);
 	}
-	app.status = app.pipeline != nil ? [NSString stringWithFormat:@"device: %@\n%ux%u BGRA8 IOSurfaces, rendered by Metal, shown as a layer's contents",
-	    app.device.name, app.n, app.n] : @"no Metal device or pipeline: see the log (metal_tri:, HakiosMetal:, native-metal:)";
+	app.status = app.pipeline == nil ? @"no Metal device or pipeline: see the log (metal_tri:, HakiosMetal:, native-metal:)"
+	    : app.xr != NULL ? [NSString stringWithFormat:@"device: %@\n%ux%u %s CAMetalLayer drawables, blended %s",
+	    app.device.name, app.n, app.n, app.xr_format == MTLPixelFormatBGR10_XR ? "BGR10_XR" : "BGR10_XR_sRGB", app.xr]
+	    : [NSString stringWithFormat:@"device: %@\n%ux%u BGRA8 IOSurfaces, rendered by Metal, shown as a layer's contents",
+	    app.device.name, app.n, app.n];
 	NSLog(@"metal_tri: %@", app.status);
 	self.window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
 	self.window.rootViewController = [MTView new];
@@ -425,13 +659,14 @@ main(int argc, char *argv[])
 	signal(SIGBUS, fault);
 	signal(SIGABRT, fault);
 	@autoreleasepool {
-		if (argc == 1 && [NSBundle.mainBundle.bundleIdentifier isEqualToString:@"com.hakios.metaltri"]) {
+		if (argc == 1 && [NSBundle.mainBundle.bundleIdentifier hasPrefix:@"com.hakios.metaltri"]) {
 			return UIApplicationMain(argc, argv, nil, NSStringFromClass([MTApp class]));
 		}
 		const char *bundle_path = "/redwood/lib/HakiosMetal.bundle", *metallib = "/redwood/share/metal_tri.metallib", *out = NULL;
 		unsigned n = 256;
 		bool surface = false, register_it = false;
 		unsigned hold = 0;
+		const char *xr = NULL;
 		for (int i = 1; i < argc; i++) {
 			if (strcmp(argv[i], "--bundle") == 0 && i + 1 < argc) {
 				bundle_path = argv[++i];
@@ -447,9 +682,11 @@ main(int argc, char *argv[])
 				register_it = true;
 			} else if (strcmp(argv[i], "--hold") == 0 && i + 1 < argc) {
 				hold = (unsigned)atoi(argv[++i]);
+			} else if (strcmp(argv[i], "--xr") == 0 && i + 1 < argc) {
+				xr = argv[++i];
 			} else {
 				fprintf(stderr, "usage: metal_tri [--bundle DIR] [--metallib FILE] [--size N] [--out FILE.ppm] [--surface] "
-				    "[--register] [--hold SECONDS]\n");
+				    "[--register] [--hold SECONDS] [--xr none|over|add]\n");
 				return 2;
 			}
 		}
@@ -459,6 +696,11 @@ main(int argc, char *argv[])
 		id<MTLDevice> device = make_device(bundle_path, register_it);
 		if (device == nil) {
 			return 1;
+		}
+		if (xr != NULL) {
+			bool pass = xr_check(device, metallib, n, xr, surface);
+			printf("metal_tri: %s\n", pass ? "PASS" : "FAIL");
+			return pass ? 0 : 1;
 		}
 		id<MTLRenderPipelineState> pipeline = make_pipeline(device, metallib);
 		if (pipeline == nil) {
