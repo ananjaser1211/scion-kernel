@@ -30,10 +30,13 @@
 #include <unistd.h>
 #include "bridge/NativeMetalObjects.h"   // Scion: tools/metal/bridge/ (the build gives -I tools/metal)
 #include "NativeBridgeMetalFrontend.h"
+#import <QuartzCore/CAMetalLayer.h>
 
 extern "C" void sys_dcache_flush(void *start, size_t length);
 
 static NmbDevice *gDevice;
+
+static void drawable_xr_to_surface(id<MTLDrawable> drawable);
 static id gDeviceObject;
 static uint64_t gRegistryID;
 static NSString *gName;
@@ -360,6 +363,41 @@ static void waitForResource(id resource);
 @property(nonatomic,strong) id<MTLHeap> parentHeap;
 @property(nonatomic) NSUInteger heapOffset;
 @end
+
+// Scion: a CAMetalLayer of BGR10_XR or BGR10_XR_sRGB (the Astronomy wallpaper's) gets drawables over IOSurfaces the kernel makes as
+// ordinary BGRA: MiniIOSurface substitutes 'w30r' (CoreAnimation's software renderer cannot draw into it), so the window server reads the
+// surface as eight-bit BGRA, and the ten-bit codes Metal stored there came out as wrong colours. As the drawable is presented, its codes
+// become the BGRA bytes the surface says it holds: each channel's value (c - 384) / 510, which a layer of these formats holds sRGB-encoded,
+// clamped to [0, 1] (this panel shows nothing past it), as the byte nearest it, alpha opaque. A presented drawable's contents are
+// CoreAnimation's from then on, so nothing of Metal's is lost. On the CPU, after the GPU has finished.
+static void
+drawable_xr_to_surface(id<MTLDrawable> drawable)
+{
+ static uint8_t byte_of[1024];
+ static dispatch_once_t once;
+ if(![(id)drawable respondsToSelector:@selector(texture)])return;
+ id texture=[(id<CAMetalDrawable>)drawable texture];
+ if(![texture isKindOfClass:[NBTexture class]])return;
+ MTLPixelFormat format=[(id<MTLTexture>)texture pixelFormat];
+ IOSurfaceRef surface=[(NBTexture *)texture surface];
+ if((format!=MTLPixelFormatBGR10_XR && format!=MTLPixelFormatBGR10_XR_sRGB) || surface==nullptr ||
+    IOSurfaceGetPixelFormat(surface)!='BGRA' || IOSurfaceGetBytesPerElement(surface)!=4)return;
+ dispatch_once(&once,^{
+  for(int c=0;c<1024;c++){double v=(c-384)/510.0;v=v<0?0:v>1?1:v;byte_of[c]=(uint8_t)lround(v*255);}
+ });
+ if(IOSurfaceLock(surface,0,nullptr)!=0)return;
+ uint8_t *base=(uint8_t *)IOSurfaceGetBaseAddress(surface);
+ size_t row=IOSurfaceGetBytesPerRow(surface),width=IOSurfaceGetWidth(surface),height=IOSurfaceGetHeight(surface);
+ for(size_t y=0;y<height;y++) {
+  uint32_t *w=(uint32_t *)(base+y*row);
+  for(size_t x=0;x<width;x++) {
+   uint32_t v=w[x];
+   w[x]=0xff000000u|(uint32_t)byte_of[v>>20&0x3ff]<<16|(uint32_t)byte_of[v>>10&0x3ff]<<8|byte_of[v&0x3ff];
+  }
+ }
+ sys_dcache_flush(base,row*height);
+ IOSurfaceUnlock(surface,0,nullptr);
+}
 // A no-copy import keeps its pages until the runtime frees it, which can be after the buffer object goes (a command buffer still using
 // it). The owner's release (Metal's deallocator, an IOSurface's mapping) waits for that, as Metal's does: run earlier, the owner could
 // unmap or reuse pages the GPU still reads or writes.
@@ -1127,8 +1165,9 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs);
 - (void)addScheduledHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_scheduledHandlers addObject:[block copy]];}}
 - (void)addCompletedHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_completedHandlers addObject:[block copy]];}}
 // A drawable (RenderBox's CAMetalLayer path) is presented once the GPU has written it: this runtime's scheduling comes before completion.
-- (void)presentDrawable:(id<MTLDrawable>)drawable {[self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable present];}];}
-- (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)time {[self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable presentAtTime:time];}];}
+// An extended-range drawable is made what its surface says it is first (drawable_xr_to_surface).
+- (void)presentDrawable:(id<MTLDrawable>)drawable {[self addCompletedHandler:^(id<MTLCommandBuffer>){drawable_xr_to_surface(drawable);[drawable present];}];}
+- (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)time {[self addCompletedHandler:^(id<MTLCommandBuffer>){drawable_xr_to_surface(drawable);[drawable presentAtTime:time];}];}
 - (void)enqueue {}
 - (void)event:(id<MTLEvent>)event value:(uint64_t)value signal:(bool)signal {
  if(![(id)event isKindOfClass:[NBEvent class]]){[self refuse:@"foreign event"];return;}
