@@ -6,7 +6,7 @@
  * pixel. The first step of Metal for applications on the Galaxy S9 (docs/metal.md): MTLDevice, library, render pipeline, command queue,
  * render pass, read back, on metal2vulkan's runtime over PanVK on the Mali-G72.
  *
- *   metal_tri [--bundle DIR] [--metallib FILE] [--size N] [--out FILE.ppm] [--surface] [--register]
+ *   metal_tri [--bundle DIR] [--metallib FILE] [--size N] [--out FILE.ppm] [--surface] [--register] [--hold SECONDS]
  *
  * The device: MTLCreateSystemDefaultDevice() first, Metal's own discovery (the kernel names the plug-in with boot-arg metal=N). When it
  * answers nil, the plug-in at --bundle (default /redwood/lib/HakiosMetal.bundle) is loaded and its class made the way Metal makes it,
@@ -431,6 +431,7 @@ main(int argc, char *argv[])
 		const char *bundle_path = "/redwood/lib/HakiosMetal.bundle", *metallib = "/redwood/share/metal_tri.metallib", *out = NULL;
 		unsigned n = 256;
 		bool surface = false, register_it = false;
+		unsigned hold = 0;
 		for (int i = 1; i < argc; i++) {
 			if (strcmp(argv[i], "--bundle") == 0 && i + 1 < argc) {
 				bundle_path = argv[++i];
@@ -444,9 +445,11 @@ main(int argc, char *argv[])
 				surface = true;
 			} else if (strcmp(argv[i], "--register") == 0) {
 				register_it = true;
+			} else if (strcmp(argv[i], "--hold") == 0 && i + 1 < argc) {
+				hold = (unsigned)atoi(argv[++i]);
 			} else {
 				fprintf(stderr, "usage: metal_tri [--bundle DIR] [--metallib FILE] [--size N] [--out FILE.ppm] [--surface] "
-				    "[--register]\n");
+				    "[--register] [--hold SECONDS]\n");
 				return 2;
 			}
 		}
@@ -497,6 +500,11 @@ main(int argc, char *argv[])
 			CFRelease(ios);
 		}
 		printf("metal_tri: %s\n", pass ? "PASS" : "FAIL");
+		if (hold != 0) {
+			/* the device and its objects kept, for measuring what an open device costs a process (footprint -p PID) */
+			printf("metal_tri: holding the device for %u s (pid %d)\n", hold, getpid());
+			sleep(hold);
+		}
 		return pass ? 0 : 1;
 	}
 }
