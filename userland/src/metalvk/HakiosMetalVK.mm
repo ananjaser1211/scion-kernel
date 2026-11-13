@@ -39,6 +39,7 @@
 #import <Metal/Metal.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
+#import <objc/objc-exception.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 #include <dlfcn.h>
@@ -182,6 +183,28 @@ callers(char *out, size_t size)
 	}
 }
 
+/*
+ * Exceptions thrown in a process whose device is open, said with who threw them (the first 32): a Metal client that gets nil where
+ * Apple's driver would have given an object usually throws (NanoUniverse: "object cannot be nil"), and an app extension's own
+ * output goes nowhere. Thrown, not uncaught: one that is caught is said too, which is what makes the first of a series visible.
+ */
+static objc_exception_preprocessor gPreviousPreprocessor;
+
+static id
+sayException(id exception)
+{
+	static volatile int told;
+	char from[512];
+
+	if (told < 32 && [exception isKindOfClass:[NSException class]]) {
+		told++;
+		callers(from, sizeof(from));
+		say("an exception is thrown: %s: %s; from %s", [[(NSException *)exception name] UTF8String] ?: "?",
+		    [[(NSException *)exception reason] UTF8String] ?: "(no reason)", from);
+	}
+	return gPreviousPreprocessor != NULL ? gPreviousPreprocessor(exception) : exception;
+}
+
 /* load the opener and open the Vulkan device, once; WHY is the message that asked for it */
 static void
 openDevice(SEL why)
@@ -216,6 +239,7 @@ openDevice(SEL why)
 		} else if (open(gDevice, gRegistryID, sayLine, gWhy, sizeof(gWhy))) {
 			stopForwarding();
 			gState = OPEN;
+			gPreviousPreprocessor = objc_setExceptionPreprocessor(sayException);
 			say("the device is opened, at -%s, in %llu ms: %s", sel_getName(why), nowMs() - began, gWhy);
 			pthread_mutex_unlock(&gLock);
 			return;
