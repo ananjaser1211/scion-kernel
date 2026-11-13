@@ -434,3 +434,42 @@ PanVK v6 offers neither. Unblended XR10 pipelines are made. The way forward is a
 - For the `_sRGB` forms, blending the encoded values is not Metal's linear blend: that path is an approximation, and it would be said so.
 
 Not yet seen: whether the GLES compositor shows a 10-bit (`BGR10_XR`) drawable right; that needs a pipeline that draws first.
+
+## Phase 3, step 1: blends into extended-range drawables, and the compositor's view of them (14 November 2026)
+
+**The blends** (`tools/metal/m2v/0004-xr10-unorm-blend.patch`, its header says how and why in full):
+
+- On a device that has no framebuffer fetch, a `BGR10_XR` or `BGR10_XR_sRGB` color attachment is now rendered through the
+  `A2R10G10B10_UNORM_PACK32` view of its word. That means neither rasterization-order attachment access nor the pixel interlock,
+  which is PanVK v6. The view's fields are the word's own, so unblended writes, clears, loads and stores keep Metal's codes exactly.
+  Every pipeline and pass on the device takes the view, so the pass and its pipelines agree on the format.
+- The codes are affine in Metal's value, `u(v) = (384 + 510 v) / 1023`. The device's fixed-function blend of codes is therefore
+  Metal's blend when the function writes the source with the right share of the 384 bias:
+  - all of it for "over" (`SourceAlpha`/`OneMinusSourceAlpha`, a blend colour's pair, `One`/`Zero`);
+  - none for "added" (destination factor `One`);
+  - the source alpha's share for premultiplied (`One`/`OneMinusSourceAlpha`).
+  
+  Every other blend stays refused.
+- The `_sRGB` forms blend the encoded codes, which is an **approximation**. It is exact for unblended writes and at alpha 0 or 1;
+  in between, colours come out darker than Metal's where they differ (as on a GPU without sRGB blending).
+- Checks on the phone (PanVK, Mali-G72):
+  - `metal_tri --xr none|over|add`, on a texture and on a `w30r` IOSurface: every pixel within 1 code of Metal's store, and the
+    clear exact. Before the patch, the blended pipelines were refused.
+  - `metal_libcheck --format 554|555 [--blend over|add|premultiplied]`: NanoUniverse 27 of 27 in every case.
+
+**The compositor does not show an extended-range drawable right.** `MetalTri.app` with `MTXRBlend`/`MTXRFormat` in its
+`Info.plist` shows the triangle in a CAMetalLayer of `BGR10_XR`. The Metal side reads back exact (0 wrong pixels), but the panel
+shows stripes and a lavender background.
+
+- The cause is the kernel. `MiniIOSurface.cpp` makes every `w30r`, `l10r` and `w30R` surface as plain `BGRA`, because
+  CoreAnimation's software renderer cannot draw into them. The window server then reads the drawable's ten-bit words as eight-bit
+  BGRA.
+- The fix (`NativeBridgeMetalFrontend.mm`, `drawable_xr_to_surface`): when such a drawable is presented
+  (`presentDrawable:`, `presentDrawable:atTime:`), the frontend converts its codes into the BGRA bytes the surface claims to hold.
+  Each byte is `(c - 384) / 510` clamped to `[0, 1]`, the sRGB-encoded value these layers hold. It runs on the CPU after the GPU
+  has finished.
+- A presented drawable's contents belong to CoreAnimation, so nothing of Metal's is lost.
+- A client that calls `-present` on the drawable itself, rather than through the command buffer, is not converted yet.
+
+**`setDepthClipMode:`** is now forwarded to the runtime (`nmb_render_set_depth_clip_mode`). CoreLocation's precise-location
+prompt plug-in threw on it as an unrecognized selector. The alert it left on the lock screen then stopped taking touches.
