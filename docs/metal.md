@@ -101,11 +101,14 @@ this page:
   `tools/mali-drmshim-check.sh`. Buffers live in process memory, and every job is "done" without running. Nothing changes unless
   the variable is set.
 
-**A semantic difference, written down rather than changed.** The stand-in treats a sync object that was reset (no fence) as
-signalled. Linux treats it as unsignalled, and waiting on it without `WAIT_FOR_SUBMIT` fails there. Panfrost's OpenGL ES path,
-which runs today, relies on the stand-in as it is, so this was not changed for PanVK. A Vulkan program that resets a fence and
-then waits on it without submitting would return at once here, where Linux would time out. vk_smoke does not do that, but a
-conformance test would.
+**A semantic difference, and where it bit (14 November).** The stand-in treated a sync object that was reset (no fence) as
+signalled. Linux treats it as unsignalled, and waiting on it without `WAIT_FOR_SUBMIT` fails there. Since 14 November a wait
+*with* `DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT`, which Vulkan's common code always gives, waits until a submission gives the
+sync object a job; without the flag (Panfrost's OpenGL ES never gives it) a reset sync object still counts as signalled. PanVK's
+JM queue also makes its own sync object ioctls (a submission's fence handed to the semaphores it signals through a sync file;
+VkEvents), which went to the kernel and failed silently; the stand-in serves them now. Before that, every `VkFence` wait
+returned at once, and a Metal texture read back with `-getBytes:` had 64-byte lines of zeroes in about half the runs (see
+"Phase 2" below).
 
 ## What was built and run (7 November 2026, the build Mac)
 
@@ -345,3 +348,63 @@ Not yet ready for an image:
 - `tools/metal/mk-metal2vulkan.sh` has no Linux path. It assumes a Mac (`xcrun metal` for its self-test shaders, Xcode's `strip`), and on
   git 2.34 its sparse checkout needs `git sparse-checkout init --cone` first. The hand build used
   `CARGO_TARGET_AARCH64_APPLE_IOS_LINKER=xnu-clang`, with `SDKROOT` set to theos's iPhoneOS16.5 SDK.
+
+## Phase 2, step 1: a Metal device for applications (14 November 2026)
+
+**What changed** (commits `db0e84a` to `b4dd2e1` on `star2-bringup`):
+
+- **The device opens the GPU at its first use.** `HakiosMetal.bundle/HakiosMetal` (`src/metalvk/HakiosMetalVK.mm`) links only
+  the system's frameworks. `-initWithAcceleratorPort:` gives an object of its own `_MTLDevice` subclass. That object answers what
+  `MTLAddDevice()` sends (`-initLimits`, `-initFeatureQueries`, checked in the 20F66 cache) and the fixed facts (`registryID`,
+  unified memory, not low power, not removable, not headless). Every other `MTLDevice`/`MTLDeviceSPI` message goes through
+  Objective-C's forwarding, and the first one loads `HakiosMetal.bundle/HakiosMetalVK.dylib`, which holds the frontend and
+  `HakiosMetalVKOpen.mm`. That library links `libmetal2vulkan.dylib`, opens PanVK, and puts the frontend's methods on that same
+  class (`native_bridge_metal_adopt`). The object Metal holds then *is* the device: a buffer's `-device` is identical to it. A
+  process that only asks `MTLCreateSystemDefaultDevice()` maps no runtime and opens no Vulkan device. A device that cannot be
+  opened answers nil or 0, and its reason is logged once.
+- **Who is shown a device** (`src/hakios_metal_shown.c`):
+  - `metal=1`: `metal_test` only;
+  - `metal=2`: **applications and app extensions** (an executable in a `.app` or `.appex` bundle), no daemon;
+  - `metal=3`: every process but backboardd (what `metal=2` was);
+  - `metal=4`: every process.
+
+  `-NAME` in a clients file keeps the device from that process. `/private/var/db/HakiosMetal.clients`, which is writable, is read
+  beside the image's read-only `HakiosMetal.clients`. The `metal=` word is no longer matched inside another argument (such as
+  `ca_metal=`).
+- **Logging:** each process writes `HakiosMetal[process pid]: ...` lines to the console and to `/private/var/tmp/HakiosMetal.log`
+  (up to 4 MiB). The frontend's own lines go there too.
+- **Sync objects** (`tools/mesa/hakios-drm`, above): fixed. `-getBytes:` is now right in 12 runs of 12, where before about half
+  of the runs were wrong.
+- **Memory of an opened device.** HakiosMali wires every buffer whole, so there are two changes:
+  - PanVK's tiler heap is 32 MB on Darwin (`tools/mesa/panvk/panvk-tiler-heap.patch`). Linux grows it on a fault from a small
+    start.
+  - metal2vulkan's pooled blocks are 8 MiB on iOS, not 64 MiB (`tools/metal/m2v/0003-ios-block-size.patch`).
+- **Tools:** `metal_tri --register` (hands the device to Metal by `MTLAddDevice()`, as discovery does) and `--hold N` (keeps the
+  device open, to measure it). `metal_libcheck LIB.metallib...` runs every function of a library through a pipeline.
+
+**Measured on the phone (build 43's kernel, the new plug-in, PanVK and runtime from `/var/root/metal2`, no boot-arg):**
+
+| | Before | After |
+|---|---|---|
+| Runtime loaded after `-initWithAcceleratorPort:` + `MTLAddDevice()` | yes (linked by the bundle) | no; it loads at the first real message (`-name`, `-maxThreadsPerThreadgroup`, ...), 250 to 760 ms to open |
+| `metal_tri` (`getBytes:`) | 0 to 4384 wrong pixels in about half the runs, the image's build too | 0 wrong in 12 of 12; `--surface` 3 of 3; `vk_smoke` 8 of 8, three times |
+| Footprint of a process with an open device (`metal_tri --hold`) | 132 MB (129 MB IOKit: two 64 MiB blocks) | 20 MB |
+| Wired memory for one open device (`vm_stat`) | 258 MB | 49 MB |
+
+**`metal_libcheck`** (function constants zero, every function paired):
+
+| Library | Result |
+|---|---|
+| NanoUniverse (the Astronomy wallpaper) | **27 of 27** made |
+| ClockKitUI | 3 of 3 kernels made |
+| SiriUICore (Siri's orb) | 15 of 20 made. `SiriBlur` (a kernel) is refused: it needs non-uniform indexing of storage-image arrays, which PanVK v6 does not offer. The `sphere` and `compositeSphere` functions are refused for this check's own pairing and formats, not proven wrong. |
+
+**Still to be seen on a boot with `metal=2`:**
+
+- the console lines of SpringBoard, PosterBoard and its extensions, and Maps;
+- SpringBoard's and backboardd's memory and CPU against build 43's (`footprint`, `ps`);
+- the compositor's frames;
+- whether AegirPoster's crash loop ends.
+
+The daemons get no device at `metal=2`. `mediaserverd` keeps taking its device out unless `mediamtl=1` (`inject_media.c`); its
+`cvadepth-iOS.metallib` is in the image now (`KEEP_METALLIB`).
