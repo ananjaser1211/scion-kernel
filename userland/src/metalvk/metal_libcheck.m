@@ -6,14 +6,15 @@
  * before a program that needs that library is given a device. A system library (NanoUniverse's for the Astronomy wallpaper, SiriUICore's
  * for Siri's orb) is AIR that metal2vulkan translates when a pipeline is made; this makes one per function and says which are refused.
  *
- *   metal_libcheck [--bundle DIR] [--format PIXELFORMAT] LIBRARY.metallib...
+ *   metal_libcheck [--bundle DIR] [--format PIXELFORMAT] [--blend over|add|premultiplied] LIBRARY.metallib...
  *
  * The device is made as metal_tri makes it (the plug-in's class, by hand: run as metal_libcheck, named in HakiosMetal.clients beside the
  * bundle). For each library: every kernel function is a compute pipeline; every fragment function is tried with the library's vertex
  * functions, the one whose name shares the longest beginning with it first, until one makes a pipeline with it (a colour attachment of
- * PIXELFORMAT, default 80, BGRA8Unorm, on each of the first four indices and a Depth32Float attachment); a vertex function that no
+ * PIXELFORMAT, default 80, BGRA8Unorm, on each of the first four indices and a Depth32Float attachment, blended with --blend: over is
+ * SourceAlpha and OneMinusSourceAlpha, add One and One, premultiplied One and OneMinusSourceAlpha); a vertex function that no
  * fragment function took is tried the same way with the fragment functions. A function that no partner pairs with is listed with the
- * last refusal; that may be the pairing, not the function. The function constants a function declares are all set to zero (a program
+ * refusal of its nearest partner (the one whose name shares the longest beginning); that may be the pairing, not the function. The function constants a function declares are all set to zero (a program
  * sets its own), so what is checked is the translation of the function, not one particular variant.
  */
 #import <Foundation/Foundation.h>
@@ -87,6 +88,10 @@ function_named(id<MTLLibrary> library, NSString *name, NSError **error)
 	return function;
 }
 
+/* the colour attachments' blend (--blend): none, or the source and destination factors of colour and alpha, added */
+static BOOL blended;
+static MTLBlendFactor blend_source = MTLBlendFactorOne, blend_destination = MTLBlendFactorZero;
+
 /* a render pipeline of VERTEX and FRAGMENT into the test's attachments, or nil and ERROR */
 static id<MTLRenderPipelineState>
 pair(id<MTLDevice> device, id<MTLFunction> vertex, id<MTLFunction> fragment, MTLPixelFormat format, NSError **error)
@@ -96,7 +101,12 @@ pair(id<MTLDevice> device, id<MTLFunction> vertex, id<MTLFunction> fragment, MTL
 	pd.vertexFunction = vertex;
 	pd.fragmentFunction = fragment;
 	for (unsigned i = 0; i < 4; i++) {
-		pd.colorAttachments[i].pixelFormat = format;
+		MTLRenderPipelineColorAttachmentDescriptor *a = pd.colorAttachments[i];
+
+		a.pixelFormat = format;
+		a.blendingEnabled = blended;
+		a.sourceRGBBlendFactor = a.sourceAlphaBlendFactor = blend_source;
+		a.destinationRGBBlendFactor = a.destinationAlphaBlendFactor = blend_destination;
 	}
 	pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
 	return [device newRenderPipelineStateWithDescriptor:pd error:error];
@@ -166,20 +176,22 @@ check(id<MTLDevice> device, const char *path, MTLPixelFormat format)
 	NSMutableSet<NSString *> *paired = [NSMutableSet new];
 	for (id<MTLFunction> function in fragment) {
 		const char *with = NULL;
+		NSError *first = nil;
 
-		error = nil;
 		for (id<MTLFunction> partner in nearest(vertex, function.name)) {
+			error = nil;
 			if (pair(device, partner, function, format, &error) != nil) {
 				with = partner.name.UTF8String;
 				[paired addObject:partner.name];
 				break;
 			}
+			first = first ?: error;
 		}
 		if (with != NULL) {
 			printf("ok    fragment %s (with %s)\n", function.name.UTF8String, with);
 			made++;
 		} else {
-			printf("FAIL  fragment %s: %s\n", function.name.UTF8String, vertex.count ? reason(error) : "no vertex function to pair");
+			printf("FAIL  fragment %s: %s\n", function.name.UTF8String, vertex.count ? reason(first) : "no vertex function to pair");
 			refused++;
 		}
 	}
@@ -191,18 +203,20 @@ check(id<MTLDevice> device, const char *path, MTLPixelFormat format)
 			made++;
 			continue;
 		}
-		error = nil;
+		NSError *first = nil;
 		for (id<MTLFunction> partner in nearest(fragment, function.name)) {
+			error = nil;
 			if (pair(device, function, partner, format, &error) != nil) {
 				with = partner.name.UTF8String;
 				break;
 			}
+			first = first ?: error;
 		}
 		if (with != NULL) {
 			printf("ok    vertex   %s (with %s)\n", function.name.UTF8String, with);
 			made++;
 		} else {
-			printf("FAIL  vertex   %s: %s\n", function.name.UTF8String, fragment.count ? reason(error) : "no fragment function to pair");
+			printf("FAIL  vertex   %s: %s\n", function.name.UTF8String, fragment.count ? reason(first) : "no fragment function to pair");
 			refused++;
 		}
 	}
@@ -225,12 +239,29 @@ main(int argc, char *argv[])
 				bundle_path = argv[++first];
 			} else if (strcmp(argv[first], "--format") == 0 && first + 1 < argc) {
 				format = (MTLPixelFormat)strtoul(argv[++first], NULL, 0);
+			} else if (strcmp(argv[first], "--blend") == 0 && first + 1 < argc) {
+				const char *how = argv[++first];
+
+				blended = YES;
+				if (strcmp(how, "over") == 0) {
+					blend_source = MTLBlendFactorSourceAlpha;
+					blend_destination = MTLBlendFactorOneMinusSourceAlpha;
+				} else if (strcmp(how, "add") == 0) {
+					blend_source = blend_destination = MTLBlendFactorOne;
+				} else if (strcmp(how, "premultiplied") == 0) {
+					blend_source = MTLBlendFactorOne;
+					blend_destination = MTLBlendFactorOneMinusSourceAlpha;
+				} else {
+					fprintf(stderr, "metal_libcheck: --blend over, add or premultiplied\n");
+					return 2;
+				}
 			} else {
 				break;
 			}
 		}
 		if (first >= argc) {
-			fprintf(stderr, "usage: metal_libcheck [--bundle DIR] [--format PIXELFORMAT] LIBRARY.metallib...\n");
+			fprintf(stderr, "usage: metal_libcheck [--bundle DIR] [--format PIXELFORMAT] [--blend over|add|premultiplied] "
+			    "LIBRARY.metallib...\n");
 			return 2;
 		}
 		id<MTLDevice> device = make_device(bundle_path);
