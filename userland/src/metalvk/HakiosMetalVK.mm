@@ -22,8 +22,9 @@
  * making anything with it, and opening one costs a process the 18 MB runtime, the Vulkan driver, a GPU context and its memory. So
  * -initWithAcceleratorPort: gives an object of this class, a _MTLDevice that answers what Metal's own registration sends (the four
  * -init... methods, which fill nothing: nothing was measured yet) and the device's fixed facts (-registryID, unified memory, not low
- * power, not removable, not headless). Every other message of MTLDevice and MTLDeviceSPI goes to Objective-C's forwarding
- * (_objc_msgForward for the methods _MTLDevice has, the runtime's own path for the rest), and the first of them loads
+ * power, not removable, not headless). Every other message of MTLDevice and MTLDeviceSPI, and every method of _MTLDevice's own
+ * but those its -init and the object's life use, goes to Objective-C's forwarding (_objc_msgForward for the methods _MTLDevice
+ * has, the runtime's own path for the rest), and the first of them loads
  * HakiosMetalVK.dylib, opens the Vulkan device and puts the frontend's methods on this class (native_bridge_metal_adopt). The object
  * Metal and the program hold is then the device itself, and the message that opened it is sent again. When the device cannot be
  * opened, every such message is answered with nil or zero, and the log says why once.
@@ -41,6 +42,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 #include <dlfcn.h>
+#include <execinfo.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -149,6 +151,37 @@ stopForwarding(void)
 	}
 }
 
+/*
+ * Who sent the message being forwarded: the first frames outside this bundle, the Objective-C runtime and Foundation's
+ * forwarding, as image+offset, into OUT.
+ */
+static void
+callers(char *out, size_t size)
+{
+	void *frames[24];
+	int count = backtrace(frames, 24), told = 0;
+	Dl_info self, info;
+
+	out[0] = '\0';
+	dladdr((const void *)&callers, &self);
+	for (int i = 1; i < count && told < 3; i++) {
+		const char *image, *name;
+
+		if (dladdr(frames[i], &info) == 0 || info.dli_fname == NULL || info.dli_fbase == self.dli_fbase) {
+			continue;
+		}
+		image = strrchr(info.dli_fname, '/') ? strrchr(info.dli_fname, '/') + 1 : info.dli_fname;
+		if (strcmp(image, "libobjc.A.dylib") == 0 || strcmp(image, "CoreFoundation") == 0) {
+			continue;
+		}
+		name = info.dli_sname != NULL ? info.dli_sname : "?";
+		size_t used = strlen(out);
+		snprintf(out + used, size - used, "%s%s+%#lx (%s)", told ? ", " : "", image,
+		    (unsigned long)((uintptr_t)frames[i] - (uintptr_t)info.dli_fbase), name);
+		told++;
+	}
+}
+
 /* load the opener and open the Vulkan device, once; WHY is the message that asked for it */
 static void
 openDevice(SEL why)
@@ -160,12 +193,16 @@ openDevice(SEL why)
 	Dl_info info;
 	void *opener;
 
+	char from[512];
+
 	pthread_mutex_lock(&gLock);
 	if (gState != LAZY || gDevice == nil) {
 		pthread_mutex_unlock(&gLock);
 		return;
 	}
 	gState = OPENING;
+	callers(from, sizeof(from));
+	say("opening the device for -%s, sent from %s", sel_getName(why), from);
 	began = nowMs();
 	if (dladdr((const void *)&openDevice, &info) == 0 || info.dli_fname == NULL ||
 	    strlcpy(path, info.dli_fname, sizeof(path)) >= sizeof(path) || (slash = strrchr(path, '/')) == NULL) {
@@ -335,6 +372,37 @@ forwardOne(SEL selector)
 	}
 }
 
+/*
+ * _MTLDevice's own methods that are not in the protocols: Metal's internals (pipeline variants, function keys, binary archives,
+ * IO handles, the compiler) call them on a device, and the frontend replaces some of them. Before the device is open they would run
+ * _MTLDevice's own code on an object no driver filled; so they are forwarded as well, and the device opens at the first. Kept as
+ * they are: what _MTLDevice's own -init and Metal's registration use, and the object's life.
+ */
+static void
+forwardBaseMethods(void)
+{
+	static const char *const kept[] = {
+		"dealloc", ".cxx_construct", ".cxx_destruct", "init", "initWithAcceleratorPort:", "initProgressTracking",
+		"initSerializationPaths", "allowLibrariesFromOtherPlatforms", "globalTraceObjectID", "formattedDescription:",
+		"serialQueue", "concurrentQueue", "_incrementCommandQueueCount", "_decrementCommandQueueCount", "_purgeDevice",
+	};
+	unsigned count;
+	Method *methods = class_copyMethodList(gBase, &count);
+
+	for (unsigned i = 0; i < count; i++) {
+		const char *name = sel_getName(method_getName(methods[i]));
+		bool keep = false;
+
+		for (unsigned k = 0; k < sizeof(kept) / sizeof(kept[0]) && !keep; k++) {
+			keep = strcmp(name, kept[k]) == 0;
+		}
+		if (!keep) {
+			forwardOne(method_getName(methods[i]));
+		}
+	}
+	free(methods);
+}
+
 static void
 forwardProtocol(Protocol *protocol)
 {
@@ -390,6 +458,7 @@ registerDevice(void)
 	}
 	forwardProtocol(@protocol(MTLDevice));
 	forwardProtocol(spi);
+	forwardBaseMethods();
 	objc_registerClassPair(gClass);
 	say("the class HakiosMetalDevice is registered (Metal on Vulkan, opened at first use; %u of _MTLDevice's methods forwarded "
 	    "until then)", gForwardedCount);
