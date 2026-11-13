@@ -1,0 +1,30 @@
+panvk: a 32 MB tiler heap on Darwin, not 128 MB
+
+Applied by tools/mk-panvk.sh only, after tools/mesa/*.patch and panvk-darwin.patch, to Mesa 25.0.7 (Mesa's own licence, MIT,
+applies to the lines it changes). Written for Scion.
+  - panvk_vX_device.c: on Linux the tiler heap (Bifrost and older) is a buffer that grows on a GPU fault and starts small;
+    HakiosMali has no growing and makes it whole, so every process that opens a Vulkan device (every Metal client on the S9,
+    docs/metal.md) wired 128 MB of the system's memory for it. 32 MB holds the polygon lists of the frames Metal's clients
+    draw here; a heap that is too small shows as a tiler job's fault in the kernel's log, not as a wrong picture.
+
+--- a/src/panfrost/vulkan/panvk_vX_device.c
++++ b/src/panfrost/vulkan/panvk_vX_device.c
+@@ -302,8 +302,17 @@
+    panvk_device_init_mempools(device);
+ 
+ #if PAN_ARCH <= 9
++/* Scion: HakiosMali (Darwin) does not grow a heap on a fault (PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT): the
++ * tiler heap is the kernel's memory, wired whole, in every process that opens a device (not mapped
++ * into it, so not in its footprint). A UI-sized frame's polygon lists take a few MB of it.
++ */
++#ifdef __APPLE__
++#define PANVK_TILER_HEAP_SIZE (32 * 1024 * 1024)
++#else
++#define PANVK_TILER_HEAP_SIZE (128 * 1024 * 1024)
++#endif
+    result = panvk_priv_bo_create(
+-      device, 128 * 1024 * 1024,
++      device, PANVK_TILER_HEAP_SIZE,
+       PAN_KMOD_BO_FLAG_NO_MMAP | PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT,
+       VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, &device->tiler_heap);
+    if (result != VK_SUCCESS)
