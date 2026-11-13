@@ -37,6 +37,7 @@ extern "C" void sys_dcache_flush(void *start, size_t length);
 static NmbDevice *gDevice;
 
 static void drawable_xr_to_surface(id<MTLDrawable> drawable);
+extern void (*native_bridge_metal_log_hook)(const char *);
 static id gDeviceObject;
 static uint64_t gRegistryID;
 static NSString *gName;
@@ -397,6 +398,13 @@ drawable_xr_to_surface(id<MTLDrawable> drawable)
  }
  sys_dcache_flush(base,row*height);
  IOSurfaceUnlock(surface,0,nullptr);
+ static std::atomic<bool> said;
+ if(!said.exchange(true) && native_bridge_metal_log_hook) {
+  char line[160];
+  snprintf(line,sizeof line,"native-metal: extended-range drawables (%zux%zu, pixel format %lu) become the BGRA bytes of their surfaces as they are presented",
+           width,height,(unsigned long)format);
+  native_bridge_metal_log_hook(line);
+ }
 }
 // A no-copy import keeps its pages until the runtime frees it, which can be after the buffer object goes (a command buffer still using
 // it). The owner's release (Metal's deallocator, an IOSurface's mapping) waits for that, as Metal's does: run earlier, the owner could
