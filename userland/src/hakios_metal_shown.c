@@ -12,6 +12,11 @@
  * is started again. A device that is shown to a process that cannot use it costs that process, so it is shown to as few as the
  * experiment needs.
  *
+ * (The Galaxy S9's image has QuartzCore's default.metallib now, sysimage/select-system.py KEEP_METALLIB; the window server stays on
+ * OpenGL ES there by the choice of userland/src/inject.c, which takes the device out of backboardd unless boot-arg camtl=1.) The METAL=vk
+ * build shows a device that opens the GPU only at its first real use (src/metalvk/HakiosMetalVK.mm), so a process that is shown it
+ * and never uses it pays almost nothing.
+ *
  * Besides the level, a file HakiosMetal.clients beside the bundle (the way UniXNU's AdrenoMetal chooses its clients) names more
  * processes, one per line, "*" for every one: an image can show the device to the one program being worked on without a boot-arg.
  *
@@ -73,10 +78,12 @@ hakios_metal_shown(void (*say)(const char *line))
 	int level = 1;
 
 	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0) {
-		const char *at = strstr(args, "metal=");
-
-		if (at != NULL) {
-			level = atoi(at + 6);
+		/* the word metal=, not the end of another argument's name (ca_metal=, say) */
+		for (const char *at = args; (at = strstr(at, "metal=")) != NULL; at += 6) {
+			if (at == args || at[-1] == ' ') {
+				level = atoi(at + 6);
+				break;
+			}
 		}
 	}
 	if (name == NULL) {
