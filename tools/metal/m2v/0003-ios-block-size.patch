@@ -1,0 +1,32 @@
+metal2vulkan runtime: pooled memory blocks of 8 MiB on iOS, not 64 MiB (Scion)
+
+Upstream:  metal2vulkan, https://github.com/steelbrain/metal2vulkan, at 720ef1ce9ae2a2068999a8675717418b9416283e, after
+           AdrenoMetal's 16 patches to it and Scion's 0001 and 0002; tools/metal/mk-metal2vulkan.sh applies them in that order,
+           then this.
+Licence:   GPL-2.0-or-later OR LGPL-3.0-or-later, metal2vulkan's (its LICENSE); this patch is a change to it and under the same
+           terms. Nothing of it is in Scion's MIT or APSL files.
+Author:    the HakiOS authors (Scion), 14 November 2026.
+
+Why. On the Galaxy S9 (PanVK on the Mali-G72) every VkDeviceMemory is a buffer of HakiosMali's, the system's memory wired
+whole when it is made. The runtime pools resources in blocks of 64 MiB per memory type and class, so a process that opened a
+device and drew one 256x256 triangle (tools/metal metal_tri) held two such blocks: 129 MB of IOKit memory in its footprint.
+With Metal shown to applications and app extensions (boot-arg metal=2), several processes hold a device at once.
+
+What. memory.rs's BLOCK_BYTES is 8 MiB when built for iOS. A request over half a block already takes a dedicated block of its
+own size (memory.rs's pooling), so large textures and buffers are unchanged; small ones share 8 MiB blocks.
+
+--- a/crates/metal2vulkan-runtime/src/memory.rs
++++ b/crates/metal2vulkan-runtime/src/memory.rs
+@@ -49,7 +49,12 @@
+ use std::sync::Mutex;
+ 
+ /// The size of a pooled block, at most the device's `maxMemoryAllocationSize`.
++#[cfg(not(target_os = "ios"))]
+ pub(super) const BLOCK_BYTES: u64 = 64 << 20;
++/// On iOS (Scion's phones), 8 MiB: the GPU's memory is the system's, wired whole by the kernel's driver as soon as a block is
++/// allocated, in every process that opens a device; two classes of 64 MiB blocks were 128 MiB of a process that drew one triangle.
++#[cfg(target_os = "ios")]
++pub(super) const BLOCK_BYTES: u64 = 8 << 20;
+ 
+ /// What memory a resource needs.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
