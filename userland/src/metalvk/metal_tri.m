@@ -6,13 +6,15 @@
  * pixel. The first step of Metal for applications on the Galaxy S9 (docs/metal.md): MTLDevice, library, render pipeline, command queue,
  * render pass, read back, on metal2vulkan's runtime over PanVK on the Mali-G72.
  *
- *   metal_tri [--bundle DIR] [--metallib FILE] [--size N] [--out FILE.ppm] [--surface]
+ *   metal_tri [--bundle DIR] [--metallib FILE] [--size N] [--out FILE.ppm] [--surface] [--register]
  *
  * The device: MTLCreateSystemDefaultDevice() first, Metal's own discovery (the kernel names the plug-in with boot-arg metal=N). When it
  * answers nil, the plug-in at --bundle (default /redwood/lib/HakiosMetal.bundle) is loaded and its class made the way Metal makes it,
  * -initWithAcceleratorPort: on the IOAcceleratorES service; so this runs without any boot-arg, in this process only, and nothing else on
  * the phone is shown a device. The bundle registers its class only in a process it is shown to (src/hakios_metal_shown.c): put
- * "metal_tri" in HakiosMetal.clients beside it.
+ * "metal_tri" in HakiosMetal.clients beside it. --register then hands the object to Metal as its discovery does (MTLAddDevice) and checks
+ * that MTLCreateSystemDefaultDevice() answers it; the application always does. The plug-in opens the GPU only at the device's first real
+ * use, and each step says whether its runtime (libmetal2vulkan) is in the process yet.
  *
  * The shaders: tools/metal/air/tri_vertex.ll and tri_fragment.ll, AIR written by hand and put in a library by tools/metal/mkmetallib.py
  * (no Xcode needed); default /redwood/share/metal_tri.metallib. The vertex stage makes the three corners from the vertex id (bottom
@@ -30,6 +32,8 @@
 #import <UIKit/UIKit.h>
 #import <IOSurface/IOSurfaceRef.h>
 #include <IOKit/IOKitLib.h>
+#include <mach-o/dyld.h>
+#include <objc/runtime.h>
 #include <execinfo.h>
 #include <math.h>
 #include <signal.h>
@@ -48,8 +52,25 @@ static const double corner[3][2] = { { -0.8, -0.8 }, { 0.8, -0.8 }, { 0.0, 0.8 }
 - (id)initWithAcceleratorPort:(unsigned)port;
 @end
 
+/* Metal's own registration of a device, which its discovery calls for the object a plug-in's class made (exported by Metal) */
+extern void MTLAddDevice(id<MTLDevice> device);
+
+/* whether the plug-in's runtime is in this process yet: the device opens the GPU only at its first real use (HakiosMetalVK.mm) */
+static const char *
+runtime_state(void)
+{
+	for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+		const char *name = _dyld_get_image_name(i);
+
+		if (name != NULL && strstr(name, "libmetal2vulkan") != NULL) {
+			return "loaded";
+		}
+	}
+	return "not loaded";
+}
+
 static id<MTLDevice>
-make_device(const char *bundle_path)
+make_device(const char *bundle_path, bool register_it)
 {
 	id<MTLDevice> device = MTLCreateSystemDefaultDevice();
 	if (device != nil) {
@@ -75,8 +96,9 @@ make_device(const char *bundle_path)
 	}
 	/*
 	 * Sent as an init (the category below), as Metal sends it: the receiver is consumed and the result returned retained. The plug-in
-	 * returns its frontend's device in place of the object allocated here and keeps that one on purpose (HakiosMetalVK.mm); a caller
-	 * that released it as well (a cast function pointer under ARC does) would free a _MTLDevice whose -init never ran, which faults.
+	 * returns the object allocated here, initialised, or the process's device made before in its place (keeping the new allocation on
+	 * purpose, HakiosMetalVK.mm); a caller that released it as well (a cast function pointer under ARC does) would free a _MTLDevice
+	 * whose -init never ran, which faults.
 	 */
 	device = [[cls alloc] initWithAcceleratorPort:service];
 	IOObjectRelease(service);
@@ -84,7 +106,19 @@ make_device(const char *bundle_path)
 		printf("metal_tri: FAIL: -initWithAcceleratorPort: gave nil (the plug-in's log says why)\n");
 		return nil;
 	}
-	printf("metal_tri: device by the plug-in's own class: %s\n", device.name.UTF8String);
+	printf("metal_tri: the plug-in's class made a %s; its runtime is %s\n", object_getClassName(device), runtime_state());
+	if (register_it) {
+		/* what Metal's discovery does with that object; MTLCreateSystemDefaultDevice() above made Metal's device list */
+		MTLAddDevice(device);
+		id<MTLDevice> found = MTLCreateSystemDefaultDevice();
+		printf("metal_tri: after MTLAddDevice(), MTLCreateSystemDefaultDevice() is %s; the runtime is %s\n",
+		    found == device ? "this device" : found != nil ? "ANOTHER device" : "nil", runtime_state());
+		if (found != device) {
+			printf("metal_tri: FAIL: Metal did not take the device\n");
+			return nil;
+		}
+	}
+	printf("metal_tri: device by the plug-in's own class: %s; the runtime is %s\n", device.name.UTF8String, runtime_state());
 	return device;
 }
 
@@ -360,7 +394,7 @@ static struct {
 		metallib = @"/redwood/share/metal_tri.metallib";
 	}
 	app.n = 512;
-	app.device = make_device(plugin.UTF8String);
+	app.device = make_device(plugin.UTF8String, true);
 	if (app.device != nil) {
 		app.pipeline = make_pipeline(app.device, metallib.UTF8String);
 		app.queue = [app.device newCommandQueue];
@@ -396,7 +430,7 @@ main(int argc, char *argv[])
 		}
 		const char *bundle_path = "/redwood/lib/HakiosMetal.bundle", *metallib = "/redwood/share/metal_tri.metallib", *out = NULL;
 		unsigned n = 256;
-		bool surface = false;
+		bool surface = false, register_it = false;
 		for (int i = 1; i < argc; i++) {
 			if (strcmp(argv[i], "--bundle") == 0 && i + 1 < argc) {
 				bundle_path = argv[++i];
@@ -408,15 +442,18 @@ main(int argc, char *argv[])
 				out = argv[++i];
 			} else if (strcmp(argv[i], "--surface") == 0) {
 				surface = true;
+			} else if (strcmp(argv[i], "--register") == 0) {
+				register_it = true;
 			} else {
-				fprintf(stderr, "usage: metal_tri [--bundle DIR] [--metallib FILE] [--size N] [--out FILE.ppm] [--surface]\n");
+				fprintf(stderr, "usage: metal_tri [--bundle DIR] [--metallib FILE] [--size N] [--out FILE.ppm] [--surface] "
+				    "[--register]\n");
 				return 2;
 			}
 		}
 		if (n < 16 || n > 4096) {
 			n = 256;
 		}
-		id<MTLDevice> device = make_device(bundle_path);
+		id<MTLDevice> device = make_device(bundle_path, register_it);
 		if (device == nil) {
 			return 1;
 		}
