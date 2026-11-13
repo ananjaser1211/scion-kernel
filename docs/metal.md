@@ -408,3 +408,29 @@ Not yet ready for an image:
 
 The daemons get no device at `metal=2`. `mediaserverd` keeps taking its device out unless `mediamtl=1` (`inject_media.c`); its
 `cvadepth-iOS.metallib` is in the image now (`KEEP_METALLIB`).
+
+### On the phone with `metal=2` (builds 44 to 48, 14 November 2026)
+
+Each boot found the next wall. The fixes are all in `star2-bringup`.
+
+| Build | What happened | Cause | Fix |
+|---|---|---|---|
+| 44 | PosterBoard ended every ~2 s: `OS_REASON_GUARD` (VM, `kGUARD_EXC_DEALLOC_GAP`) | see build 45 | `be308d4` forwards `_MTLDevice`'s own methods too (harmless, not the cause) |
+| 45 | CollectionsPoster ended the same way, a second after its device opened | PanVK `munmap()`s IOKit mappings. IOKit gives a task one mapping per buffer, so a VkBuffer covering its whole memory shared the memory's mapping; `vkDestroyBuffer` removed it and `vkFreeMemory`'s `munmap()` fell on a hole. This is fatal in apps and extensions and silent in root tools. It was caught in `metal_tri` with VM guard delivery on | `ccc645c`: the stand-in counts each mapping's users; PanVK unmaps through `hakios_drm_unmap()` (`panvk-unmap.patch`) |
+| 46 | SpringBoard died of `SIGBUS` ~10 s after start, after `mmap(..., size=16) failed` | Siri's orb draws indexed. PanVK (arch < 9) maps the range of an index buffer; the stand-in mapped whole buffers only | `cabfdd0`: a sub-range maps as the buffer's one mapping at that offset, and upstream's in-page offset is fixed |
+| 46 | AegirPoster aborted on an uncaught exception right after opening its device | (unknown then) | `71346b0`: exceptions thrown after the device opens are logged with their caller |
+| 47 | AegirPoster: `CAMetalLayerInvalid: unsupported extended range format` from ClockKitUI | the frontend told every process "no XR10" | `12ed728`: only backboardd is told no. XR10 textures, clears and CAMetalLayer drawables work |
+| 47-48 | SpringBoard with the device | | stable; Siri's orb prewarm returns. Footprint 88 MB (44 MB without the device) |
+| 48 | PosterBoard without the device aborts when the gallery starts AegirPoster (`attempt to insert nil object from objects[1]`: it puts its command queue in a CIContext's options) | PosterBoard needs the device | `-PosterBoard` taken out of `/private/var/db/HakiosMetal.clients`. The gallery opens, and so do the Astronomy editor and AegirPoster, which no longer crash |
+
+**The Astronomy wallpaper is still black (build 48).** metal2vulkan refuses 29 of AegirPoster's render pipelines with `Unsupported Format,
+NotImplemented at Color(0)`. These are every `aegir_*` fragment that *blends* into the layer's `BGR10_XR_sRGB` drawable (SrcAlpha/OneMinusSrcAlpha for
+the earth, luna, sprites and stars; One/One for `aegir_post_fsh`). metal2vulkan computes such a blend in the shader. It reads the attachment either through
+rasterization-order input attachments (`lower/fragment/input_blend.rs`) or under the pixel interlock (the storage form, `lower/fragment/fetch.rs`), and
+PanVK v6 offers neither. Unblended XR10 pipelines are made. The way forward is a `tools/metal/m2v` patch: blend with the fixed function on the raw
+10-bit codes through a UNORM view of the attachment.
+- For an affine blend (destination factor = 1 - source factor) the XR bias is kept exactly.
+- For an additive one (destination factor One) the source is encoded without the bias.
+- For the `_sRGB` forms, blending the encoded values is not Metal's linear blend: that path is an approximation, and it would be said so.
+
+Not yet seen: whether the GLES compositor shows a 10-bit (`BGR10_XR`) drawable right; that needs a pipeline that draws first.
