@@ -503,3 +503,14 @@ prompt plug-in threw on it as an unrecognized selector. The alert it left on the
 - **What is not yet known:** Metal's numbers, which need a backboardd that survives its first frame.
 - **Default and fallback:** GLES stays the default and the fallback. The Metal road stays behind `camtl=1` plus the clients line, until
   it has run a session without aborting.
+- **Build 51** (`uchar3` constants qualified): the specializations are now made, among them `fixed_frag_lph_cph` with
+  `fc_framebuffer_fetch=1`. Of the window server's pipelines, 100 are made and one is refused: `std_vert1_lph` with `luma_boost_lph`.
+  The refusal is `Unsupported(FramebufferFetch)`, needing rasterization-order attachment access or the pixel interlock, neither of which
+  PanVK v6 has. `luma_boost_lph` reads its color attachment, and QuartzCore aborts on the refusal ("Metal failed to build render
+  pipeline: spec=PBGRAXm_TlubA2Xhf_Isrc"); launchd counted 4 crashes before the line was taken out.
+
+  The device claims Apple GPU families 1 to 3, with "Programmable blending" listed among their waived rows, so CoreAnimation assumes
+  framebuffer fetch. The ways on, each its own piece of work:
+  - find what makes QuartzCore choose the luma-boost (EDR) pass and its fetch path, and have the device answer that query truthfully;
+  - or give metal2vulkan a fetch without either Vulkan feature, for example a copy of the attachment bound as a texture for the draws
+    that read it.
