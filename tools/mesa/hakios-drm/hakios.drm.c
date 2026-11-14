@@ -35,7 +35,8 @@
 #include "drm-uapi/msm_drm.h"
 #include "drm-uapi/panfrost_drm.h"
 
-#define HAKIOS_GPU_USER_MEMORY 0x7d            /* the Adreno service's too: pages of this process as a buffer */
+#define HAKIOS_GPU_USER_MEMORY 0x7d            /* the Adreno service's: pages of this process as a buffer */
+#define HAKIOS_MALI_USER_MEMORY 0x7b           /* HakiosMali's, the same request (its 0x7d is a wait) */
 #define HAKIOS_GPU_SURFACE     0x7e            /* the request that is not Linux's (both services) */
 #define HAKIOS_GPU_DESCRIBE    0xffffffffu     /* ... asked only what the buffer would be like */
 #define HAKIOS_MALI_WAIT       0x7d            /* HakiosMali's own: wait for a job by its number */
@@ -1238,7 +1239,7 @@ int
 hakios_drm_user_memory(int fd, const void *address, uint64_t size, uint32_t *handle)
 {
 	struct { uint64_t address, size; uint32_t handle, flags; } request = { (uintptr_t)address, size, 0, 0 };
-	int error = call(HAKIOS_GPU_USER_MEMORY, &request, sizeof(request));
+	int error = call(opened == PANFROST ? HAKIOS_MALI_USER_MEMORY : HAKIOS_GPU_USER_MEMORY, &request, sizeof(request));
 
 	(void)fd;
 	if (error != 0) {
