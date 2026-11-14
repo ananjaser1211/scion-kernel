@@ -335,12 +335,21 @@ static void noteDrawablePresent(id drawable,const char *how) {
    object_getClassName(drawable),(unsigned long)texture.width,(unsigned long)texture.height,(unsigned long)texture.pixelFormat);
  }
 }
-static void drawablePresent(id self_,SEL cmd) {noteDrawablePresent(self_,"-present");((void(*)(id,SEL))gDrawablePresent)(self_,cmd);}
+// A drawable presented by itself is shown once the GPU has written it, as through a command buffer (presentDrawable:, which converts
+// in its completed handler): an extended-range one is made what its surface says it is first (drawable_xr_to_surface), after the
+// work that writes it. The Astronomy wallpaper (AegirPoster) presents its BGR10_XR_sRGB drawable so, and the compositor showed the
+// XR words as BGRA bytes: black, with a blue patch (docs/metal.md, phase 5).
+static void drawableXrBeforePresent(id drawable);   // (after waitForResource, below)
+static void drawablePresent(id self_,SEL cmd) {
+ noteDrawablePresent(self_,"-present");drawableXrBeforePresent(self_);((void(*)(id,SEL))gDrawablePresent)(self_,cmd);
+}
 static void drawablePresentAtTime(id self_,SEL cmd,CFTimeInterval t) {
- noteDrawablePresent(self_,"-presentAtTime:");((void(*)(id,SEL,CFTimeInterval))gDrawablePresentAtTime)(self_,cmd,t);
+ noteDrawablePresent(self_,"-presentAtTime:");drawableXrBeforePresent(self_);
+ ((void(*)(id,SEL,CFTimeInterval))gDrawablePresentAtTime)(self_,cmd,t);
 }
 static void drawablePresentAfter(id self_,SEL cmd,CFTimeInterval t) {
- noteDrawablePresent(self_,"-presentAfterMinimumDuration:");((void(*)(id,SEL,CFTimeInterval))gDrawablePresentAfter)(self_,cmd,t);
+ noteDrawablePresent(self_,"-presentAfterMinimumDuration:");drawableXrBeforePresent(self_);
+ ((void(*)(id,SEL,CFTimeInterval))gDrawablePresentAfter)(self_,cmd,t);
 }
 static void watchDrawablePresents() {
  Class cls=objc_getClass("CAMetalDrawable");
@@ -922,6 +931,15 @@ static void waitForResource(id resource) {
   if(dependency!=0)[(id<MTLCommandBuffer>)commandBuffer waitUntilCompleted];else gResourceSkipped++;
  }
  gTimeResourceWait.add(began);
+}
+static void drawableXrBeforePresent(id drawable) {
+ if(tPresentingForBuffer || ![drawable respondsToSelector:@selector(texture)])return;
+ id texture=[(id<CAMetalDrawable>)drawable texture];
+ if(![texture isKindOfClass:[NBTexture class]])return;
+ const MTLPixelFormat format=[(id<MTLTexture>)texture pixelFormat];
+ if(format!=MTLPixelFormatBGR10_XR && format!=MTLPixelFormatBGR10_XR_sRGB)return;
+ waitForResource(texture);
+ drawable_xr_to_surface((id<MTLDrawable>)drawable);
 }
 @implementation NBEncoder
 - (void)dealloc {if(_handle)nmb_encoder_discard(_handle);}
