@@ -1,0 +1,113 @@
+metal2vulkan: a copied no-copy buffer gives back only what the GPU changed (Scion)
+
+Upstream:  metal2vulkan, https://github.com/steelbrain/metal2vulkan, at 720ef1ce9ae2a2068999a8675717418b9416283e, after
+           AdrenoMetal's 16 patches to it and Scion's 0001 to 0005; tools/metal/mk-metal2vulkan.sh applies them in that order,
+           then this.
+Licence:   GPL-2.0-or-later OR LGPL-3.0-or-later, metal2vulkan's (its LICENSE); this patch is a change to it and under the same
+           terms. Nothing of it is in Scion's MIT or APSL files.
+Author:    the HakiOS authors (Scion), 14 November 2026.
+
+Why. The window server on Metal (build 52, camtl=1) died of SIGSEGV within a minute, twice, in memmove from
+Buffer::copy_host_bytes (host_sync::copy_out, on the command buffer's Transition thread), at a page boundary of the caller's
+bytes. 0002 copies a no-copy buffer the device could not import back into the caller's bytes as a command buffer that writes
+it completes, and one its commands use untracked counts as written. The copy back took every 4 KiB where the buffer's own
+memory and the caller's bytes differed, which is also where the caller changed its bytes after the copy in. CoreAnimation's
+buffers over memory it maps read-only were written there, a fault. And on writable memory the caller's newer writes would have
+been overwritten with the old copy.
+
+What. CopiedHost keeps a 64-bit digest of each 4 KiB of the buffer's own memory as it last agreed with the caller's bytes,
+recorded at each copy in. A copy out gives back only the chunks whose digest changed since, which are the chunks the GPU wrote,
+and records the new digest. A chunk the GPU did not write is left as the caller has it, read-only or rewritten. A buffer never
+copied in gives nothing back. The comparison of a copy in is unchanged; a copy out no longer reads the caller's bytes.
+
+--- a/crates/metal2vulkan-runtime/src/buffer.rs
++++ b/crates/metal2vulkan-runtime/src/buffer.rs
+@@ -91,6 +91,26 @@
+     pointer: NonNull<u8>,
+     length: u64,
+     deallocator: Mutex<Option<Deallocator>>,
++    /// A digest of each 4 KiB of the buffer's own memory as it last agreed with the caller's
++    /// bytes (after a copy in or out): a copy out takes back only what the GPU changed since, so a
++    /// buffer used untracked (its writes not known) gives back nothing it did not write, and the
++    /// caller's later writes, or bytes it maps read-only, are left alone.
++    synced: Mutex<Vec<u64>>,
++}
++
++/// A 64-bit digest of `bytes` (FxHash's step over 8-byte words): whether a 4 KiB chunk of a copied
++/// no-copy buffer changed since it was last synced.
++fn chunk_digest(bytes: &[u8]) -> u64 {
++    let mut hash = bytes.len() as u64;
++    let mut words = bytes.chunks_exact(8);
++    for word in &mut words {
++        let w = u64::from_le_bytes(word.try_into().unwrap_or([0; 8]));
++        hash = (hash.rotate_left(5) ^ w).wrapping_mul(0x9e37_79b9_7f4a_7c15);
++    }
++    for &b in words.remainder() {
++        hash = (hash.rotate_left(5) ^ u64::from(b)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
++    }
++    hash
+ }
+ 
+ // SAFETY: the caller's bytes, which the no-copy contract keeps mapped while the buffer lives; the
+@@ -2021,6 +2041,7 @@
+             pointer,
+             length: self.length(),
+             deallocator: Mutex::new(deallocator),
++            synced: Mutex::new(Vec::new()),
+         };
+         let _ = self.0.copied.set(copied);
+     }
+@@ -2031,8 +2052,9 @@
+     }
+ 
+     /// Scion (`host_sync.rs`): copy the caller's bytes into the buffer's own memory where they
+-    /// differ, 4 KiB at a time (`in_` true), or the buffer's into the caller's (false). The spans
+-    /// of its own memory the copy in changed, for a flush; and the bytes copied.
++    /// differ, 4 KiB at a time (`in_` true), or the buffer's into the caller's (false) where the
++    /// GPU changed them since they last agreed (`CopiedHost::synced`). The spans of its own memory
++    /// the copy in changed, for a flush; and the bytes copied.
+     pub(super) fn copy_host_bytes(&self, in_: bool) -> (Vec<crate::host_sync::HostSpan>, u64) {
+         const CHUNK: usize = 4096;
+         let (Some(copied), Some(own), Some(span)) = (self.0.copied.get(), self.own_contents(), self.host_span())
+@@ -2044,8 +2066,31 @@
+         let mut spans: Vec<crate::host_sync::HostSpan> = Vec::new();
+         let mut copied_bytes = 0;
+         let mut at = 0;
++        let mut synced = lock(&copied.synced);
++        let chunks = length.div_ceil(CHUNK);
++        // Never synced: nothing the GPU wrote can be told from the caller's bytes, so a copy out
++        // gives back nothing (a copy in always comes first, before a command buffer's first batch).
++        if synced.len() != chunks {
++            if !in_ {
++                return (Vec::new(), 0);
++            }
++            synced.clear();
++            synced.resize(chunks, 0);
++        }
+         while at < length {
+             let end = (at + CHUNK).min(length);
++            let chunk = at / CHUNK;
++            if !in_ {
++                // SAFETY: the buffer's own memory holds `length` bytes from its start, which no
++                // command writes now (a copy out runs after the work completed).
++                let mine = unsafe { std::slice::from_raw_parts(own.add(at), end - at) };
++                let digest = chunk_digest(mine);
++                if digest == synced[chunk] {
++                    at = end;
++                    continue;
++                }
++                synced[chunk] = digest;
++            }
+             // SAFETY: both hold `length` bytes from their start (the caller's by the no-copy
+             // contract, the buffer's by its placement); no command reads or writes them meanwhile
+             // (a copy in runs before the batch is submitted, a copy out after its work completed).
+@@ -2074,6 +2119,9 @@
+                     }),
+                 }
+             }
++            if in_ {
++                synced[chunk] = chunk_digest(to);
++            }
+             at = end;
+         }
+         (spans, copied_bytes)
