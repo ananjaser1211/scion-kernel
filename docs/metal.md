@@ -583,3 +583,55 @@ first commit, presents by command buffer and by drawable, large texture loads, a
   the program's thread. PanVK takes about a minute over them.
 - **0007** (`0007-owned-kernels-ahead.patch`) makes them on a thread of their own. Until they are made the pass uses the host's
   reach, as the module's own rule says for capture forms not yet made. It needs an image to be seen in AegirPoster.
+
+## Phase 5: no-copy imports, and the Astronomy wallpaper checks in (14 November 2026)
+
+**AegirPoster, builds 54 to 56:**
+
+- With 0007 it checks in ("extension checked in as alive"), makes its drawable's texture over the surface, commits once (3 render
+  passes, 5 draws, 1 blit) and presents it by the drawable itself (`-present`). Settings > Wallpaper > Add New Wallpaper >
+  Astronomy opens the editor, and the gallery and editor are not killed any more.
+- Builds 54 and 55 showed the editor black with a blue patch at the top left. The drawable is `BGR10_XR_sRGB`. The frontend made an
+  XR drawable's surface BGRA only for `presentDrawable:` (in its completed handler), so the compositor showed the XR words as BGRA
+  bytes. Since 06e56c1 a drawable presented by itself is converted too, after the work that writes it. On build 56 the patch is
+  gone and the frame is black, as converted.
+- **Still no Earth:** AegirPoster commits that one frame and no other (no commit 100), and its 2048x2048 texture loads come after
+  the first commit. What it waits for before a second frame is not known yet.
+- The capture-replay kernels that 0007 moved off the program's thread are still being made after 9 minutes of one core at 100%.
+  Symbolicated against the unstripped PanVK: `vk_common_CreateComputePipelines` → `panvk_compile_shaders` →
+  `bifrost_compile_shader_nir` → `bi_register_allocate`, which spills one node per pass of up to 2000 passes, each rebuilding the
+  interference graph. Until they are made the pass keeps the host's reach, as before, but the extension burns a core that long.
+
+**The window server's no-copy buffers:**
+
+- **Why they were copied.** PanVK had no `VK_EXT_external_memory_host`, so every no-copy buffer was copied (0002, 0006), whether it
+  was an IOSurface's or the process's own. Alignment and read-only mappings were not the cause.
+- **IOSurfaces are now imported.** `tools/mesa/panvk/panvk-host-surfaces.patch` imports an IOSurface's pages as HakiosMali's buffer
+  of the surface by its ID (`kHakiosMaliSurface`, as `pan_kmod_bo_import` already did on Darwin), in the coherent type. The
+  frontend tells the driver each surface it imports (`hakios_drm_host_surface`, as AdrenoMetal does for Turnip). With metal_tri,
+  a 1024x1024 render pass into an IOSurface took 49.0 ms copied and takes 3.4 ms imported; `--surface`, `--fetch` and
+  `--xr over|add` pass.
+- **That was not the bulk.** The frontend's new tally (every 1000th commit) shows backboardd on Metal making 137 to 423
+  no-copy buffers of its own memory, against 7 to 88 over IOSurfaces. Over commits 101 to 1000 on build 55, copying them cost
+  94 ms a commit in and 64 ms out (reading back the device's write-combined memory to find what the GPU changed), and the GPU's
+  commit-to-completion averaged 198 ms.
+- **Importing the process's own pages (build 56, backed out):** HakiosMali request 0x7b (`ae4f5b6`, kept) wires a
+  client's pages as a GPU buffer, and a PanVK memory type that is cached and not coherent imported them (metal2vulkan 0008
+  flushes and invalidates such imports). A no-copy blit test (3 x 4 MB) took 7.8 ms against 206 ms copied, but it lost data at
+  cache-line granularity: lines the GPU wrote read back as the CPU's old bytes, and lines the CPU changed read as the old ones on
+  the GPU. That happened even with every line cleaned and invalidated by hand around each job (DC CIVAC, trapped and done by
+  the kernel under patch 1511). iOS's `sys_dcache_flush()` is a DSB alone, so the frontend's `flushSurfaces` does nothing either.
+  The GPU does not yet see a process's cached pages coherently, and backboardd's buffers were mostly refused anyway (it still
+  copied 32 MB in 100 commits on build 56). PanVK went back to importing IOSurfaces only. Until both are understood, those buffers
+  stay copied.
+
+**Numbers** (`ps` once a second, six home-page swipes, `/var/tmp/m5/swipe.sh`):
+
+| | GLES | Metal, build 54 (all copied) | Metal, build 55 (surfaces imported) | Metal, build 56 |
+|---|---|---|---|---|
+| backboardd CPU, swipes | 6 to 74% | 115 to 166% | 18 to 133% | 82 to 144% |
+| backboardd CPU, idle | 4 to 20% | about 150% (Clock icon page) | 8 to 10% | about 125% |
+| RSS | 103 to 115 MB | 176 to 186 MB | 133 to 148 MB | 146 to 157 MB |
+| commit to completion (GPU) | (eagl line, about 9 ms median) | not measured | 142 to 198 ms average | 102 ms average |
+
+GLES stays the default. Metal is not yet within reach of it for the window server.
