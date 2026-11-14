@@ -635,3 +635,69 @@ first commit, presents by command buffer and by drawable, large texture loads, a
 | commit to completion (GPU) | (eagl line, about 9 ms median) | not measured | 142 to 198 ms average | 102 ms average |
 
 GLES stays the default. Metal is not yet within reach of it for the window server.
+
+## Phase 6: the process's own pages, coherent and imported (14 November 2026, on build 57)
+
+**Why the GPU did not see a process's pages (wall 1).** It was never the Mali or its page tables:
+
+- `tools/metal/vk_hostcoh.c` imports 4 MB of a process's pages through PanVK. Each round the CPU writes a pattern, the GPU
+  copies it into its own memory and then fills the pages with another value, and every 64-byte line is checked on both sides.
+  With build 56's PanVK (`0x7b`, pages wired by HakiosMali), 10 rounds:
+  - nothing done about the caches: 420409 of 655360 lines lost into the GPU, 410076 out of it;
+  - PanVK's `vkFlushMappedMemoryRanges` and `vkInvalidateMappedMemoryRanges` (what metal2vulkan 0008 calls): 366973 and
+    350598 lost, the same, because they call `sys_dcache_flush()`, which on iOS 16.5 is a DSB alone;
+  - DC CIVAC over every line, by the program, before the submit and after the wait: **none lost**.
+- So the GPU sees cached pages correctly once their lines are cleaned and invalidated (JS_CONFIG already flushes the GPU's
+  L2 at both ends of a job). Phase 5's note that lines were lost even with DC CIVAC around each job did not hold up here.
+- The program cannot do it itself at any useful speed. With the Exynos M3s up, `SCTLR_EL1.UCI` is clear (xnu patch 1511),
+  so each DC CIVAC from EL0 traps and the kernel does it: about 0.67 us a line, 87 ms a round for 4 MB, slower than
+  metal2vulkan's copy.
+- **The fix is in the kernel.** HakiosMali request `0x7a` (`syncBuffer`) cleans and invalidates a range of a buffer's lines
+  on the kernel's alias of each wired page, as patch 1511 does, without holding its lock. hakios-drm's `hakios_drm_sync()`
+  asks for it. PanVK's flush and invalidate of its cached type now ask for it too (`panvk-host-memory.patch`), so
+  metal2vulkan's 0001 and 0008 steps do what they say.
+- PanVK imports a process's own pages only where the kernel has `0x7a`. It asks once, of no buffer: a new kernel answers
+  ENOENT and build 57's ENOSYS. Without `0x7a`, those pages are refused and copied as before. On build 57, `vk_hostcoh` with
+  that PanVK says "the host pages were not imported", as it should.
+- A hand-built PanVK that falls back to the trapped DC CIVAC where `0x7a` is missing loses nothing through the Vulkan path
+  (`vk_hostcoh ... vk`: 5 rounds of 65536 lines, 0 lost either way). It is not committed; it was only for looking ahead of a
+  kernel.
+
+**Why most of backboardd's buffers were refused (wall 2).** The same hand build logged each import with `mach_vm_region`.
+
+- Of 353 own-page imports at backboardd's start, 185 were taken and 168 refused.
+- **Every refused one was read-only to backboardd** (protection and maximum protection read):
+  - CoreAnimation's images shared from other processes: VM tag 51, shared, mapped by 3 to 40 processes, 32 KB to 1.4 MB;
+  - read-only private copies of its own: tag 7, up to 10 MB.
+- HakiosMali wired only writable pages (`kIODirectionInOut`), so metal2vulkan copied the rest at every commit.
+- Now such pages are wired for reading and entered for the GPU to read only (AP 11 in the Mali's AArch64 tables; a job that
+  writes one takes a permission fault), and `0x7b` answers `kMaliUserReadOnly`.
+- Alignment and size were never the reason: metal2vulkan imports the window of whole pages around the bytes.
+
+**What the window server's commits cost now (wall 3, first look).** backboardd on Metal with the hand-built PanVK on build
+57's kernel: writable pages imported, read-only ones still copied. The driver was named through `launchctl setenv
+HAKIOS_VK_ICD`, plus a `backboardd` line in the clients file; both were taken back after. Six home swipes
+(`/var/tmp/coh/m6.sh`, which wakes and unlocks the screen first; an idle screen gave 4% flat):
+
+| | GLES (build 57) | Metal, build 57's kernel, writable pages imported |
+|---|---|---|
+| backboardd CPU, six swipes | 7 to 92% | 82 to 161% |
+| RSS | 101 to 115 MB | 140 to 158 MB |
+| commits 2 to 100 | | 132 ms apart; commit to completion 82 ms on average |
+| copied in, not imported | | 61 MB in 99 commits (3.3 s) |
+
+- A 5 s spindump during the swipes put 180 of the display thread's 250 samples in `Buffer::copy_host_bytes` under
+  `host_sync::copy_in`, and 101 of the handlers thread's in the same function for the copy out.
+- PanVK's own work (submit, the trapped flushes) was under 20 samples.
+- The copy in compared the caller's bytes with the buffer's own memory and then took that memory's digest. That memory is
+  write-combined and reads back at about 25 MB/s.
+- **metal2vulkan 0009** (`0009-copy-in-by-caller-digest.patch`) compares the caller's bytes with the digest recorded when they
+  last agreed, and only writes the buffer's own memory.
+- With the read-only pages imported too, little should be left to copy at all. That needs the kernel.
+- 0009 builds, but it has not run on the phone yet: backboardd's dyld ignores `DYLD_LIBRARY_PATH` (set through `launchctl
+  setenv`; the plug-in still named the old runtime's patch hash), and the runtime's path is fixed in the plug-in, so it needs
+  an image.
+
+**Needs an image** (kernel and userland): HakiosMali `0x7a` and read-only `0x7b` in the kernel; PanVK with
+`panvk-host-memory.patch` and the new hakios-drm; metal2vulkan with 0009. Then backboardd on Metal is measured again the same
+way, against GLES. GLES stays the default until then.
