@@ -33,6 +33,9 @@ arm64):
   - Buffers and images take either type; external buffer properties and linear 2D images are importable from host
     allocations, never exported.
   - vkMapMemory of imported memory is the caller's pointer, and is never unmapped here.
+  - Images of host pages are 2D and linear: VK_IMAGE_TILING_LINEAR, or DRM_FORMAT_MOD_LINEAR at the caller's rows
+    (VkImageDrmFormatModifierExplicitCreateInfoEXT), which metal2vulkan asks for where a surface's rows are not the
+    driver's own (docs/metal.md, phase 7); the image format query takes no other modifier.
 Anything refused (VK_ERROR_INVALID_EXTERNAL_HANDLE) metal2vulkan copies, as before.
 
 --- a/src/panfrost/vulkan/panvk_physical_device.c
@@ -90,16 +93,20 @@ Anything refused (VK_ERROR_INVALID_EXTERNAL_HANDLE) metal2vulkan copies, as befo
     };
  }
  
-@@ -1469,6 +1496,25 @@
+@@ -1469,6 +1496,29 @@
        VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
        VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
  
 +#ifdef __APPLE__
 +   /* Host pages (VK_EXT_external_memory_host): rows as the host has them, so
-+    * a linear 2D image only, imported and never exported. */
++    * a linear 2D image only, imported and never exported: the driver's own
++    * linear layout, or DRM_FORMAT_MOD_LINEAR at the rows the caller gives
++    * (an IOSurface's rows are often further apart than the driver's: the
++    * window server's 1125-pixel framebuffers at 4608 bytes against 4544). */
 +   if (handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT) {
 +      if (pImageFormatInfo->type != VK_IMAGE_TYPE_2D ||
-+          pImageFormatInfo->tiling != VK_IMAGE_TILING_LINEAR) {
++          (pImageFormatInfo->tiling != VK_IMAGE_TILING_LINEAR &&
++           pImageFormatInfo->tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)) {
 +         return panvk_errorf(
 +            physical_device, VK_ERROR_FORMAT_NOT_SUPPORTED,
 +            "host memory is imported only for linear 2D images");
