@@ -29,6 +29,7 @@
 #include <unistd.h>
 
 #include <IOKit/IOKitLib.h>
+#include <mach/mach.h>
 
 #define HAKIOS_DRM_DEVICES 1           /* (xf86drm.h: the device list is this file's to give) */
 #include "xf86drm.h"
@@ -1383,6 +1384,42 @@ hakios_drm_sync(int fd, uint32_t handle, uint64_t offset, uint64_t size)
 		return -1;
 	}
 	return 0;
+}
+
+/*
+ * Whether no processor can write the pages at `address` (`size` bytes) from now on, so that their lines, once cleaned, stay
+ * clean: every region over them is mapped here only (private, its memory held by nothing else: one reference), and read-only
+ * for good (its maximum protection lacks VM_PROT_WRITE, which can only be lowered). A mapping made from one of them (vm_remap,
+ * a memory entry) is read-only for good as well; a copy made writable (VM_PROT_COPY) is other pages. The window server's
+ * largest no-copy buffers are such pages (CoreAnimation's decoded images: 9 MB, 6.9 MB and 1.7 MB on the home screen), whose
+ * 18 MB were cleaned at every frame (docs/metal.md, phase 9). Anything else, shared or writable anywhere, is not.
+ */
+int
+hakios_drm_host_pages_sealed(const void *address, uint64_t size)
+{
+	vm_address_t at = (vm_address_t)address, end = at + size;
+
+	while (at < end) {
+		vm_address_t base = at, extBase = at;
+		vm_size_t length = 0, extLength = 0;
+		vm_region_basic_info_data_64_t basic;
+		vm_region_extended_info_data_t extended;
+		mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64, extCount = VM_REGION_EXTENDED_INFO_COUNT;
+		mach_port_t object = MACH_PORT_NULL, extObject = MACH_PORT_NULL;
+
+		if (vm_region_64(mach_task_self(), &base, &length, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&basic, &count,
+		    &object) != KERN_SUCCESS || base > at ||
+		    vm_region_64(mach_task_self(), &extBase, &extLength, VM_REGION_EXTENDED_INFO, (vm_region_info_t)&extended,
+		    &extCount, &extObject) != KERN_SUCCESS || extBase != base) {
+			return 0;
+		}
+		if (basic.shared || (basic.max_protection & VM_PROT_WRITE) || extended.share_mode != SM_PRIVATE ||
+		    extended.ref_count != 1) {
+			return 0;
+		}
+		at = base + length;
+	}
+	return 1;
 }
 
 /*

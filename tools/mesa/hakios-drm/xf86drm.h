@@ -112,6 +112,9 @@ int hakios_drm_user_memory(int fd, const void *address, uint64_t size, uint32_t 
 /* Not libdrm's: a range of a buffer's lines cleaned and invalidated by the kernel (HakiosMali's request 0x7a), for such a
  * buffer of the process's own cached pages; -1 with errno ENOSYS where the kernel has no such request */
 int hakios_drm_sync(int fd, uint32_t handle, uint64_t offset, uint64_t size);
+/* Not libdrm's: 1 if no processor can write the pages at ADDRESS (SIZE bytes) from now on: each is mapped only here, in
+ * memory nothing else holds, and read-only for good (its maximum protection); their lines then need cleaning only once */
+int hakios_drm_host_pages_sealed(const void *address, uint64_t size);
 /*
  * Not libdrm's: work this process submitted writes the pixels of IOSurface SURFACE, whose buffer the kernel made
  * (drmPrimeFDToHandle): its seed changes, as at a device's write (HakiosMali's request 0x79), for readers in other processes

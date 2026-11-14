@@ -23,6 +23,11 @@ arm64):
     vkFlushMappedMemoryRanges and vkInvalidateMappedMemoryRanges have the kernel clean and invalidate the lines of such
     memory (HakiosMali's request 0x7a, hakios_drm_sync), which metal2vulkan calls around a command buffer's use of it
     (0001, 0008). Memory allocated in that type without an import is the first type's.
+  - Pages of that kind that no processor can write any more (hakios_drm_host_pages_sealed: read-only for good in their
+    maximum protection, private, their memory held by nothing else) are cleaned once, at the import, and their flushes
+    and invalidates are nothing to do after: the GPU sees them read-only too. The window server's decoded images are
+    such pages (9 MB, 6.9 MB and 1.7 MB on the home screen), which were cleaned at every frame, about 180 MB a second
+    idle (scion-kernel docs/metal.md, phase 9).
   - Only where the kernel has request 0x7a (asked once, of no buffer: ENOENT, not ENOSYS). The process cannot keep the
     lines itself at any useful speed: iOS's sys_dcache_flush() is a DSB alone, and its own DC CIVAC traps with the Exynos
     M3s up (xnu patch 1511), at about 0.67 us a line, which is slower than metal2vulkan's copy. On a kernel without the
@@ -123,7 +128,7 @@ Anything refused (VK_ERROR_INVALID_EXTERNAL_HANDLE) metal2vulkan copies, as befo
     if (!(handleType & supported_handle_types)) {
        return panvk_errorf(physical_device, VK_ERROR_FORMAT_NOT_SUPPORTED,
                            "VkExternalMemoryTypeFlagBits(0x%x) unsupported",
-@@ -1671,6 +1717,12 @@
+@@ -1671,6 +1721,12 @@
        features |= VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT |
                    VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
     }
@@ -136,9 +141,25 @@ Anything refused (VK_ERROR_INVALID_EXTERNAL_HANDLE) metal2vulkan copies, as befo
  
     pExternalBufferProperties->externalMemoryProperties =
        (VkExternalMemoryProperties){
+--- a/src/panfrost/vulkan/panvk_device_memory.h
++++ b/src/panfrost/vulkan/panvk_device_memory.h
+@@ -20,6 +20,13 @@
+       void *host;
+    } addr;
+ 
++#ifdef __APPLE__
++   /* imported pages of the process's own that no processor can write any
++    * more (hakios_drm_host_pages_sealed): their lines were cleaned at the
++    * import, and stay clean */
++   bool host_sealed;
++#endif
++
+    struct {
+       /* Don't use this pointer, it's only to have user memory dumped when
+        * PANVK_DEBUG=dump. */
 --- a/src/panfrost/vulkan/panvk_device_memory.c
 +++ b/src/panfrost/vulkan/panvk_device_memory.c
-@@ -13,9 +13,69 @@
+@@ -13,9 +13,72 @@
  
  #include "vk_log.h"
  
@@ -147,7 +168,8 @@ Anything refused (VK_ERROR_INVALID_EXTERNAL_HANDLE) metal2vulkan copies, as befo
 +#include "util/u_atomic.h"
 +#include <unistd.h>  /* getpagesize */
 +#include <xf86drm.h> /* hakios_drm_host_surface_at, hakios_drm_surface,
-+                        hakios_drm_sync (src/hakios-drm) */
++                        hakios_drm_sync, hakios_drm_host_pages_sealed
++                        (src/hakios-drm) */
 +
 +/* Imported pages of the process's own (the cached type), not an IOSurface's:
 + * the Mali does not see them through the processors' caches. */
@@ -185,7 +207,9 @@ Anything refused (VK_ERROR_INVALID_EXTERNAL_HANDLE) metal2vulkan copies, as befo
 +   for (uint32_t i = 0; i < count; i++) {
 +      VK_FROM_HANDLE(panvk_device_memory, mem, ranges[i].memory);
 +
-+      if (mem == NULL || !panvk_memory_host_cached(mem))
++      /* sealed pages: nothing has written them since the import's clean,
++       * and the GPU, which sees them read-only, cannot either */
++      if (mem == NULL || !panvk_memory_host_cached(mem) || mem->host_sealed)
 +         continue;
 +
 +      VkDeviceSize size = vk_device_memory_range(&mem->vk, ranges[i].offset,
@@ -208,7 +232,7 @@ Anything refused (VK_ERROR_INVALID_EXTERNAL_HANDLE) metal2vulkan copies, as befo
     if (!mem->addr.host) {
        void *addr = pan_kmod_bo_mmap(mem->bo, 0, pan_kmod_bo_size(mem->bo),
                                      PROT_READ | PROT_WRITE, MAP_SHARED, NULL);
-@@ -31,6 +91,11 @@
+@@ -31,6 +94,11 @@
  static void
  panvk_memory_munmap(struct panvk_device_memory *mem)
  {
@@ -220,7 +244,7 @@ Anything refused (VK_ERROR_INVALID_EXTERNAL_HANDLE) metal2vulkan copies, as befo
     if (mem->addr.host) {
        ASSERTED int ret =
           os_munmap((void *)mem->addr.host, pan_kmod_bo_size(mem->bo));
-@@ -78,6 +143,15 @@
+@@ -78,6 +146,15 @@
     if (fd_info && !fd_info->handleType)
        fd_info = NULL;
  
@@ -236,7 +260,7 @@ Anything refused (VK_ERROR_INVALID_EXTERNAL_HANDLE) metal2vulkan copies, as befo
     if (fd_info) {
        assert(
           fd_info->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT ||
-@@ -88,6 +162,47 @@
+@@ -88,6 +165,57 @@
           result = panvk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
           goto err_destroy_mem;
        }
@@ -275,6 +299,16 @@ Anything refused (VK_ERROR_INVALID_EXTERNAL_HANDLE) metal2vulkan copies, as befo
 +         mem->bo = pan_kmod_bo_import_user(device->kmod.dev,
 +                                           host_info->pHostPointer,
 +                                           pAllocateInfo->allocationSize);
++         /* Pages no processor can write any more (read-only for good,
++          * mapped only here: CoreAnimation's decoded images) are cleaned
++          * once, now, for what was written before; flushes of them are
++          * then nothing to do (panvk_memory_host_sync). */
++         if (mem->bo && hakios_drm_host_pages_sealed(
++                           host_info->pHostPointer,
++                           pAllocateInfo->allocationSize) &&
++             hakios_drm_sync(device->kmod.dev->fd, pan_kmod_bo_handle(mem->bo),
++                             0, pAllocateInfo->allocationSize) == 0)
++            mem->host_sealed = true;
 +      }
 +      if (!mem->bo) {
 +         result = panvk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
@@ -284,7 +318,7 @@ Anything refused (VK_ERROR_INVALID_EXTERNAL_HANDLE) metal2vulkan copies, as befo
     } else {
        mem->bo = pan_kmod_bo_alloc(device->kmod.dev,
                                    can_be_exported ? NULL : device->kmod.vm,
-@@ -283,6 +398,11 @@
+@@ -283,6 +411,11 @@
  panvk_FlushMappedMemoryRanges(VkDevice _device, uint32_t memoryRangeCount,
                                const VkMappedMemoryRange *pMemoryRanges)
  {
@@ -296,7 +330,7 @@ Anything refused (VK_ERROR_INVALID_EXTERNAL_HANDLE) metal2vulkan copies, as befo
     return VK_SUCCESS;
  }
  
-@@ -290,6 +410,11 @@
+@@ -290,6 +423,11 @@
  panvk_InvalidateMappedMemoryRanges(VkDevice _device, uint32_t memoryRangeCount,
                                     const VkMappedMemoryRange *pMemoryRanges)
  {
@@ -308,7 +342,7 @@ Anything refused (VK_ERROR_INVALID_EXTERNAL_HANDLE) metal2vulkan copies, as befo
     return VK_SUCCESS;
  }
  
-@@ -326,6 +451,32 @@
+@@ -326,6 +464,32 @@
     return VK_SUCCESS;
  }
  
