@@ -185,6 +185,11 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         // A texture over a buffer whose rows lie apart is an image over the bytes, rendered or written too: the window server's padded
         // framebuffers (3048x2032 BGRA8 at 12288-byte rows, int-251) were otherwise copied in and out of a shadow image every pass.
         options.policy.padded_reads = metal2vulkan::device::PaddedReadsPolicy::AliasWrites;
+        // Framebuffer fetch on a device with neither rasterization-order attachment access nor the pixel interlock (PanVK on the
+        // Mali-G72): input attachments, ordered between draws by a barrier and unordered within one draw (tools/metal/m2v/0005), not
+        // refused. Programs written for Apple's GPUs assume the fetch (CoreAnimation's luma_boost_lph), and a full-screen pass that reads
+        // each pixel once reads Metal's value. The compile layer announces the precision note once per pipeline that takes it.
+        options.policy.framebuffer_fetch = metal2vulkan::device::FramebufferFetchPolicy::AcceptUnordered;
         // Every texture given a shadow image is announced with why no image aliases its bytes (`shadow.log`).
         options.announce_each.insert(metal2vulkan_runtime::Degradation::ShadowedTexture);
         let _ = SHADOW_LOG.set(PathBuf::from(cache.to_string_lossy().into_owned()).join("shadow.log"));

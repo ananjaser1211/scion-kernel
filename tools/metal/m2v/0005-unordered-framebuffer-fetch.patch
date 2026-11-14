@@ -1,0 +1,510 @@
+metal2vulkan: framebuffer fetch on a device with neither ordered form, through unordered input attachments (Scion)
+
+Upstream:  metal2vulkan, https://github.com/steelbrain/metal2vulkan, at 720ef1ce9ae2a2068999a8675717418b9416283e, after
+           AdrenoMetal's 16 patches to it and Scion's 0001 to 0004; tools/metal/mk-metal2vulkan.sh applies them in that order,
+           then this.
+Licence:   GPL-2.0-or-later OR LGPL-3.0-or-later, metal2vulkan's (its LICENSE); this patch is a change to it and under the same
+           terms. Nothing of it is in Scion's MIT or APSL files.
+Author:    the HakiOS authors (Scion), 14 November 2026.
+
+Why. CoreAnimation's window server (backboardd, camtl=1) reads its colour attachment in luma_boost_lph ([[color(0)]],
+framebuffer fetch), and programs written for Apple's GPUs assume the fetch. metal2vulkan's fetch is exact through
+rasterization-order input attachments or the pixel interlock; PanVK v6 (the Galaxy S9's Mali-G72) has neither, so the
+pipeline was refused Unsupported(FramebufferFetch) and QuartzCore aborted ("Metal failed to build render pipeline:
+spec=PBGRAXm_TlubA2Xhf_Isrc"). The compile layer already reads such a fetch through input attachments without that order under
+FramebufferFetchPolicy::AcceptUnordered (PrecisionNote::UnorderedFramebufferFetch); the runtime refused every such pipeline.
+
+What.
+- DeviceProfile::framebuffer_fetch(): the policy, public, for the runtime.
+- framebuffer_fetch::unordered_inputs: a device with neither rasterizationOrderColorAttachmentAccess nor the pixel interlock
+  whose profile accepts the unordered form. There every pass reads its colour attachments as input attachments, as on a device
+  with the ordered access (through_inputs: render targets take INPUT_ATTACHMENT usage, image_plan.rs; the subpass references
+  them, render_target.rs), without the rasterization-order flags on the subpass and the pipelines (orders_inputs). The runtime
+  makes the compile layer's unordered pipelines there (ordered() accepts them); elsewhere it still refuses them.
+- Between draws: the draws' subpass already depends on itself, by region, from colour attachment writes to input attachment
+  reads (DRAWS_SELF_DEPENDENCY). A draw that reads input attachments without rasterization order records a barrier of that
+  whole dependency first wherever an earlier draw of its render pass instance wrote a colour since the last such barrier
+  (render.rs: InterlockedStorage::attachments, DrawBarrier; the pending draw's barrier too, render/pending.rs). So a fetch
+  reads every earlier draw's value at its pixel, as Metal's does. A pass's first instance whose colour loads by a clear counts
+  the clear as such a write: PanVK reads an input attachment through memory, which the clear reaches only when a barrier ends
+  the tile's work (with Scion's tools/mesa/panvk/panvk-barrier-clears.patch, which keeps the clear at such a barrier).
+- Within one draw the fetch stays unordered: a fragment may read its pixel as it was before the same draw's earlier fragments
+  there. A draw that reads each pixel once (a full-screen pass, CoreAnimation's luma boost) reads Metal's value. The compile
+  layer's precision note announces it once.
+- A BGR10_XR attachment that renders through the unorm view of its word (0004) is not read so: the input attachment would read
+  the view's codes, not the raw texel the read decodes. Refused NotImplemented(FramebufferFetch) at that attachment.
+- ProgrammableBlending (the family feature) stays refused without rasterization-order access.
+
+The policy is the caller's: Scion's bridge (tools/metal/bridge, nmb_device_open) passes AcceptUnordered. Under the default
+RequireOrdered nothing changes.
+
+Checked on the phone (PanVK on the Mali-G72): metal_tri --fetch (tools/metal/air/tri_fetch.ll, the corners' mix over 2 plus
+[[color(0)]] over 2, drawn twice into a cleared BGRA8 target, a texture and a texture over an IOSurface): every pixel inside
+within 0.9/255 of 3/4 mix + 1/4 clear, every pixel outside the clear exactly, at 256 and 1024 pixels square, five runs of five.
+Before PanVK's barrier fix the first draw read zeros instead of the clear; before the barrier the pipeline was refused.
+metal_tri plain and --xr none, over, add pass as before.
+
+diff --git a/crates/metal2vulkan-runtime/src/families/features.rs b/crates/metal2vulkan-runtime/src/families/features.rs
+index b63c88dc..d961452c 100644
+--- a/crates/metal2vulkan-runtime/src/families/features.rs
++++ b/crates/metal2vulkan-runtime/src/families/features.rs
+@@ -32,7 +32,7 @@ use super::formats::{FormatRow, Missing};
+ use super::{Column, Facts, FormatCapability, Framework, Refusal, RowState};
+ use crate::capabilities::Query;
+ use crate::error::RuntimeGap;
+-use crate::framebuffer_fetch::through_inputs;
++use crate::framebuffer_fetch::orders_inputs;
+ use crate::rate_mapped_pass::RegionRefusal;
+ use metal2vulkan::device::{OpBits, StageSimd, SubgroupOp, VkExtension, VkFeature, VkProperty};
+ use metal2vulkan::error::{Capability, Feature, LowerFamily, Unsupported};
+@@ -1002,8 +1002,9 @@ impl FeatureRow {
+             // Framebuffer fetch (the compile layer's color inputs, the runtime's
+             // `framebuffer_fetch`): exact through input attachments in rasterization order. The
+             // pixel interlock's storage form keeps no blended or sRGB fetched attachment exact
+-            // (`lower::fragment::fetch`).
+-            F::ProgrammableBlending => first([(!through_inputs(f.profile)).then(|| {
++            // (`lower::fragment::fetch`), and unordered input attachments miss Metal's order
++            // within a draw (`framebuffer_fetch::unordered_inputs`).
++            F::ProgrammableBlending => first([(!orders_inputs(f.profile)).then(|| {
+                 refused(Unsupported::needs(
+                     Feature::FramebufferFetch,
+                     Capability::Feature(VkFeature::RasterizationOrderColorAttachmentAccess),
+diff --git a/crates/metal2vulkan-runtime/src/framebuffer_fetch.rs b/crates/metal2vulkan-runtime/src/framebuffer_fetch.rs
+index 17b87a84..3b913bb3 100644
+--- a/crates/metal2vulkan-runtime/src/framebuffer_fetch.rs
++++ b/crates/metal2vulkan-runtime/src/framebuffer_fetch.rs
+@@ -14,8 +14,22 @@
+ //! `DeviceOptions::policy`, the compile layer also emits input attachments without that access
+ //! where neither form is open to the pipeline (a device with neither feature, or a pipeline
+ //! state the storage form cannot keep exact, such as a blending fetched attachment), recording
+-//! `PrecisionNote::UnorderedFramebufferFetch`. The runtime runs only the ordered forms, which
+-//! are Metal's, so it refuses such a pipeline where it makes it ([`ordered`]).
++//! `PrecisionNote::UnorderedFramebufferFetch`. The runtime runs the ordered forms, which are
++//! Metal's, and the unordered one only on a device that has neither feature and whose profile
++//! asks for it ([`unordered_inputs`]); elsewhere it refuses such a pipeline where it makes it
++//! ([`ordered`]).
++//!
++//! **Unordered input attachments** ([`unordered_inputs`]: no rasterization-order access, no pixel
++//! interlock, `AcceptUnordered`; PanVK on a Mali-G72). The passes are the input attachment form's
++//! below, without the rasterization-order flags on the subpass and the pipelines. The draws'
++//! subpass depends on itself from the color attachments' writes to the input attachments' reads
++//! (`render_target::DRAWS_SELF_DEPENDENCY`), and a draw that reads input attachments records after
++//! a by-region barrier of that dependency wherever an earlier draw of its render pass instance
++//! wrote since the last one (`render.rs`'s `InterlockedStorage::attachments`): a fetch reads what
++//! every earlier draw wrote at its pixel, as Metal's does. Only the overlapping fragments of one
++//! draw are unordered: a fetch may read the pixel as it was before the draw's own earlier
++//! fragments there. A draw that reads each pixel once (a full-screen pass, CoreAnimation's) reads
++//! Metal's value; the compile layer's precision note announces the rest once.
+ //!
+ //! The input attachment form ([`through_inputs`]): a pass cannot foresee which of its draws
+ //! fetch, so on such a device every color render target is also an input attachment
+@@ -86,7 +100,7 @@ use super::error::Error;
+ use super::image_plan::ImagePlan;
+ use super::Device;
+ use metal2vulkan::bind::PlanesCopy;
+-use metal2vulkan::device::{DeviceProfile, FormatUsage, VkFeature, VkProperty};
++use metal2vulkan::device::{DeviceProfile, FormatUsage, FramebufferFetchPolicy, VkFeature, VkProperty};
+ use metal2vulkan::error::{Capability, Feature, Unsupported};
+ use metal2vulkan::metal::TextureType;
+ use metal2vulkan::pipeline::{GraphicsState, StorageAttachmentUse};
+@@ -94,12 +108,30 @@ use metal2vulkan::vk::{Format, ImageCreateFlags, ImageUsageFlags};
+ use std::collections::VecDeque;
+ 
+ /// Whether the compile layer reads `profile`'s fetched color attachments as input attachments
+-/// in rasterization order (`lower::fragment::fetch`): where the device has
+-/// `rasterizationOrderColorAttachmentAccess`.
++/// (`lower::fragment::fetch`): in rasterization order ([`orders_inputs`]), or unordered between
++/// a draw's own fragments ([`unordered_inputs`]). Every pass of such a device reads its color
++/// attachments as input attachments.
+ pub(crate) fn through_inputs(profile: &DeviceProfile) -> bool {
++    orders_inputs(profile) || unordered_inputs(profile)
++}
++
++/// Whether `profile`'s input attachment reads are in rasterization order: where the device has
++/// `rasterizationOrderColorAttachmentAccess`, which the subpass and its pipelines then state.
++pub(crate) fn orders_inputs(profile: &DeviceProfile) -> bool {
+     profile.fragment().rasterization_order_color_access
+ }
+ 
++/// Whether the compile layer reads `profile`'s fetched color attachments as input attachments
++/// without rasterization order (the module docs): a device with neither
++/// `rasterizationOrderColorAttachmentAccess` nor `fragmentShaderPixelInterlock`, whose profile
++/// accepts the unordered form (`FramebufferFetchPolicy::AcceptUnordered`).
++pub(crate) fn unordered_inputs(profile: &DeviceProfile) -> bool {
++    let fragment = profile.fragment();
++    !fragment.rasterization_order_color_access
++        && !fragment.pixel_interlock
++        && profile.framebuffer_fetch() == FramebufferFetchPolicy::AcceptUnordered
++}
++
+ /// Whether the compile layer reads `profile`'s fetched color attachments as storage images in the
+ /// ordered pixel interlock (`lower::fragment::fetch`): where it has `fragmentShaderPixelInterlock`
+ /// without rasterization-order color attachment access.
+@@ -344,11 +376,15 @@ impl Device {
+ }
+ 
+ /// Refuse a pipeline of `graphics` whose framebuffer fetch the compile layer left unordered:
+-/// input attachments without rasterization-order attachment access. The refusal names that
+-/// access, with which the compile layer orders every fetch; compiling under `RequireOrdered`
+-/// names each alternative the device lacks.
+-pub(crate) fn ordered(graphics: &GraphicsState) -> Result<(), Error> {
+-    if graphics.input_attachments.is_empty() || graphics.rasterization_order_attachment_access {
++/// input attachments without rasterization-order attachment access, but on a device of
++/// `profile` that runs that form ([`unordered_inputs`]). The refusal names that access, with
++/// which the compile layer orders every fetch; compiling under `RequireOrdered` names each
++/// alternative the device lacks.
++pub(crate) fn ordered(graphics: &GraphicsState, profile: &DeviceProfile) -> Result<(), Error> {
++    if graphics.input_attachments.is_empty()
++        || graphics.rasterization_order_attachment_access
++        || unordered_inputs(profile)
++    {
+         return Ok(());
+     }
+     Err(Error::Unsupported(Unsupported::needs(
+diff --git a/crates/metal2vulkan-runtime/src/pipeline/graphics.rs b/crates/metal2vulkan-runtime/src/pipeline/graphics.rs
+index c5e5f46c..d2fbb75a 100644
+--- a/crates/metal2vulkan-runtime/src/pipeline/graphics.rs
++++ b/crates/metal2vulkan-runtime/src/pipeline/graphics.rs
+@@ -22,6 +22,7 @@ use super::libraries::{Linked, Part};
+ use super::objects::{RawPipeline, VariantObjects};
+ use crate::degradation::BoundFormats;
+ use crate::error::{internal, vulkan, Error};
++use crate::framebuffer_fetch;
+ use crate::render_target::{PassShape, RenderPassObject};
+ use crate::shader_cache::driver::Making;
+ use crate::shader_cache::REPORTED_STAGES;
+@@ -810,13 +811,15 @@ impl VariantObjects {
+             .collect();
+         // In a pass whose draws fetch through input attachments every pipeline orders its color
+         // attachment accesses by rasterization (`framebuffer_fetch.rs`), so a fetch reads what an
+-        // earlier fragment of any pipeline wrote.
++        // earlier fragment of any pipeline wrote. On a device whose input attachments are
++        // unordered no pipeline states an order (`framebuffer_fetch::unordered_inputs`).
+         if graphics.rasterization_order_attachment_access && !key.pass.fetch_inputs {
+             return Err(internal(
+                 "a pipeline fetching in rasterization order outside a pass that does",
+             ));
+         }
+-        let blend_flags = match key.pass.fetch_inputs {
++        let ordered = framebuffer_fetch::orders_inputs(self.device.compile_device().profile());
++        let blend_flags = match key.pass.fetch_inputs && ordered {
+             true => {
+                 vk::PipelineColorBlendStateCreateFlags::RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXT
+             }
+diff --git a/crates/metal2vulkan-runtime/src/pipeline/render.rs b/crates/metal2vulkan-runtime/src/pipeline/render.rs
+index c6879801..6c4eae41 100644
+--- a/crates/metal2vulkan-runtime/src/pipeline/render.rs
++++ b/crates/metal2vulkan-runtime/src/pipeline/render.rs
+@@ -2150,7 +2150,7 @@ impl RenderVariant {
+             }
+             Remembered::Compiled(pipeline) => pipeline,
+         };
+-        framebuffer_fetch::ordered(&pipeline.graphics)?;
++        framebuffer_fetch::ordered(&pipeline.graphics, device.compile_device().profile())?;
+         // Before the variant's shader modules, whose creation the layer reports.
+         device.degrade_requirements(&pipeline.requirements, Occurrence::Made);
+         // Where the creation log is on, the stages' SPIR-V it names hashed on a thread of its
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+index 5cd377c9..ab871549 100644
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -659,6 +659,13 @@ impl DrawStates {
+ /// earlier one's writes (for the imageblock and for a color, with a synthetic repro). No device is
+ /// measured to order them, so every device takes the barrier. Another kind of storage a draw reads
+ /// and writes inside the interlock joins as a field here and in [`InterlockedStorage::of`].
++///
++/// One kind is not the interlock's: the color attachments read as input attachments without
++/// rasterization order (`attachments`, `framebuffer_fetch::unordered_inputs`). Nothing orders a
++/// draw's input attachment reads after an earlier draw's color attachment writes there, so a draw
++/// that reads them after one wrote records after the barrier of the draws' subpass's whole
++/// dependency on itself (`render_target::between_draws`), which holds the storage barrier's
++/// scopes too.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ struct InterlockedStorage {
+     /// The pass's fragment imageblock storage (`fragment_imageblock.rs`).
+@@ -668,6 +675,9 @@ struct InterlockedStorage {
+     /// The depth's stand-in, which a draw that tests the depth in the shader reads and may write
+     /// (`depth_stand_in.rs`).
+     depth: bool,
++    /// The color attachments: read as input attachments without rasterization order, written as
++    /// attachments by any draw that writes a color.
++    attachments: bool,
+ }
+ 
+ impl InterlockedStorage {
+@@ -675,6 +685,7 @@ impl InterlockedStorage {
+         imageblock: false,
+         colors: false,
+         depth: false,
++        attachments: false,
+     };
+ 
+     /// Every kind: what an execution of render commands, or the encoder's draws before it, may
+@@ -683,11 +694,34 @@ impl InterlockedStorage {
+         imageblock: true,
+         colors: true,
+         depth: true,
++        attachments: true,
+     };
+ 
++    /// What `layout`'s first instance holds written before its first draw on `device`: the color
++    /// attachments, where one loads by a clear and the device reads them as input attachments
++    /// without rasterization order (`framebuffer_fetch::unordered_inputs`). Such a device (PanVK on
++    /// a Mali-G72) reads an input attachment through memory, which the clear reaches only when a
++    /// barrier ends the work on the tile, so the first fetching draw records after the barrier as
++    /// after a draw (a by-region barrier of the draws' subpass's dependency on itself, valid
++    /// there whatever the device).
++    fn cleared(layout: &PassLayout, device: &super::Device) -> Self {
++        let cleared = layout
++            .colors
++            .iter()
++            .flatten()
++            .any(|color| color.load == LoadAction::Clear);
++        let unordered = framebuffer_fetch::unordered_inputs(device.compile_device().profile());
++        Self {
++            attachments: cleared && unordered && layout.fetch_inputs,
++            ..Self::NONE
++        }
++    }
++
+     /// What a draw of `graphics` whose colors in the interlocked storage form are `storage`
+     /// reaches, and what it writes. A draw that reaches the imageblock may write it, and one that
+-    /// tests the depth in the shader may write the depth's stand-in.
++    /// tests the depth in the shader may write the depth's stand-in. A draw reaches the color
++    /// attachments where it reads input attachments without rasterization order, and writes them
++    /// where it rasterizes and its fragment function writes a color.
+     fn of(graphics: &GraphicsState, storage: &[StorageAttachmentUse]) -> (Self, Self) {
+         let imageblock = graphics.fragment_imageblock.is_some();
+         let depth = graphics.shader_tests.is_some();
+@@ -695,11 +729,14 @@ impl InterlockedStorage {
+             imageblock,
+             colors: !storage.is_empty(),
+             depth,
++            attachments: !graphics.input_attachments.is_empty()
++                && !graphics.rasterization_order_attachment_access,
+         };
+         let writes = Self {
+             imageblock,
+             colors: storage.iter().any(|s| s.writes),
+             depth,
++            attachments: !graphics.rasterizer_discard && graphics.color_outputs != 0,
+         };
+         (reaches, writes)
+     }
+@@ -709,6 +746,18 @@ impl InterlockedStorage {
+         (self.imageblock && other.imageblock)
+             || (self.colors && other.colors)
+             || (self.depth && other.depth)
++            || (self.attachments && other.attachments)
++    }
++
++    /// The barrier a draw that reaches `self` records first after its instance's draws wrote
++    /// `written`: none where no kind meets; the draws' subpass's whole dependency on itself where
++    /// the color attachments meet; else the storage barrier.
++    fn barrier(self, written: Self) -> Option<DrawBarrier> {
++        match (self.meets(written), self.attachments && written.attachments) {
++            (false, _) => None,
++            (true, true) => Some(DrawBarrier::Attachments),
++            (true, false) => Some(DrawBarrier::Storage),
++        }
+     }
+ 
+     /// The kinds of either.
+@@ -717,6 +766,35 @@ impl InterlockedStorage {
+             imageblock: self.imageblock || other.imageblock,
+             colors: self.colors || other.colors,
+             depth: self.depth || other.depth,
++            attachments: self.attachments || other.attachments,
++        }
++    }
++}
++
++/// The barrier a draw records first, inside its render pass instance ([`InterlockedStorage`]).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(super) enum DrawBarrier {
++    /// From the fragment shader's storage writes (`render_target::between_storage_draws`).
++    Storage,
++    /// The draws' subpass's whole dependency on itself, color attachment writes to input
++    /// attachment reads among it (`render_target::between_draws`).
++    Attachments,
++}
++
++impl DrawBarrier {
++    /// Record it into `draws`, a secondary command buffer of an instance whose subpasses have
++    /// `view_mask`.
++    ///
++    /// # Safety
++    ///
++    /// As `render_target::between_draws`'s.
++    pub(super) unsafe fn record(self, raw: &ash::Device, draws: vk::CommandBuffer, view_mask: u32) {
++        // SAFETY: the caller's contract.
++        unsafe {
++            match self {
++                DrawBarrier::Storage => render_target::between_storage_draws(raw, draws, view_mask),
++                DrawBarrier::Attachments => render_target::between_draws(raw, draws, view_mask),
++            }
+         }
+     }
+ }
+@@ -1320,7 +1398,7 @@ impl CommandBuffer {
+                 shadow: false,
+                 shader_tests: false,
+                 imageblock: false,
+-                interlocked_writes: InterlockedStorage::NONE,
++                interlocked_writes: InterlockedStorage::cleared(&layout, device),
+                 tile_memory: false,
+                 views: ViewSetup::default(),
+                 pieces: Vec::new(),
+@@ -7076,15 +7154,17 @@ impl RenderCommandEncoder {
+             // A draw that reaches interlocked storage an earlier draw of the instance wrote, the
+             // imageblock's, a color's or the depth's stand-in, records after the barrier
+             // (`InterlockedStorage`).
+-            let after_writes = interlocked.meets(self.current.interlocked_writes);
++            // So does one that reads input attachments without rasterization order after an
++            // earlier draw of the instance wrote a color (`InterlockedStorage::attachments`).
++            let barrier = interlocked.barrier(self.current.interlocked_writes);
+             let mut storage_barrier = None;
+-            if after_writes {
++            if let Some(barrier) = barrier {
+                 match pending {
+-                    Some(_) => storage_barrier = Some(self.current.shape.view_mask),
++                    Some(_) => storage_barrier = Some((barrier, self.current.shape.view_mask)),
+                     // SAFETY: the secondary command buffer is recording inside the compatible
+                     // pass, which `render_target` made, and only this encoder records it.
+                     None => unsafe {
+-                        render_target::between_storage_draws(
++                        barrier.record(
+                             device.shared().vk(),
+                             self.current.draws,
+                             self.current.shape.view_mask,
+@@ -7095,10 +7175,16 @@ impl RenderCommandEncoder {
+             if imageblock_use.is_some() {
+                 self.current.imageblock = true;
+             }
+-            // The barrier orders every earlier storage write of the instance before the draw.
+-            self.current.interlocked_writes = match after_writes {
+-                true => interlocked_writes,
+-                false => interlocked_writes.or(self.current.interlocked_writes),
++            // The barrier orders every earlier storage write of the instance before the draw, and
++            // the whole one every earlier color attachment write too.
++            let written = self.current.interlocked_writes;
++            self.current.interlocked_writes = match barrier {
++                Some(DrawBarrier::Attachments) => interlocked_writes,
++                Some(DrawBarrier::Storage) => interlocked_writes.or(InterlockedStorage {
++                    attachments: written.attachments,
++                    ..InterlockedStorage::NONE
++                }),
++                None => interlocked_writes.or(written),
+             };
+             if resumed.is_some() {
+                 self.visibility
+diff --git a/crates/metal2vulkan-runtime/src/render/pending.rs b/crates/metal2vulkan-runtime/src/render/pending.rs
+index 62335bfd..cc62955c 100644
+--- a/crates/metal2vulkan-runtime/src/render/pending.rs
++++ b/crates/metal2vulkan-runtime/src/render/pending.rs
+@@ -37,7 +37,6 @@ use crate::draw_source::IndexBind;
+ use crate::dynamic_state::ExtendedDynamicState;
+ use crate::error::{vulkan, Error, FailedPipeline, FailedState};
+ use crate::pipeline::{Pending, RawPipeline, RenderPipelineState};
+-use crate::render_target;
+ use crate::visibility::Lent;
+ use ash::vk;
+ use metal2vulkan::cache::VariantKey;
+@@ -76,9 +75,8 @@ pub(super) struct PendingDraw {
+     pub(super) draw: usize,
+     pub(super) variant: VariantKey,
+     pub(super) specialization: Vec<(SpecKey, u64)>,
+-    /// The view mask of the storage barrier it records first
+-    /// (`render_target::between_storage_draws`), where it has one.
+-    pub(super) storage_barrier: Option<u32>,
++    /// The barrier it records first and its view mask (`DrawBarrier`), where it has one.
++    pub(super) storage_barrier: Option<(super::DrawBarrier, u32)>,
+     /// The visibility query it counts in.
+     pub(super) query: Option<Lent>,
+     pub(super) recordings: Vec<OwnedRecording>,
+@@ -147,8 +145,8 @@ impl PendingDraw {
+         // instance, valid in the pass's subpass; the lent query is a continuation of the offset
+         // the encoder's draws count in, with none active in this secondary before it.
+         unsafe {
+-            if let Some(view_mask) = self.storage_barrier {
+-                render_target::between_storage_draws(raw, cb, view_mask);
++            if let Some((barrier, view_mask)) = self.storage_barrier {
++                barrier.record(raw, cb, view_mask);
+             }
+             if let Some(query) = &self.query {
+                 query.begin(raw, cb);
+diff --git a/crates/metal2vulkan-runtime/src/render_target.rs b/crates/metal2vulkan-runtime/src/render_target.rs
+index 4018d060..c1c6f528 100644
+--- a/crates/metal2vulkan-runtime/src/render_target.rs
++++ b/crates/metal2vulkan-runtime/src/render_target.rs
+@@ -1271,9 +1271,15 @@ fn create(
+     }
+     let mut draws = graphics().color_attachments(&references);
+     if shape.fetch_inputs {
+-        draws = draws
+-            .input_attachments(&inputs)
+-            .flags(vk::SubpassDescriptionFlags::RASTERIZATION_ORDER_ATTACHMENT_COLOR_ACCESS_EXT);
++        draws = draws.input_attachments(&inputs);
++        // In rasterization order where the device orders the reads so; elsewhere they are
++        // unordered within a draw and ordered across draws by the self-dependency's barrier
++        // (`framebuffer_fetch::unordered_inputs`).
++        if framebuffer_fetch::orders_inputs(device.compile_device().profile()) {
++            draws = draws.flags(
++                vk::SubpassDescriptionFlags::RASTERIZATION_ORDER_ATTACHMENT_COLOR_ACCESS_EXT,
++            );
++        }
+     }
+     if resolve_references
+         .iter()
+diff --git a/crates/metal2vulkan/src/device/profile.rs b/crates/metal2vulkan/src/device/profile.rs
+index 2684ba6b..ac0d9970 100644
+--- a/crates/metal2vulkan/src/device/profile.rs
++++ b/crates/metal2vulkan/src/device/profile.rs
+@@ -80,6 +80,13 @@ impl DeviceProfile {
+         &self.fields.fragment
+     }
+ 
++    /// The framebuffer-fetch ordering policy the profile was built with
++    /// (`DevicePolicy::framebuffer_fetch`): whether a fetch no ordered form serves on the device
++    /// is refused or read unordered.
++    pub fn framebuffer_fetch(&self) -> FramebufferFetchPolicy {
++        self.fields.framebuffer_fetch
++    }
++
+     /// The image and sampler capabilities the profile enables.
+     pub fn images(&self) -> &ImageCaps {
+         &self.fields.images
+diff --git a/crates/metal2vulkan/src/lower/fragment/color.rs b/crates/metal2vulkan/src/lower/fragment/color.rs
+index 66e4674b..84f413fc 100644
+--- a/crates/metal2vulkan/src/lower/fragment/color.rs
++++ b/crates/metal2vulkan/src/lower/fragment/color.rs
+@@ -71,7 +71,8 @@ use crate::lower::arith::legal::{form_on, refuse_int64_interface};
+ use crate::lower::arith::{extended_range, math, narrow, ops, srgb, Form, Held};
+ use crate::lower::emit::EmitCx;
+ use crate::lower::select::SelectCx;
+-use crate::metal::format::ExtendedRange;
++use crate::metal::format::{unorm_codes_view, ExtendedRange};
++use crate::metal::PixelFormat;
+ use crate::pipeline::artifact::PrecisionNote;
+ use crate::pipeline::facts::RuntimeFact;
+ use crate::pipeline::sym::{ResourceKind, ResourceSlot, Stage};
+@@ -168,6 +169,19 @@ pub(super) fn select_param(cx: &mut SelectCx<'_>, b: &ParamBinding) -> Result<Co
+     if !frag.rasterization_order_color_access {
+         match cx.profile.fields().framebuffer_fetch {
+             FramebufferFetchPolicy::AcceptUnordered => {
++                // A `BGR10_XR` attachment that renders through the unsigned normalized view of
++                // its word (`metal::format::unorm_codes_view`, a device that orders no fetch)
++                // would be read there as the view's codes, not as the raw texel this read
++                // decodes: not built.
++                let pf = match extended.map(|e| e.form) {
++                    Some(ExtendedRange::Bgr10 { srgb: false }) => Some(PixelFormat::BGR10XR),
++                    Some(ExtendedRange::Bgr10 { srgb: true }) => Some(PixelFormat::BGR10XRSRGB),
++                    _ => None,
++                };
++                if pf.is_some_and(|pf| unorm_codes_view(pf, cx.profile).is_some()) {
++                    let refused = Unsupported::not_implemented(Feature::FramebufferFetch);
++                    return Err(refused.at_attachment(Attachment::Color(color)).into());
++                }
+                 cx.precision
+                     .insert(PrecisionNote::UnorderedFramebufferFetch);
+             }
