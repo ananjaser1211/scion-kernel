@@ -831,3 +831,12 @@ GLES (today `camtl=1` is needed); and the plug-in opens the device at once in ba
 the window server uses it within a second anyway) and answers nil when it cannot, so that CoreAnimation takes its GLES path: today
 a device that fails to open answers nil from its first use on, after CoreAnimation has chosen Metal, and backboardd ends (seen
 here with a driver path the plug-in refused). The clients file keeps its `-backboardd` line as the switch back without a new image.
+
+### On the phone, build 59 (userland at 66531a0, kernel as build 58)
+
+- `metal_tri` passes; backboardd on Metal draws the home screen correctly; no crash reports.
+- backboardd, six swipes: CPU 18–86%, idle after 18–31%, RSS 74–76 MB (build 58: 24–80%, 27–33%, 79–86 MB).
+- Commit to completion still about 20 ms on average (214 ms slowest, at start-up): the wallpaper's YCbCr conversion
+  every frame is the larger share and is not fixed yet. No copies of no-copy buffers.
+- `shadow.log` is written now: 16 small textures over no-copy buffers (A8Unorm and RGBA8Unorm, rows padded to
+  the caller's) still go through a shadow image.
