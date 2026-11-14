@@ -1,0 +1,207 @@
+panvk: constant arrays a shader indexes are its constant data (nir_opt_large_constants), not thread-local storage
+
+Applied by tools/mk-panvk.sh only, after panvk-host-memory.patch, to Mesa 25.0.7 (Mesa's own licence, MIT, applies to the
+lines it adds). Written for Scion.
+
+Why. A constant array that a shader indexes with a value it computes (a noise function's permutation table, say) stays a
+function-temporary variable through PanVK's lowering, and pan_shader_preprocess() (bifrost_preprocess_nir) puts every such
+array of more than 256 bytes in thread-local storage: each invocation first stores the whole array there, then reads the
+few words it needs. The Astronomy wallpaper's fragment shaders (NanoUniverse's aegir_*_fsh, which AegirPoster draws with)
+each build a 4 KiB table so, 256 vec4 stores a pixel: 2304 store_scratch in one frame's shaders, 294 load/store cycles
+a pixel by BIFROST_MESA_DEBUG=shaderdb. A frame of the Earth took about 20 s at 1170x2532, and its fragment job was
+killed by HakiosMali at its 1 s limit (status 0x8), which reset the GPU for every client (scion-kernel docs/metal.md,
+phases 7 to 9).
+
+What. nir_opt_large_constants moves arrays that are only ever written with constants into the shader's constant data
+(nir_shader::constant_data), after nir_lower_global_vars_to_local and before pan_shader_preprocess(), and each
+load_constant becomes a load_global_constant at that data's address, which the shader reads as a sysval
+(panvk_{graphics,compute}_sysvals::const_data). The data is uploaded beside the binary (panvk_shader::const_data_mem) and
+serialized with it; the sysval is set to the bound shader's address as its push uniforms are made, so the vertex and
+fragment shaders of a draw each get their own. With it, no store_scratch is left in those shaders, the load/store cycles
+are 10 to 108 a pixel, and the Earth's frame takes 0.7 s at 1170x2532 (the rest of the scene 70 ms).
+
+--- a/src/panfrost/vulkan/panvk_shader.h
++++ b/src/panfrost/vulkan/panvk_shader.h
+@@ -77,6 +77,10 @@
+ 
+    aligned_u64 push_consts;
+ 
++   /* the bound shader's constant data (panvk_shader::const_data_mem), set
++    * for each shader as its push uniforms are made */
++   aligned_u64 const_data;
++
+ #if PAN_ARCH <= 7
+    /* gl_Layer on Bifrost is a bit of hack. We have to issue one draw per
+     * layer, and filter primitives at the VS level.
+@@ -113,6 +117,9 @@
+ 
+    aligned_u64 push_consts;
+ 
++   /* the bound shader's constant data (panvk_shader::const_data_mem) */
++   aligned_u64 const_data;
++
+ #if PAN_ARCH <= 7
+    struct {
+       aligned_u64 sets[PANVK_DESC_TABLE_COMPUTE_COUNT];
+@@ -288,6 +295,13 @@
+ 
+    struct panvk_priv_mem code_mem;
+ 
++   /* Constant arrays the shader indexes (nir_opt_large_constants), read
++    * through the const_data sysval, not built in thread-local storage by
++    * every invocation. */
++   const void *const_data_ptr;
++   uint32_t const_data_size;
++   struct panvk_priv_mem const_data_mem;
++
+ #if PAN_ARCH <= 7
+    struct panvk_priv_mem rsd;
+ #else
+--- a/src/panfrost/vulkan/panvk_vX_cmd_push_constant.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_push_constant.c
+@@ -54,6 +54,14 @@
+          push_uniforms.gpu + (shader->fau.sysval_count * FAU_WORD_SIZE);
+    }
+ 
++   /* the constant data is the shader's own: set as its words are packed */
++   if (shader->vk.stage == MESA_SHADER_COMPUTE)
++      cmdbuf->state.compute.sysvals.const_data =
++         panvk_priv_mem_dev_addr(shader->const_data_mem);
++   else
++      cmdbuf->state.gfx.sysvals.const_data =
++         panvk_priv_mem_dev_addr(shader->const_data_mem);
++
+    uint64_t *sysvals = shader->vk.stage == MESA_SHADER_COMPUTE
+                           ? (uint64_t *)&cmdbuf->state.compute.sysvals
+                           : (uint64_t *)&cmdbuf->state.gfx.sysvals;
+--- a/src/panfrost/vulkan/panvk_vX_shader.c
++++ b/src/panfrost/vulkan/panvk_vX_shader.c
+@@ -621,6 +621,32 @@
+             nir_metadata_control_flow, shader);
+ }
+ 
++/* load_constant (nir_opt_large_constants) as a load from the shader's constant
++ * data, whose address is a sysval */
++static bool
++lower_load_constant(struct nir_builder *b, nir_intrinsic_instr *intr,
++                    UNUSED void *data)
++{
++   if (intr->intrinsic != nir_intrinsic_load_constant)
++      return false;
++
++   b->cursor = nir_before_instr(&intr->instr);
++
++   nir_def *base = b->shader->info.stage == MESA_SHADER_COMPUTE
++                      ? load_sysval(b, compute, 64, const_data)
++                      : load_sysval(b, graphics, 64, const_data);
++   nir_def *offset =
++      nir_iadd_imm(b, intr->src[0].ssa, nir_intrinsic_base(intr));
++   unsigned align = nir_combined_align(nir_intrinsic_align_mul(intr),
++                                       nir_intrinsic_align_offset(intr));
++   nir_def *value = nir_load_global_constant(
++      b, nir_iadd(b, base, nir_u2u64(b, offset)), align,
++      intr->def.num_components, intr->def.bit_size);
++
++   nir_def_replace(&intr->def, value);
++   return true;
++}
++
+ static void
+ panvk_lower_nir(struct panvk_device *dev, nir_shader *nir,
+                 uint32_t set_layout_count,
+@@ -732,6 +758,16 @@
+     */
+    NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+ 
++   /* Constant arrays the shader indexes go to its constant data, and are
++    * read from there: otherwise pan_shader_preprocess() puts each one in
++    * thread-local storage, which every invocation fills before it reads a
++    * word of it (4 KiB a pixel in the Astronomy wallpaper's shaders). */
++   NIR_PASS(_, nir, nir_opt_large_constants, glsl_get_natural_size_align_bytes,
++            16);
++   if (nir->constant_data_size > 0)
++      NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_load_constant,
++               nir_metadata_control_flow, NULL);
++
+    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+    if (unlikely(instance->debug_flags & PANVK_DEBUG_NIR)) {
+       fprintf(stderr, "translated nir:\n");
+@@ -791,6 +827,20 @@
+    }
+    util_dynarray_fini(&binary);
+ 
++   shader->const_data_size = 0;
++   shader->const_data_ptr = NULL;
++
++   if (nir->constant_data_size) {
++      void *data = malloc(nir->constant_data_size);
++
++      if (data == NULL)
++         return panvk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++      memcpy(data, nir->constant_data, nir->constant_data_size);
++      shader->const_data_size = nir->constant_data_size;
++      shader->const_data_ptr = data;
++   }
++
+    if (dump_asm) {
+       shader->nir_str = nir_shader_as_str(nir, NULL);
+ 
+@@ -900,6 +950,14 @@
+    if (!panvk_priv_mem_dev_addr(shader->code_mem))
+       return panvk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+ 
++   if (shader->const_data_size) {
++      shader->const_data_mem = panvk_pool_upload_aligned(
++         &dev->mempools.rw, shader->const_data_ptr, shader->const_data_size,
++         16);
++      if (!panvk_priv_mem_dev_addr(shader->const_data_mem))
++         return panvk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++   }
++
+ #if PAN_ARCH <= 7
+    if (shader->info.stage == MESA_SHADER_FRAGMENT)
+       return VK_SUCCESS;
+@@ -1008,6 +1066,7 @@
+    ralloc_free((void *)shader->nir_str);
+ 
+    panvk_pool_free_mem(&shader->code_mem);
++   panvk_pool_free_mem(&shader->const_data_mem);
+ 
+ #if PAN_ARCH <= 7
+    panvk_pool_free_mem(&shader->rsd);
+@@ -1023,6 +1082,7 @@
+ #endif
+ 
+    free((void *)shader->bin_ptr);
++   free((void *)shader->const_data_ptr);
+    vk_shader_free(&dev->vk, pAllocator, &shader->vk);
+ }
+ 
+@@ -1240,6 +1300,17 @@
+ 
+    blob_copy_bytes(blob, (void *)shader->bin_ptr, shader->bin_size);
+ 
++   shader->const_data_size = blob_read_uint32(blob);
++   if (shader->const_data_size && !blob->overrun) {
++      shader->const_data_ptr = malloc(shader->const_data_size);
++      if (shader->const_data_ptr == NULL) {
++         panvk_shader_destroy(vk_dev, &shader->vk, pAllocator);
++         return panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
++      }
++      blob_copy_bytes(blob, (void *)shader->const_data_ptr,
++                      shader->const_data_size);
++   }
++
+    result = shader_desc_info_deserialize(blob, shader);
+ 
+    if (result != VK_SUCCESS) {
+@@ -1315,6 +1386,8 @@
+    blob_write_bytes(blob, &shader->local_size, sizeof(shader->local_size));
+    blob_write_uint32(blob, shader->bin_size);
+    blob_write_bytes(blob, shader->bin_ptr, shader->bin_size);
++   blob_write_uint32(blob, shader->const_data_size);
++   blob_write_bytes(blob, shader->const_data_ptr, shader->const_data_size);
+    shader_desc_info_serialize(blob, shader);
+ 
+    return !blob->out_of_memory;
