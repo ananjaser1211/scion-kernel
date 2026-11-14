@@ -7,7 +7,7 @@
  * render pass, read back, on metal2vulkan's runtime over PanVK on the Mali-G72.
  *
  *   metal_tri [--bundle DIR] [--metallib FILE] [--size N] [--out FILE.ppm] [--surface] [--register] [--hold SECONDS]
- *             [--xr none|over|add]
+ *             [--xr none|over|add] [--fetch]
  *
  * The device: MTLCreateSystemDefaultDevice() first, Metal's own discovery (the kernel names the plug-in with boot-arg metal=N). When it
  * answers nil, the plug-in at --bundle (default /redwood/lib/HakiosMetal.bundle) is loaded and its class made the way Metal makes it,
@@ -33,6 +33,10 @@
  * (v = 0.25 mix + 0.75 clear), add with One and One (v = mix + clear). Inside within 2 codes, outside the clear's codes exactly. On a
  * device without framebuffer fetch the runtime blends such a target's codes through a unorm view of its word (metal2vulkan,
  * tools/metal/m2v/0004-xr10-unorm-blend.patch), and this is its check.
+ *
+ * --fetch draws the triangle twice in one pass with a fragment function that reads its colour attachment ([[color(0)]], framebuffer
+ * fetch: tools/metal/air/tri_fetch.ll, the corners' mix over 2 plus the attachment over 2) and judges every pixel against 3/4 of the mix
+ * plus 1/4 of the clear (fetch_check below); with --surface into a texture over an IOSurface.
  */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -475,6 +479,121 @@ xr_check(id<MTLDevice> device, const char *metallib, unsigned n, const char *mod
 	return pass;
 }
 
+/* ---------------------------------------------------------------------------------------------------- framebuffer fetch (--fetch) */
+
+/*
+ * The triangle drawn twice in one pass by tri_fetch (tools/metal/air/tri_fetch.ll: the corners' mix m over 2 plus the attachment's own
+ * colour over 2) into an n x n BGRA8 target cleared to the clear colour C, judged pixel by pixel. The first draw reads C and writes
+ * m/2 + C/2; the second reads that and writes 3m/4 + C/4. Inside within 3/255 per channel of that (the first draw's result is stored as
+ * 8-bit codes before the second reads it), outside the clear colour exactly. A pixel left at m/2 + C/2 means the second draw read the
+ * attachment before the first draw's write reached it (fetch unordered between draws), and one at m/2 + C/4 or so that the first read
+ * something other than the clear; both are counted apart. On PanVK (Mali-G72, neither rasterization-order attachment access nor the
+ * pixel interlock) metal2vulkan reads the attachment as an input attachment after a barrier between the draws
+ * (tools/metal/m2v/0005-unordered-framebuffer-fetch.patch), and this is its check.
+ */
+static bool
+fetch_check(id<MTLDevice> device, const char *metallib, unsigned n, bool surface)
+{
+	NSError *error = nil;
+	id<MTLLibrary> library = [device newLibraryWithURL:[NSURL fileURLWithPath:@(metallib)] error:&error];
+	if (library == nil) {
+		printf("metal_tri: FAIL: newLibraryWithURL: %s: %s\n", metallib, error.description.UTF8String);
+		return false;
+	}
+	MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+	pd.vertexFunction = [library newFunctionWithName:@"tri_vertex"];
+	pd.fragmentFunction = [library newFunctionWithName:@"tri_fetch"];
+	pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	if (pd.vertexFunction == nil || pd.fragmentFunction == nil) {
+		printf("metal_tri: FAIL: tri_vertex or tri_fetch is not in the library\n");
+		return false;
+	}
+	id<MTLRenderPipelineState> pipeline = [device newRenderPipelineStateWithDescriptor:pd error:&error];
+	if (pipeline == nil) {
+		printf("metal_tri: FAIL: the fetching pipeline was refused: %s\n", error.description.UTF8String);
+		return false;
+	}
+	printf("ok    render pipeline reading [[color(0)]]\n");
+	IOSurfaceRef ios = surface ? make_surface(n) : NULL;
+	id<MTLTexture> target = (!surface || ios != NULL) ? make_target(device, n, ios) : nil;
+	if (target == nil) {
+		printf("metal_tri: FAIL: no %ux%u BGRA8 %s\n", n, n, surface ? "texture over an IOSurface" : "Shared texture");
+		return false;
+	}
+	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+	rp.colorAttachments[0].texture = target;
+	rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+	rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+	rp.colorAttachments[0].clearColor = MTLClearColorMake(clear_rgb[0], clear_rgb[1], clear_rgb[2], 1);
+	id<MTLCommandBuffer> cb = [[device newCommandQueue] commandBuffer];
+	id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+	[enc setRenderPipelineState:pipeline];
+	[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	[enc endEncoding];
+	[cb commit];
+	[cb waitUntilCompleted];
+	if (cb.status != MTLCommandBufferStatusCompleted) {
+		printf("FAIL  render pass: status %ld%s%s\n", (long)cb.status, cb.error ? ": " : "",
+		    cb.error ? cb.error.description.UTF8String : "");
+		return false;
+	}
+	unsigned char *pixels = calloc(n, (size_t)n * 4);
+	if (surface) {
+		read_surface(ios, pixels, n);
+	} else {
+		[target getBytes:pixels bytesPerRow:(size_t)n * 4 fromRegion:MTLRegionMake2D(0, 0, n, n) mipmapLevel:0];
+	}
+	unsigned char want_clear[3] = { (unsigned char)lround(clear_rgb[2] * 255), (unsigned char)lround(clear_rgb[1] * 255),
+		(unsigned char)lround(clear_rgb[0] * 255) };   /* B G R */
+	unsigned inside = 0, outside = 0, bad_in = 0, bad_out = 0, stale = 0;
+	double worst = 0;
+	for (unsigned y = 0; y < n; y++) {
+		for (unsigned x = 0; x < n; x++) {
+			const unsigned char *p = pixels + ((size_t)y * n + x) * 4;
+			double w[3];
+			barycentric(x, y, n, w);
+			double margin = 2.5 / n;
+			if (w[0] > margin && w[1] > margin && w[2] > margin) {
+				inside++;
+				double m[3] = { w[2], w[1], w[0] }, c[3] = { clear_rgb[2], clear_rgb[1], clear_rgb[0] };   /* B G R */
+				bool ok = true, once = true;
+				double err = 0;
+				for (int k = 0; k < 3; k++) {
+					double want = (0.75 * m[k] + 0.25 * c[k]) * 255, first = (0.5 * m[k] + 0.5 * c[k]) * 255;
+					err = fmax(err, fabs(p[k] - want));
+					ok = ok && fabs(p[k] - want) <= 3;
+					once = once && fabs(p[k] - first) <= 3;
+				}
+				worst = fmax(worst, err);
+				if (!ok) {
+					stale += once;
+					if (bad_in++ < 4) {
+						printf("      inside (%u,%u): BGRA %u %u %u %u, want about %.0f %.0f %.0f 255%s\n", x, y, p[0], p[1], p[2], p[3],
+						    (0.75 * m[0] + 0.25 * c[0]) * 255, (0.75 * m[1] + 0.25 * c[1]) * 255, (0.75 * m[2] + 0.25 * c[2]) * 255,
+						    once ? " (the first draw's value: the second read before it)" : "");
+					}
+				}
+			} else if (w[0] < -margin || w[1] < -margin || w[2] < -margin) {
+				outside++;
+				if ((p[0] != want_clear[0] || p[1] != want_clear[1] || p[2] != want_clear[2]) && bad_out++ < 4) {
+					printf("      outside (%u,%u): BGRA %u %u %u %u, want the clear colour %u %u %u 255\n", x, y, p[0], p[1], p[2],
+					    p[3], want_clear[0], want_clear[1], want_clear[2]);
+				}
+			}
+		}
+	}
+	bool pass = inside > 0 && bad_in == 0 && bad_out == 0;
+	printf("%s fetch triangle drawn twice: %ux%u %s, %u inside (largest error %.1f/255) and %u outside judged, %u wrong (%u at the "
+	    "first draw's value)\n", pass ? "ok   " : "FAIL ", n, n, surface ? "read from the IOSurface's own memory" : "read with getBytes:",
+	    inside, worst, outside, bad_in + bad_out, stale);
+	free(pixels);
+	if (ios != NULL) {
+		CFRelease(ios);
+	}
+	return pass;
+}
+
 /* ------------------------------------------------------------------------------------------------------------------ the application */
 
 /*
@@ -678,6 +797,7 @@ main(int argc, char *argv[])
 		bool surface = false, register_it = false;
 		unsigned hold = 0;
 		const char *xr = NULL;
+		bool fetch = false;
 		for (int i = 1; i < argc; i++) {
 			if (strcmp(argv[i], "--bundle") == 0 && i + 1 < argc) {
 				bundle_path = argv[++i];
@@ -695,9 +815,11 @@ main(int argc, char *argv[])
 				hold = (unsigned)atoi(argv[++i]);
 			} else if (strcmp(argv[i], "--xr") == 0 && i + 1 < argc) {
 				xr = argv[++i];
+			} else if (strcmp(argv[i], "--fetch") == 0) {
+				fetch = true;
 			} else {
 				fprintf(stderr, "usage: metal_tri [--bundle DIR] [--metallib FILE] [--size N] [--out FILE.ppm] [--surface] "
-				    "[--register] [--hold SECONDS] [--xr none|over|add]\n");
+				    "[--register] [--hold SECONDS] [--xr none|over|add] [--fetch]\n");
 				return 2;
 			}
 		}
@@ -710,6 +832,11 @@ main(int argc, char *argv[])
 		}
 		if (xr != NULL) {
 			bool pass = xr_check(device, metallib, n, xr, surface);
+			printf("metal_tri: %s\n", pass ? "PASS" : "FAIL");
+			return pass ? 0 : 1;
+		}
+		if (fetch) {
+			bool pass = fetch_check(device, metallib, n, surface);
 			printf("metal_tri: %s\n", pass ? "PASS" : "FAIL");
 			return pass ? 0 : 1;
 		}
