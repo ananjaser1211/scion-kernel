@@ -840,3 +840,101 @@ here with a driver path the plug-in refused). The clients file keeps its `-backb
   every frame is the larger share and is not fixed yet. No copies of no-copy buffers.
 - `shadow.log` is written now: 16 small textures over no-copy buffers (A8Unorm and RGBA8Unorm, rows padded to
   the caller's) still go through a shadow image.
+
+## Phase 8: the wallpaper converted only when it changes, and HakiosMali's queue, lock and cleans (14 November 2026, on build 59)
+
+**Where it starts** (build 59, backboardd on Metal; `/var/tmp/coh/m6.sh`, six home swipes, and the kernel's 5 s lines):
+
+- backboardd CPU 7 to 76% in the swipes, 26 to 31% idle after them, RSS 81 to 82 MB.
+- GPU idle on the home screen: 11% busy; 350 to 381 vertex, tiler and compute jobs in 5 s at 1.4 to 1.5 ms each (528 ms: mostly the
+  wallpaper's conversion, ten or so a second), 150 to 166 fragment jobs at about 0.3 ms. Swipes: 28 to 57% busy.
+
+**The wallpaper's conversion (wall 1).** The planes are converted again only where they may have changed, as the seed of their
+IOSurface says, decided where the command buffer is submitted, in the queue's order.
+
+- *The seed.* A processor's lock or unlock for writing changes it, as before. Now a device's write changes it too, in the kernel
+  (xnu fork `457143df6f1f`, `MiniIOSurfaceWritten`, `hakios_surface_written`):
+  - the video decoder's frame written into a client's surface (`exynos_mfc`, zero copy);
+  - a HakiosMali job chain whose submission marks the surface's handle as written (`kMaliSubmitWritten`). Mesa's panfrost knows
+    which buffers a batch writes and marks them (`tools/mesa/panfrost-written-bos.patch`), so an OpenGL ES program drawing into a
+    surface changes its seed; one only sampling it does not;
+  - request `0x79` (`hakios_drm_surface_written`): work a client submitted writes a surface.
+  
+  Each change comes after the chain is queued, so a reader that saw the new seed submits behind the write.
+- *The runtime* (metal2vulkan **0011**, `surface_watch.rs`):
+  - The frontend watches every surface it imports (`nmb_buffer_watch_surface`): the seed, and a call announcing this process's
+    GPU writes.
+  - An encoder's first conversion of a YCbCr texture over a watched surface records nothing where no command before it in the
+    command buffer wrote the planes or the image. The command buffer notes the texture.
+  - Its first batch converts, at its start, each noted texture whose image does not hold the planes as of the seed it reads then.
+    That conversion goes in a command buffer of its own, between barriers from and to every command.
+  - What an image holds (seed, `VkQueue`) is forgotten once a batch writes the image or the planes.
+  - After each batch, the watched surfaces it wrote are announced through hakios-drm (as a device's write). Where the driver cannot
+    announce them (an older kernel, or a surface the driver copied), a lock and unlock for writing changes the seed instead.
+  - A use after a write of the planes in the same command buffer converts in its encoder, as before.
+- *What the seed does not see*: a processor writing the pixels without the lock IOSurface asks for. The frontend's own
+  `replaceRegion:` of a texture over a surface now takes it.
+- **`metal_tri --ycbcr`** checks it (`tools/metal/air/tri_ycbcr.ll`, a hand-written AIR fragment function that `read()`s a
+  `YCBCR8_420_2P` texture over a `420f` surface at its own pixel). The steps draw:
+  - twice, with the planes unchanged;
+  - after the processor wrote them under the lock;
+  - after a render pass cleared an `R8Unorm` texture over the luma plane, in a command buffer of its own and then in the draw's own.
+  
+  On the phone (build 59's kernel; 0011's runtime, frontend and PanVK by `DYLD_LIBRARY_PATH` and `HAKIOS_VK_ICD`), every step reads
+  the codes the planes hold then, with the image's runtime and with 0011's. At 2048x2048 a step takes 33 ms from commit to completion
+  with the image's runtime, and with 0011's **2.4 ms where the planes were unchanged** and 33 ms where they changed. The step after
+  the GPU's own write converts once more: its batch wrote the planes. `metal_tri --surface --size 1125 --row-bytes 4608`,
+  `--surface --frames 30` and `--fetch` pass with the new runtime, frontend and PanVK.
+
+**HakiosMali (wall 2)** (`drivers/gpu/mali`):
+
+- *The queue and the lock.* A submission reads its buffer list, cleans the surfaces it names, and waits for room in a full queue of
+  64 chains, all without the lock every request takes. `hakios_mali_enqueue_for()` never sleeps; `hakios_mali_room()` waits.
+  Before, the display thread slept there with every other client's requests behind it. A buffer given back now waits for its last
+  job without the lock too (it waited up to 2 s with it).
+- *Cleans by seed.* A surface's lines are cleaned before a job only where a processor may have written them since the last clean:
+  its seed moved past `cleanSeed`, which a device's write keeps in step. A framebuffer the GPU draws into frame after frame was
+  cleaned whole (5 MB, about 400 us) at every submission that named it. After the GPU writes, the cleans at `HakiosMaliDrawn()` and
+  `WAIT_BO` stay as they were. `mali_flush=2` cleans before every job, as before, to compare.
+- *A hung client is contained.* A job that faults is seen at once: the wait asked for the done bit alone, so a faulting job also
+  held the queue for the whole second. For a job still running after the second (status 0x8):
+  - the GPU is reset under it, as before;
+  - its client's other chains queued by then are not run (counted done);
+  - after 3 hangs the client's submissions are answered with no job until it goes;
+  - the minute's line counts them ("job chains of clients whose jobs hung not run").
+  
+  Each AegirPoster the snapshotter starts can still hang the queue for a second, once.
+- The kernel builds with all of it (`make kernel`: no error in the changed files; the symbol-set steps fail as they always do).
+
+**Not done here.**
+
+- *Wall 3, the 16 shadowed small textures* (`shadow.log`: A8Unorm and RGBA8Unorm text and icon textures, 94x54 to 600x600, over
+  no-copy buffers):
+  - Each sits at an offset in its pages (32, 64, 256, 6912, ...), but PanVK asks every image for 4096-byte alignment
+    (`panvk_GetImageMemoryRequirements2`).
+  - 13 of the 16 have rows that are multiples of 16 bytes but not of 64 (224, 288, 352, 608, 672, 720, 2400), where Mesa's linear
+    layout rounds rows to 64.
+  - What the Mali's texture descriptor takes (base alignment, row stride) needs a measurement on the phone first (a `metal_tri`
+    texture over a buffer at such an offset and pitch), then PanVK's requirements for host memory.
+- *Wall 4, the Astronomy wallpaper's hung fragment job*: tracing it needs the trace PanVK in AegirPoster, which takes an image
+  (extensions take no `launchctl setenv`, and `HakiosMetal.icd` is read-only). The kernel now contains the hang.
+- *Wall 5, idle CPU in the per-draw recording*: not started.
+- *Wall 6, Metal by default*: waits for the measurement this phase needs an image for.
+
+**Needs an image** (kernel and userland):
+
+- *Kernel*: the xnu fork at `457143df6f1f` (`profiles/ios-16.5.conf`), `drivers/gpu/mali`, `drivers/media/mfc`.
+- *Userland* (`METAL=vk`):
+  - metal2vulkan with 0011 and the bridge's `nmb_buffer_watch_surface`;
+  - the plug-in with the new frontend;
+  - PanVK with the new hakios-drm;
+  - Mesa's OpenGL ES with `panfrost-written-bos.patch` and the new hakios-drm;
+  - `metal_tri` with `share/metal_tri.metallib` (now with `tri_ycbcr`).
+
+Then:
+
+- `metal_tri --ycbcr --size 2048`.
+- backboardd on Metal measured as above (`m6.sh`, the kernel's GPU busy lines). Expected: the idle compute jobs and about 9 ms of
+  every frame's GPU time gone, fewer chains a frame.
+- No "client ... job hung" lines but AegirPoster's.
+- Video (`mfc_zc`) and the wallpaper still drawn right.
