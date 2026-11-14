@@ -514,3 +514,72 @@ prompt plug-in threw on it as an unrecognized selector. The alert it left on the
   - find what makes QuartzCore choose the luma-boost (EDR) pass and its fetch path, and have the device answer that query truthfully;
   - or give metal2vulkan a fetch without either Vulkan feature, for example a copy of the attachment bound as a texture for the draws
     that read it.
+
+## Phase 4: framebuffer fetch without either ordered form, and the window server on Metal (14 November 2026)
+
+**metal2vulkan 0005** (`tools/metal/m2v/0005-unordered-framebuffer-fetch.patch`, its header says how and why in full):
+
+- PanVK v6 has neither `rasterizationOrderColorAttachmentAccess` nor `fragmentShaderPixelInterlock`. On such a device, and only
+  under `FramebufferFetchPolicy::AcceptUnordered`, every pass now reads its colour attachments as input attachments, as on a device
+  with ordered access, but without the rasterization-order flags. The runtime makes the compile layer's unordered fetch pipelines
+  there, where it used to refuse them.
+- Between draws the read is ordered. The draws' subpass already depends on itself, by region, from colour attachment writes to
+  input attachment reads. A draw that reads input attachments records that barrier first whenever an earlier draw of its render pass
+  instance wrote a colour since the last barrier, or the pass loaded by a clear.
+- Within one draw the read is unordered: a fragment may see its pixel as it was before the same draw's earlier fragments. A pass
+  that reads each pixel once, such as CoreAnimation's full-screen `luma_boost_lph`, gets Metal's value. The compile layer's precision
+  note (`unordered-framebuffer-fetch`) says so once.
+- A `BGR10_XR` attachment rendered through its unorm view (0004) is not fetched. It is refused by name, because the view's codes are
+  not the raw texel that the read decodes.
+- The bridge (`nmb_device_open`) passes `AcceptUnordered`. The default policy is unchanged.
+
+**PanVK** (`tools/mesa/panvk/panvk-barrier-clears.patch`): on Bifrost, input attachments are texture reads through memory, and a
+pass's clear stays in the tile until its batch ends. PanVK used to drop a batch that had no draw at a barrier and then turn every
+clear into a preload, so a barrier before the first draw lost the clear. The barrier now writes the clears first, as
+`CmdEndRendering` does for a pass without draws.
+
+**`metal_tri --fetch`** (`tools/metal/air/tri_fetch.ll`: the corners' mix over 2 plus `[[color(0)]]` over 2, drawn twice into a
+target cleared in BGRA8):
+
+- Every pixel inside is within 0.9/255 of 3/4 mix + 1/4 clear, and every pixel outside is the clear exactly.
+- Checked on a texture and on a texture over an IOSurface, 256 and 1024 square, five runs of five, per process and from build 52's
+  image.
+- Before the PanVK fix, the first draw read zeros instead of the clear (19602 of 19602 pixels wrong). Before 0005, the pipeline was
+  refused.
+- `metal_tri` plain and `--xr none|over|add` still pass.
+
+**The window server on Metal (`camtl=1` plus the clients line), builds 52 and 53:**
+
+- **Build 52:** all 337 of backboardd's pipelines are made, `luma_boost_lph` among them, and the home screen draws right. Then
+  backboardd died of SIGSEGV twice: 13 s after its start, and at the first home swipe. Both were in `memmove` from
+  `Buffer::copy_host_bytes` in `host_sync::copy_out`, symbolicated against the unstripped runtime. That is 0002's copy back of
+  no-copy buffers the device cannot import. It took every 4 KiB that differed, which included the caller's newer bytes and memory
+  that CoreAnimation maps read-only. **0006** (`0006-copied-host-copy-out-gpu-writes.patch`) copies back only the chunks the GPU
+  changed, from a per-4 KiB digest taken at the copy in.
+- **Build 53:** backboardd runs on Metal without a crash through two sets of six home swipes. Measured the same way as GLES on
+  build 52 (`ps` once a second):
+
+  | | GLES (build 52) | Metal (build 53) |
+  |---|---|---|
+  | backboardd CPU, idle | about 7% | about 7% |
+  | backboardd CPU, during the swipes | 25 to 38% | 120 to 168% |
+  | backboardd RSS | 108 MB | 159 MB at the start, 171 MB after the swipes |
+
+- **The next wall is the copy in.** A 4 s spindump during swipes puts 138 of 399 display-thread samples in `-[NBCommandBuffer
+  commit]`, and 116 of those in `host_sync::copy_in`, the 4 KiB comparison of every no-copy buffer the device could not import, at
+  every commit. Making those buffers import (why HakiosMali or PanVK refuses them: alignment, read-only mappings) is the next
+  piece. GLES stays the default.
+- No frame-time figure for Metal yet. The plug-in streams no frame line for a Metal backboardd; the eagl line is the GLES path's.
+
+**The Astronomy wallpaper (AegirPoster), build 53, with the new plug-in log lines** (5e5dd13: the first IOSurface texture, the
+first commit, presents by command buffer and by drawable, large texture loads, a tally at commits 1, 100, 1000 and 10000):
+
+- AegirPoster makes its drawable's texture (`1125x2313`, MTLPixelFormat 555, over a `BGRA` surface) and loads a 2048x2048 texture.
+  It never says its first commit, so the commit tally never runs.
+- launchd kills it again and again: "Extension is hanging on launch. Killing." (`XPC_EXIT_REASON_EXTENSION_CHECK_IN_TIMEOUT`).
+- A spindump of the launch has 181 of 181 main-thread samples under `-[NBEncoder endEncoding]` → `RenderCommandEncoder::end_pass` →
+  `capture_steps` → `Device::owned_kernel` → `vkCreateComputePipelines` → PanVK's `bi_register_allocate`.
+- The first pass loads its XR drawable, so it keeps its draws for capture replay, and the replay's three kernels were compiled on
+  the program's thread. PanVK takes about a minute over them.
+- **0007** (`0007-owned-kernels-ahead.patch`) makes them on a thread of their own. Until they are made the pass uses the host's
+  reach, as the module's own rule says for capture forms not yet made. It needs an image to be seen in AegirPoster.
