@@ -343,6 +343,8 @@ hakios_mfc_uncarve(uint64_t phys)
 }
 
 extern int hakios_surface_mfc_frame(uint32_t sid, uint64_t *y, uint64_t *uv, uint32_t *y_stride, uint32_t *uv_stride, uint32_t *y_bytes, uint32_t *uv_bytes);
+/* a device wrote the surface's pixels: its seed changes (MiniIOSurface.cpp) */
+extern void hakios_surface_written(uint32_t sid);
 
 static void *
 mfc_alloc(uint32_t bytes)
@@ -1226,6 +1228,14 @@ mfc_ioctl(dev_t dev __unused, u_long cmd, caddr_t data, int flag __unused, proc_
 		error = inst_frame(d->bytes, 0, d->tag, d->bytes == 0, (uint32_t)y, (uint32_t)uv, &r);
 		if (error != 0) {
 			break;
+		}
+		/*
+		 * Zero copy: the block decoded into the client's surface (the frame's slot), which nobody locked for writing. Its seed changes, so a
+		 * reader that keeps what it made of the pixels (the window server's converted YCbCr texture of a video frame,
+		 * metal2vulkan's surface_watch.rs) makes it again.
+		 */
+		if (I.zc && !r.finished) {
+			hakios_surface_written(d->surface);
 		}
 		d->finished = r.finished;
 		d->slot = r.slot;
