@@ -284,6 +284,65 @@ static void noteProblem(NSString *what) {
 void (*native_bridge_metal_log_hook)(const char *);
 #define NBLOG(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];NSLog(@"%@",nbText);\
  if(native_bridge_metal_log_hook)native_bridge_metal_log_hook(nbText.UTF8String?:"?");noteProblem(nbText);}while(0)
+
+// ---- what a process does with its drawables: said once each, and as a tally at its 1st, 100th, 1000th and 10000th commit ----
+// The Astronomy wallpaper (AegirPoster) made every pipeline and presented nothing (docs/metal.md, builds 49 and 50). These lines say which of
+// the steps between happen: textures over IOSurfaces (a CAMetalLayer's drawables), presents through a command buffer (presentDrawable:) and
+// presents by the drawable itself (-[CAMetalDrawable present], which this device never sees otherwise), commits, and large texture loads.
+// Not problems: written to the log without counting in the status line's refusals.
+#define NBSAY(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];NSLog(@"%@",nbText);\
+ if(native_bridge_metal_log_hook)native_bridge_metal_log_hook(nbText.UTF8String?:"?");}while(0)
+static std::atomic<uint64_t> gSaidSurfaceTextures,gBufferPresents,gDrawablePresents,gBigLoads,gBigLoadBytes,gBigLoadUs;
+static std::atomic<bool> gSaidSurface,gSaidBufferPresent,gSaidDrawablePresent,gSaidBigLoad,gSaidCommit;
+static thread_local bool tPresentingForBuffer;
+// A texture load (replaceRegion:) of this many bytes or more is a large one.
+static const uint64_t kBigLoad=4u<<20;
+static bool firstTime(std::atomic<bool> &said) {bool no=false;return said.compare_exchange_strong(no,true);}
+static void sayTally(uint64_t commits) {
+ NBSAY(@"native-metal: at commit %llu: %llu textures over IOSurfaces, %llu presents by command buffers (presentDrawable:), %llu by drawables "
+  "themselves (-present), %llu large texture loads (%llu MB in %llu ms)",(unsigned long long)commits,(unsigned long long)gSaidSurfaceTextures.load(),
+  (unsigned long long)gBufferPresents.load(),(unsigned long long)gDrawablePresents.load(),(unsigned long long)gBigLoads.load(),
+  (unsigned long long)(gBigLoadBytes.load()>>20),(unsigned long long)(gBigLoadUs.load()/1000));
+}
+// -[CAMetalDrawable present] and its timed forms, counted and said the first time, then QuartzCore's own: a present not through a command
+// buffer reaches the drawable only. Installed once, with the device (native_bridge_metal_adopt).
+static IMP gDrawablePresent,gDrawablePresentAtTime,gDrawablePresentAfter;
+static void noteDrawablePresent(id drawable,const char *how) {
+ if(tPresentingForBuffer)return;
+ gDrawablePresents++;
+ if(firstTime(gSaidDrawablePresent)) {
+  id<MTLTexture> texture=[drawable respondsToSelector:@selector(texture)]?[(id<CAMetalDrawable>)drawable texture]:nil;
+  NBSAY(@"native-metal: the first drawable presented by itself (%s, not through a command buffer): a %s, texture %lux%lu MTLPixelFormat %lu",how,
+   object_getClassName(drawable),(unsigned long)texture.width,(unsigned long)texture.height,(unsigned long)texture.pixelFormat);
+ }
+}
+static void drawablePresent(id self_,SEL cmd) {noteDrawablePresent(self_,"-present");((void(*)(id,SEL))gDrawablePresent)(self_,cmd);}
+static void drawablePresentAtTime(id self_,SEL cmd,CFTimeInterval t) {
+ noteDrawablePresent(self_,"-presentAtTime:");((void(*)(id,SEL,CFTimeInterval))gDrawablePresentAtTime)(self_,cmd,t);
+}
+static void drawablePresentAfter(id self_,SEL cmd,CFTimeInterval t) {
+ noteDrawablePresent(self_,"-presentAfterMinimumDuration:");((void(*)(id,SEL,CFTimeInterval))gDrawablePresentAfter)(self_,cmd,t);
+}
+static void watchDrawablePresents() {
+ Class cls=objc_getClass("CAMetalDrawable");
+ if(!cls)return;
+ Method m;
+ if((m=class_getInstanceMethod(cls,@selector(present))))gDrawablePresent=method_setImplementation(m,(IMP)drawablePresent);
+ if((m=class_getInstanceMethod(cls,@selector(presentAtTime:))))gDrawablePresentAtTime=method_setImplementation(m,(IMP)drawablePresentAtTime);
+ if((m=class_getInstanceMethod(cls,@selector(presentAfterMinimumDuration:))))gDrawablePresentAfter=method_setImplementation(m,(IMP)drawablePresentAfter);
+}
+// A command buffer's present of DRAWABLE, once the GPU is done: counted and said the first time.
+static void presentForBuffer(id<MTLDrawable> drawable,bool timed,CFTimeInterval time) {
+ gBufferPresents++;
+ if(firstTime(gSaidBufferPresent)) {
+  id<MTLTexture> texture=[(id)drawable respondsToSelector:@selector(texture)]?[(id<CAMetalDrawable>)drawable texture]:nil;
+  NBSAY(@"native-metal: the first drawable presented through a command buffer (presentDrawable:%s): a %s, texture %lux%lu MTLPixelFormat %lu",
+   timed?"atTime:":"",object_getClassName(drawable),(unsigned long)texture.width,(unsigned long)texture.height,(unsigned long)texture.pixelFormat);
+ }
+ tPresentingForBuffer=true;
+ if(timed)[drawable presentAtTime:time];else [drawable present];
+ tPresentingForBuffer=false;
+}
 // The pixel formats textures were asked for (first eight distinct), with how many were refused: native_bridge_metal_formats.
 static uint32_t gFormats[8];static unsigned gFormatCount;static std::atomic<uint64_t> gTextureRefusals;
 // Textures over IOSurfaces: made, refused, and how many of the requests named a planar surface.
@@ -517,7 +576,18 @@ NB_RESOURCE_SPI
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image {
  const uint64_t region[6]={r.origin.x,r.origin.y,r.origin.z,r.size.width,r.size.height,r.size.depth};
  const uint64_t length=(r.size.depth>1?image*(r.size.depth-1):0)+row*r.size.height;
- if(!nmb_texture_replace(_handle,region,level,slice,bytes,row,image,length))NBLOG(@"native-metal: replaceRegion refused: %@",lastError());
+ const uint64_t began=nowUs();
+ const bool done=nmb_texture_replace(_handle,region,level,slice,bytes,row,image,length);
+ if(!done)NBLOG(@"native-metal: replaceRegion refused: %@",lastError());
+ if(length>=kBigLoad) {
+  const uint64_t took=nowUs()-began;
+  gBigLoads++;gBigLoadBytes+=length;gBigLoadUs+=took;
+  if(firstTime(gSaidBigLoad))
+   NBSAY(@"native-metal: the first large texture load: replaceRegion: of %llu KB (%llux%llu, level %lu) into a %llux%llu texture of MTLPixelFormat %llu, "
+    "%llu ms%s",(unsigned long long)(length>>10),(unsigned long long)r.size.width,(unsigned long long)r.size.height,(unsigned long)level,
+    (unsigned long long)_descriptor.width,(unsigned long long)_descriptor.height,(unsigned long long)_descriptor.format,(unsigned long long)(took/1000),
+    done?"":" (refused)");
+ }
 }
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row {
  [self replaceRegion:r mipmapLevel:level slice:0 withBytes:bytes bytesPerRow:row bytesPerImage:row*r.size.height];
@@ -1172,8 +1242,12 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs);
 - (void)addCompletedHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_completedHandlers addObject:[block copy]];}}
 // A drawable (RenderBox's CAMetalLayer path) is presented once the GPU has written it: this runtime's scheduling comes before completion.
 // An extended-range drawable is made what its surface says it is first (drawable_xr_to_surface).
-- (void)presentDrawable:(id<MTLDrawable>)drawable {[self addCompletedHandler:^(id<MTLCommandBuffer>){drawable_xr_to_surface(drawable);[drawable present];}];}
-- (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)time {[self addCompletedHandler:^(id<MTLCommandBuffer>){drawable_xr_to_surface(drawable);[drawable presentAtTime:time];}];}
+- (void)presentDrawable:(id<MTLDrawable>)drawable {
+ [self addCompletedHandler:^(id<MTLCommandBuffer>){drawable_xr_to_surface(drawable);presentForBuffer(drawable,false,0);}];
+}
+- (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)time {
+ [self addCompletedHandler:^(id<MTLCommandBuffer>){drawable_xr_to_surface(drawable);presentForBuffer(drawable,true,time);}];
+}
 - (void)enqueue {}
 - (void)event:(id<MTLEvent>)event value:(uint64_t)value signal:(bool)signal {
  if(![(id)event isKindOfClass:[NBEvent class]]){[self refuse:@"foreign event"];return;}
@@ -1236,6 +1310,10 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs);
   CommitRecord &r=gCommitRing[index%32];
   r={};r.index=index;r.committedUs=self.committedUs;r.ageUs=self.committedUs-createdUs;r.work=encodedWork;
  }
+ if(self.commitIndex==1 && firstTime(gSaidCommit))
+  NBSAY(@"native-metal: the first commit: %u render passes, %u draws, %llu thousand pixels, %u dispatches, %u blits",encodedWork.passes,
+   encodedWork.draws,(unsigned long long)(encodedWork.pixels>>10),encodedWork.dispatches,encodedWork.blits);
+ if(self.commitIndex==1 || self.commitIndex==100 || self.commitIndex==1000 || self.commitIndex==10000)sayTally(self.commitIndex);
  dispatch_group_enter(_handlers);
  dispatch_group_enter(_schedulingHandlers);
  @synchronized(gInFlight){[gInFlight addObject:self];}
@@ -1730,7 +1808,14 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  NBBuffer *buffer=surfaceBuffer(surface,base,bytes);if(!buffer){refuseSurface(4,surface,d,plane,start-(uintptr_t)base,row);return nil;}
  NBTexture *texture=planes>=2?textureOnSurface(buffer,d,surface,plane,start-(uintptr_t)base,row):textureOnBuffer(buffer,d,start-(uintptr_t)base,row,true);
  if(!texture){refuseSurface(5,surface,d,plane,start-(uintptr_t)base,row);return nil;}
- gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);return (id<MTLTexture>)texture;
+ gSurfaceTextures++;gSaidSurfaceTextures++;
+ if(firstTime(gSaidSurface)) {
+  const OSType format=IOSurfaceGetPixelFormat(surface);
+  NBSAY(@"native-metal: the first texture over an IOSurface: %lux%lu MTLPixelFormat %lu, usage 0x%lx, plane %lu of a '%c%c%c%c' surface %zux%zu, "
+   "%zu bytes a row",(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.pixelFormat,(unsigned long)d.usage,(unsigned long)plane,
+   (char)(format>>24),(char)(format>>16),(char)(format>>8),(char)format,IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),row);
+ }
+ texture.surface=(IOSurfaceRef)CFRetain(surface);return (id<MTLTexture>)texture;
 }
 - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {
  const void *bytes=nullptr;size_t size=0;dispatch_data_t mapped=dispatch_data_create_map(data,&bytes,&size);
@@ -1957,6 +2042,7 @@ extern "C" bool native_bridge_metal_adopt(id object,const char *loader,const cha
  if(!object || !openRuntimeDevice(loader,cache,registryID,missing))return false;
  installDeviceMethods(object_getClass(object));
  gDeviceObject=object;
+ watchDrawablePresents();
  return true;
 }
 
