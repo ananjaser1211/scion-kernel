@@ -35,6 +35,7 @@
 extern "C" void sys_dcache_flush(void *start, size_t length);
 
 static NmbDevice *gDevice;
+static std::string gLoaderPath;   // the Vulkan driver's path (openRuntimeDevice), for tellHostSurface
 
 static void drawable_xr_to_surface(id<MTLDrawable> drawable);
 extern void (*native_bridge_metal_log_hook)(const char *);
@@ -502,6 +503,18 @@ NB_RESOURCE_SPI
 // caller-owned no-copy buffers do not enter this cache.
 static NSMapTable<NSValue *,NBBuffer *> *gSurfaceImports;
 static std::mutex gSurfaceImportLock;
+// The driver imports a host pointer only as an IOSurface's memory, which its kernel makes a buffer of by the surface's ID (PanVK on
+// HakiosMali: tools/mesa/panvk/panvk-host-surfaces.patch; Turnip on HakiosGPU likewise): the surface mapped at base is told to it
+// (tools/mesa/hakios-drm: hakios_drm_host_surface) before the runtime imports the pages. A driver without the call copies instead.
+static void tellHostSurface(IOSurfaceRef surface,void *base,size_t bytes) {
+ static void (*tell)(const void *,uint64_t,uint32_t);
+ static std::once_flag once;
+ std::call_once(once,[]{
+  if(void *driver=gLoaderPath.empty()?nullptr:dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD))
+   tell=(void (*)(const void *,uint64_t,uint32_t))dlsym(driver,"hakios_drm_host_surface");
+ });
+ if(tell)tell(base,bytes,IOSurfaceGetID(surface));
+}
 static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
  struct Key {uint64_t identity,address,bytes;};
  const Key value={IOSurfaceGetID(surface),(uintptr_t)base,bytes};
@@ -511,6 +524,7 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
  NBBuffer *buffer=key?[gSurfaceImports objectForKey:key]:nil;
  if(buffer)return buffer;
  // The surface keeps its CPU mapping (the imported pages) until the import is freed.
+ tellHostSurface(surface,base,bytes);
  NmbBuffer *handle=nmb_buffer_new_no_copy_releasing(gDevice,base,bytes,MTLResourceStorageModeShared,releaseSurface,(void *)CFRetain(surface));
  if(!handle){CFRelease(surface);NBLOG(@"native-metal: surface import refused: %@",lastError());return nil;}
  gSurfaceImportsMade++;buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;
@@ -1990,6 +2004,7 @@ static bool openRuntimeDevice(const char *loader,const char *cache,uint64_t regi
  gMissing=missing;gInFlight=[NSMutableSet set];
  gDevice=nmb_device_open(loader,cache);
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return false;}
+ gLoaderPath=loader;
  if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}
  char name[128]={};nmb_device_name(gDevice,name,sizeof name);gName=[NSString stringWithUTF8String:name];gRegistryID=registryID;
  // The target families supportsFamily: answers true, with the rows of Apple's tables the device does not meet in them (nmb_device_family_waivers).
