@@ -1,0 +1,46 @@
+metal2vulkan runtime: imported host pages in a type that is not coherent are flushed and invalidated too (Scion)
+
+Upstream:  metal2vulkan, https://github.com/steelbrain/metal2vulkan, at 720ef1ce9ae2a2068999a8675717418b9416283e, after
+           AdrenoMetal's 16 patches to it and Scion's 0001 to 0007; tools/metal/mk-metal2vulkan.sh applies them in that order,
+           then this.
+Licence:   GPL-2.0-or-later OR LGPL-3.0-or-later, metal2vulkan's (its LICENSE); this patch is a change to it and under the same
+           terms. Nothing of it is in Scion's MIT or APSL files.
+Author:    the HakiOS authors (Scion), 14 November 2026.
+
+Why. PanVK on the Galaxy S9's Mali now imports a no-copy buffer's host pages (tools/mesa/panvk/panvk-host-surfaces.patch,
+HakiosMali's request 0x7b), where metal2vulkan used to copy them in and out at every commit (0002). The window server on
+Metal made 137 such buffers (build 55) and spent 78 ms a commit copying them in and 48 ms comparing them out. The pages are
+the process's own cached memory, and the Mali does not see the processors' caches, so PanVK imports them into a memory
+type that is HOST_VISIBLE | HOST_CACHED and not coherent, and cleans and invalidates their lines in
+vkFlushMappedMemoryRanges and vkInvalidateMappedMemoryRanges. 0001 already takes those steps for a command buffer's
+buffers in memory that is not coherent, but Buffer::host_span gave no span for a buffer over the caller's memory, so an
+imported no-copy buffer was never flushed: the GPU would read what the CPU's caches had not yet written back.
+
+What. Buffer::host_span gives a no-copy buffer's span in its import, whose placement is mapped at the caller's pointer
+(as a heap's buffer over a no-copy heap's pages gets its heap's); only the memory of a caller's VkBuffer, which the runtime
+does not map, still has none. host_sync::sync still flushes and invalidates only spans in memory that is not coherent, so
+on a coherent import (every device before this, and an IOSurface's pages on PanVK) nothing changes.
+
+--- a/crates/metal2vulkan-runtime/src/buffer.rs
++++ b/crates/metal2vulkan-runtime/src/buffer.rs
+@@ -2000,11 +2000,16 @@
+     /// Whose memory the buffer's bytes are, where they are the caller's: a no-copy buffer's
+     /// host pages, or the memory of the caller's `VkBuffer`; a heap buffer's, its heap's (a heap
+     /// over host pages, `Device::new_heap_with_bytes_no_copy`).
+-    /// Where the bytes `contents` points at lie in the runtime's host-visible memory, for a flush
+-    /// or an invalidate (`host_sync.rs`): `None` for `Private` storage and for memory the caller
+-    /// made (host pages, a `VkBuffer`), which the runtime does not map.
++    /// Where the bytes `contents` points at lie in host-visible memory, for a flush or an
++    /// invalidate (`host_sync.rs`): the runtime's own, or the import of a no-copy buffer's host
++    /// pages, whose placement is mapped at the caller's pointer (Scion: a device that imports them
++    /// into a type that is not coherent, PanVK on the Mali, needs the steps there too); `None` for
++    /// `Private` storage and for the memory of a caller's `VkBuffer`, which the runtime does not
++    /// map.
+     pub(super) fn host_span(&self) -> Option<crate::host_sync::HostSpan> {
+-        if self.storage_mode() == StorageMode::Private || self.caller_memory().is_some() {
++        if self.storage_mode() == StorageMode::Private
++            || matches!(self.caller_memory(), Some(CallerMemory::VkBuffer))
++        {
+             return None;
+         }
+         let span = |placement: &Placement, offset: u64, size: u64| {
