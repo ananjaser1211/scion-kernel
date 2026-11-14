@@ -957,3 +957,170 @@ Then:
 
 The idle conversion jobs are gone. A frame's GPU time is now within twice GLES's, which is Phase 7's condition
 for making Metal the window server's default. Idle CPU stays about 8 points above GLES.
+
+## Phase 9: the window server on Metal by default, its idle cleans, the Astronomy wallpaper's Earth, and textures over buffers at their offsets (14 November 2026, on build 60)
+
+How it was tried without an image: the plug-in, `libhakios.dylib` and the test PanVKs were built from this tree and
+pushed over SSH. The system volume is read-only and a bindfs over `/redwood/lib` is refused to a shell (EPERM), so the
+plug-in's window-server path ran in a stand-in process named `backboardd` that loads the bundle and sends
+`-initWithAcceleratorPort:` as Metal does; test PanVKs reached backboardd through `launchctl setenv HAKIOS_VK_ICD` (a
+file named `libvulkan_panfrost*`) and a restart of backboardd, and test programs through the environment. Everything
+was taken back after: backboardd runs the image's PanVK on Metal, the clients file is as it was.
+
+### Metal is the window server's default where the device is Metal on PanVK
+
+Phase 7's proposal, done:
+
+- **Who is shown the device** (`userland/src/hakios_metal_shown.c`). backboardd is shown it at `metal=2` or `3` when the
+  plug-in's Vulkan driver is PanVK: `HAKIOS_VK_ICD`, else the first line of `HakiosMetal.icd` beside the bundle, names a
+  `libvulkan_panfrost*` file (`hakios_metal_vk_driver()`, moved here from the opener so both decide by the same path).
+  `camtl=0`, or a line `-backboardd` in either clients file, keeps the window server on OpenGL ES; the second needs no
+  boot, only backboardd's next start. Any other driver or build: shown only at `metal=4` or when a clients file names it.
+- **The plug-in opens the device at once in the window server** (`src/metalvk/HakiosMetalVK.mm`), in
+  `-initWithAcceleratorPort:`, and answers nil when it cannot be opened. Metal's discovery tests the object before
+  `MTLAddDevice()` (in Metal of 20F66, the call to the `initWithAcceleratorPort:` stub is followed by `cbz x0` past the
+  add), so a nil answer is no device, `MTLCreateSystemDefaultDevice()` is nil, and CoreAnimation takes its OpenGL ES path.
+  Before, a device that failed answered nil from its first use on, after CoreAnimation had chosen Metal, and backboardd
+  ended. Every other process still opens the device at its first real use.
+- **`inject.c`** leaves the device in backboardd without a `camtl=` on the line when it answers YES to
+  `-hakiosOpenedForWindowServer` (the plug-in's: opened, for the window server); any other device is taken out as before.
+  `camtl=1` leaves any device (the experiment it always was); `camtl=0` takes it out.
+- The stand-in `backboardd` (the image's `libhakios.dylib` injected, `camtl=1` on the line, so this tests the plug-in's
+  side): with the clients file's `backboardd` line removed and the image's PanVK, shown by default, opened in 134 to
+  224 ms inside `-initWithAcceleratorPort:`, `-hakiosOpenedForWindowServer` YES; with `HAKIOS_VK_ICD` naming a PanVK file
+  that is not there, shown, the open fails in 2 ms, and `-initWithAcceleratorPort:` answers nil ("no device for the
+  window server: CoreAnimation draws with OpenGL ES"); with another driver named, not shown; with `-backboardd`, not
+  shown; with the line `backboardd`, shown and opened. The no-`camtl=` path of `inject.c` needs a boot without `camtl=`.
+- **Defaults.** `devices/star2lte` (scion-star2lte `4ebaa72`, pinned by `devices/manifest.conf`) has `CONFIG_METAL=2`:
+  the S9+'s line carries `metal=2`, and `camtl=1` is no longer needed. The installer (`build-installer.sh`, scion-installer
+  `441f592`) builds PanVK (`tools/mk-panvk.sh`) and the plug-in on Vulkan (`METAL=vk
+  METAL_ICD=/redwood/lib/libvulkan_panfrost.dylib`, metal2vulkan through `mk-metal2vulkan.sh` and its own Rust) whenever
+  the S9+ is among the phones, and checks for `llvm-as` (and Xcode's Metal compiler on macOS); the S9 and the Note9 get
+  the same image and no `metal=`, so their kernels name no plug-in. Its README says so. The installer's kernel pin moves
+  to this phase's last commit once it is pushed.
+
+### Idle CPU: the cleans of pages no processor can write (wall 5 of phase 8)
+
+A 10 s spindump of backboardd idle on the home screen (build 60, Metal): the display thread busy in 94 of 500 samples,
+**90 of them in the kernel in `HakiosMaliUserClient::syncBuffer`** (request `0x7a`), under `host_sync::sync` →
+`vkFlushMappedMemoryRanges` → `hakios_drm_sync`, at each command buffer's first batch. metal2vulkan's per-draw recording was
+not where the time went (a few samples).
+
+A test PanVK (not committed) logged every clean by buffer, with each import's region (`mach_vm_region`): **about 180 MB a
+second cleaned idle**, 95% of it three buffers, CoreAnimation's decoded images (9 MB, 6.9 MB and 1.7 MB, VM tag 7),
+cleaned whole at every frame. Each is read-only for good (maximum protection read), private and held by nothing else
+(share mode private, one reference): no processor can write those pages after the import, and the GPU maps them read only.
+
+- `hakios_drm_host_pages_sealed()` (`tools/mesa/hakios-drm`) says so of a range of pages, region by region; anything shared
+  or writable anywhere is not. A mapping made from such pages is read-only for good as well, and a copy made writable
+  (`VM_PROT_COPY`) is other pages.
+- `panvk-host-memory.patch`: such an import is cleaned once, when it is made, and its flushes and invalidates are nothing to
+  do after.
+- What is still cleaned at every frame: CoreAnimation's images shared with other processes (VM tag 51, about 3.5 MB a
+  second) and the small writable buffers.
+
+| backboardd, Metal | image's PanVK (build 60) | with the sealed pages | GLES |
+|---|---|---|---|
+| CPU idle (CPU time over 20 s, woken, 5 s settled) | 27.9–28.9% | 22.8–23.7% | ~20% |
+| CPU, six swipes (`m6.sh`) | 6–80% | 8.5–64% | 6–69% |
+| RSS | 66–78 MB | 75–80 MB | 105–113 MB |
+
+The display thread's busy samples idle went from 94 to 39 of 500. What is left over GLES, about 3 points, is spread over
+CoreAnimation's own work, the submissions and the remaining cleans.
+
+### The Astronomy wallpaper: the fragment shaders built a 4 KiB table in thread-local storage at every pixel (wall 4)
+
+**A harness, no image needed.** NanoUniverse (the framework AegirPoster draws with) renders in any process:
+`NUNIScene -initWithSphereoids:currentDateBlock:` (bit 3 the Earth, bit 4 the Moon), `-setSnap:3` (the Earth in focus),
+`+[NUNIRenderer sharedInstanceWithPixelFormat:textureSuffix:rendererStyle:]` with style 2 (`NUNIAegirRenderer`; 0 is the
+classic renderer, 1 Globetrotter), and `-renderWithScene:viewport:commandBuffer:passDescriptor:` into a `BGR10_XR_sRGB`
+texture (555, the only format its pipelines are made for). Its first command buffer is AegirPoster's: 3 render passes, 6
+draws, 1 blit (`aegir_starfield_fsh`, `aegir_star_fsh`, `aegir_earth_fsh`, `aegir_luna_fsh`, `aegir_threshold_fsh`,
+`aegir_post_fsh`). It reproduces the hang: at 390x844 the frame's fragment job ran past HakiosMali's 1 s and was killed
+(`status 0x8`, "client ... job hung"), the read-back showing the tiles done until then. It is slow, not looping: at
+195x422 the Earth's frame took 440 ms, at 96x208 110 ms, about 5 us a pixel; at 1170x2532 about 20 s.
+
+**Why.** `BIFROST_MESA_DEBUG=shaderdb`: every one of those fragment shaders spends 280 to 364 cycles a pixel in loads and
+stores, for 0.5 to 3.5 of texturing. `BIFROST_MESA_DEBUG=shaders`: 2304 `store_scratch` in one frame's shaders. Each begins
+by storing a 4 KiB constant table (`scratch: 4096`, 256 vec4 stores of words like 0x00010001, 0x00020002: a noise
+function's permutation table) into thread-local storage, then reads a few words of it. PanVK keeps such a constant array a
+function variable, and `bifrost_preprocess_nir()` puts every array over 256 bytes in thread-local storage.
+
+**`panvk-large-constants.patch`**: `nir_opt_large_constants` after the global variables became local and before
+`pan_shader_preprocess()`; each `load_constant` becomes a `load_global_constant` at the shader's own constant data, whose
+address is a sysval (`panvk_{graphics,compute}_sysvals::const_data`), set to the bound shader's as its push uniforms are
+made (so the vertex and fragment shaders of a draw each have their own). The data is uploaded beside the binary and
+serialized with it.
+
+| the harness, Earth and Moon in focus | before | with `panvk-large-constants.patch` |
+|---|---|---|
+| `store_scratch` in the frame's shaders | 2304 | 0 |
+| load/store cycles a pixel (shaderdb) | 280–364 | 10–108 |
+| frame at 195x422 | about 450 ms | 8–9 ms |
+| frame at 1170x2532 | about 20 s (killed at 1 s) | 100 ms with the camera off the Earth; 0.7 s with the Earth filling the view (the rest of the scene 70 ms) |
+
+The Earth renders: a disc with its atmosphere's rim, lit from the sun's side as the scene's date puts it, the starfield
+behind. The 0.7 s is under HakiosMali's limit but slow: the Earth's shader is 5755 instructions at one thread a lane with
+246 global loads of its tables. In AegirPoster itself it is not seen yet: that needs the image (extensions take no
+`launchctl setenv`).
+
+### Textures over no-copy buffers at their offsets (wall 3)
+
+**`metal_tri --texel-buffer OFFSET [--a8] [--blit] [--render]`** (new): the triangle drawn by `tri_ycbcr` from an RGBA8Unorm
+(or A8Unorm) texture over page-aligned no-copy memory at OFFSET, rows `--row-bytes` apart, judged texel by texel, and every
+other byte of the memory checked unchanged; `--blit` has the GPU write the texels first, `--render` renders into the
+texture and judges its memory. With a test PanVK whose host-allocation images asked any alignment (`P9_ALIGN`, not
+committed):
+
+| RGBA8 rows 720, A8 rows 224 or 288 | offsets 16, 32, 48, 64, 96, 6912 | offsets 1 to 8 |
+|---|---|---|
+| sampled | right, in place | Metal refuses them (`OffsetAlignment ... 16`) |
+| blitted into | right, nothing outside the texels written | |
+| rendered to (RGBA8) | right, nothing outside the texels written | |
+
+Rows that are not multiples of 64 bytes (224, 288, 720) were never the obstacle: at offset 0 such a texture was already
+in place. The page each image asked for was: `panvk_GetImageMemoryRequirements2` answered 4096 bytes of every image.
+`panvk-host-memory.patch` now answers 64 bytes for a linear image of host allocations (Mesa's own minimum for a linear
+surface on v6) and **16 on a v6 GPU where the image is no storage image**; a storage image is written through an attribute
+buffer, whose pointer has no lower 6 bits on v6 (`Attribute Buffer`, `v6.xml`), and that was not measured.
+
+In backboardd (a restart each, `shadow.log` emptied first): **18 textures shadowed with the image's PanVK, 8 with this one**.
+metal2vulkan makes every such image with storage and color-attachment usage (`0x1f`), so the RGBA8 ones at offset 32 keep
+64 bytes and stay shadows; the A8 ones at offsets of 64, 4608, 6784, 14592 bytes are shadows for another reason of
+`aliases()` (the image's subresource larger than the room left in the buffer, by its rounded height), and a 1x1 BGRA8 one
+as before.
+
+### Not done
+
+- **`metal_tri --ycbcr`'s "again, unchanged" after a same-command-buffer clear** still converts (33 ms; the values are right).
+  Skipping it is correct only where the in-encoder conversion of that batch came after its last write of the planes, and
+  no other writer changed the surface between the batch's submission and the runtime's own announcement of its write: the
+  image then holds the planes as of the seed after that announcement. `SurfaceWatches::submitted()` forgets every image over
+  bytes the batch wrote; it would need, per batch, the conversions that followed the last write, and the seed before and
+  after the announcement (exactly one apart). Left as it is: a conversion more is right, one less would not be.
+
+### Needs an image (userland only; the kernel is build 60's)
+
+- the plug-in (`HakiosMetalVK.mm`, `HakiosMetalVKOpen.mm`, `hakios_metal_shown.c`) and `libhakios.dylib` (`inject.c`);
+- PanVK with the new `panvk-host-memory.patch` (sealed pages, image alignment), `panvk-large-constants.patch` and the new
+  hakios-drm (`tools/mk-panvk.sh`: the changed patches re-extract Mesa and rebuild PanVK whole);
+- Mesa's OpenGL ES with the new hakios-drm (`hakios_drm_host_pages_sealed` is unused there);
+- `metal_tri` (`--texel-buffer`).
+
+Built as build 60 was (`userland/build.sh ALONE=1 RC=rc.launchd DEVICE=star2lte REST=1 GL=1 NO_AIR=1 SYSTEM=1
+PANVK_DIR=... M2V_DIR=... METAL=vk METAL_ICD=/redwood/lib/libvulkan_panfrost.dylib`), the boot line without `camtl=1`
+(`metal=2` from the S9+'s configuration). Then:
+
+- the boot says "the window server draws with Metal" (inject.c) and "opened now, for the window server" (the plug-in);
+- with `camtl=0` once, and with `-backboardd` in `/private/var/db/HakiosMetal.clients`, it draws with OpenGL ES;
+- `m6.sh` and `cpuidle` as above; `shadow.log` of backboardd;
+- Settings > Wallpaper > Add New Wallpaper > Astronomy: no "job hung" line, and the Earth drawn.
+
+### Next walls
+
+1. The Astronomy wallpaper's Earth at 0.7 s a frame: 246 global loads of its tables at one thread a lane. A table could be
+   a UBO pushed in part to the FAU, or the shader kept at two threads (its register pressure).
+2. The textures still shadowed in backboardd: metal2vulkan asks storage usage of every texture over a buffer, which costs
+   the 16-byte alignment; and A8 images whose rounded height runs past the buffer.
+3. The cleans of CoreAnimation's images shared with other processes (3.5 MB a second idle): their producers write them
+   once; knowing that needs the kernel (a seed of the memory, as an IOSurface has).
