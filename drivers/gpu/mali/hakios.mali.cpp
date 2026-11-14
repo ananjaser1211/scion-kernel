@@ -17,10 +17,9 @@
  * What there is: parameters, buffers (made, entered into the GPU's address space, told their address, mapped, given
  * back), and job chains, queued and run one at a time by a thread of hakios.mali.c's, with a number to wait for. A
  * buffer is wired kernel memory, zero when made and write-combined, so what the program writes goes to memory where the
- * GPU, which does not look into the processors' caches here, reads it. Requests 0x7b to 0x7f are ours: pages of the
- * program's own as a buffer, an IOSurface's memory as a buffer, the job a surface is drawn by, a wait for a job by its
- * number, and a test's pixels shown. Not here
- * yet: an address space for each program, interrupts, buffers shared between programs as file descriptors.
+ * GPU, which does not look into the processors' caches here, reads it. Requests 0x7a to 0x7f are ours: a range of a
+ * buffer's lines cleaned and invalidated, pages of the program's own as a buffer, an IOSurface's memory as a buffer, the
+ * job a surface is drawn by, a wait for a job by its number, and a test's pixels shown. Not here yet: an address space for each program, interrupts, buffers shared between programs as file descriptors.
  *
  * Who may open it: whoever asks, as HakiosGPU. The window server's process, backboardd, does not run as root (PixOS
  * found that out on another phone), so nothing here asks for root.
@@ -68,6 +67,8 @@ bool hakios_mali_wait(uint64_t seq, uint64_t timeout_ns);
 void HakiosMaliStart(void);
 void MiniIOMobileFramebufferShow(const uint8_t * pixels, uint32_t width, uint32_t height, uint32_t rowBytes);
 void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);      /* osfmk/arm64/caches_asm.s */
+vm_offset_t phystokv(uint64_t pa);                              /* osfmk/arm64/pmap: the kernel's alias of RAM */
+boolean_t pmap_valid_address(uint64_t addr);                    /* memory the kernel manages */
 
 /* what programs have done with the GPU so far, for drivers/gpu/mali/hakios.mali.c to repeat in the log */
 uint32_t gMaliClients, gMaliBuffers, gMaliSubmits, gMaliFailed, gMaliShown;
@@ -86,6 +87,7 @@ enum {
 	kPanfrostGetParam       = 0x44,
 	kPanfrostGetBOOffset    = 0x45,
 	kPanfrostMadvise        = 0x48,
+	kHakiosMaliSync         = 0x7a,         /* ours: a range of a buffer's lines cleaned and invalidated (struct mali_sync) */
 	kHakiosMaliUserMemory   = 0x7b,         /* ours: pages of the caller's own as a buffer, as HakiosGPU's 0x7d (struct mali_user_memory) */
 	kHakiosMaliSurfaceSeq   = 0x7c,         /* ours: a surface's last job, or "drawing, not yet sent" (struct mali_surface_seq) */
 	kHakiosMaliWait         = 0x7d,         /* ours: wait for a job by its number (struct mali_wait) */
@@ -107,6 +109,13 @@ struct mali_user_memory {
 	uint64_t address, size;                 /* in the caller, in whole pages */
 	uint32_t handle;                        /* back: the buffer */
 	uint32_t flags;
+};
+
+/* kHakiosMaliSync: as tools/mesa/hakios-drm's hakios_drm_sync() passes it; bytes offset to offset + size of buffer `handle` */
+struct mali_sync {
+	uint32_t handle;
+	uint32_t flags;                         /* none yet: 0 */
+	uint64_t offset, size;
 };
 
 /* kHakiosMaliWait: job `seq` (what kPanfrostSubmit gave back in `jc`) done within timeout_ns, or kIOReturnTimeout */
@@ -318,6 +327,7 @@ class HakiosMaliUserClient : public IOUserClient
 	    uint32_t flags);
 	IOReturn surfaceBuffer(struct mali_surface * request);
 	IOReturn userBuffer(struct mali_user_memory * request);
+	IOReturn syncBuffer(const struct mali_sync * request);
 
 public:
 	virtual bool initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties) APPLE_KEXT_OVERRIDE;
@@ -536,10 +546,11 @@ HakiosMaliUserClient::surfaceBuffer(struct mali_surface * request)
 /*
  * Pages of the client's own as a buffer, as Linux's userptr and HakiosGPU's request 0x7d: wired for as long as the buffer
  * is there and entered into the GPU's address space. Vulkan's VK_EXT_external_memory_host over it (PanVK,
- * tools/mesa/panvk/panvk-host-surfaces.patch): Metal's no-copy buffers, which metal2vulkan otherwise copies at every
+ * tools/mesa/panvk/panvk-host-memory.patch): Metal's no-copy buffers, which metal2vulkan otherwise copies at every
  * commit. They are ordinary cached memory, which the GPU does not see through the processors' caches: whoever writes them
  * cleans its lines before a job reads them, and invalidates them before it reads what a job wrote (PanVK's
- * vkFlushMappedMemoryRanges and vkInvalidateMappedMemoryRanges over its non-coherent type, which metal2vulkan calls). Only
+ * vkFlushMappedMemoryRanges and vkInvalidateMappedMemoryRanges over its non-coherent type, which metal2vulkan calls, and
+ * which ask this client to do it: kHakiosMaliSync, syncBuffer()). Only
  * pages the client may write: a job could write any of them, and pages it may only read are not its to have written.
  * Called without the lock: wiring may wait for the pages.
  */
@@ -582,6 +593,81 @@ HakiosMaliUserClient::userBuffer(struct mali_user_memory * request)
 		memory->release();
 		return kIOReturnNoMemory;
 	}
+	return kIOReturnSuccess;
+}
+
+/*
+ * A range of a buffer's lines cleaned and invalidated to the point of coherency (kHakiosMaliSync): what PanVK's
+ * vkFlushMappedMemoryRanges and vkInvalidateMappedMemoryRanges ask for the client's own pages (userBuffer), which are
+ * cached and which the GPU does not see through the processors' caches. Before a job reads them, what the processors
+ * wrote goes out to memory; after a job wrote them, the processors read memory, not lines fetched before.
+ *
+ * The program cannot do this itself at any speed: with the Exynos M3s up, EL0's cache maintenance by VA traps
+ * (SCTLR_EL1.UCI clear, xnu patch 1511) and costs about 0.67 us a line, 44 ms for 4 MB, where here it is the
+ * instruction's own cost; and iOS's sys_dcache_flush() is a DSB alone. Done on the kernel's alias of each page, as
+ * patch 1511 does (the data caches are physically tagged), so a page the client unmapped meanwhile cannot fault the
+ * kernel: the pages stay wired while the buffer is there, and the descriptor is held across the work, done without the
+ * lock. An IOSurface's buffer has its pixels' lines done the same way through the kernel's mapping (flushSurface's);
+ * a buffer this client made is write-combined, with nothing in a cache.
+ */
+static void
+flushPhysical(uint64_t phys, uint64_t length)
+{
+	while (length != 0) {
+		uint64_t n = PAGE_SIZE - (phys & PAGE_MASK);
+
+		if (n > length) {
+			n = length;
+		}
+		if (pmap_valid_address(phys)) {
+			FlushPoC_DcacheRegion(phystokv(phys), (size_t) n);
+		}
+		phys += n;
+		length -= n;
+	}
+}
+
+IOReturn
+HakiosMaliUserClient::syncBuffer(const struct mali_sync * request)
+{
+	IOMemoryDescriptor * memory = NULL;
+	struct mali_buffer * b;
+	uint64_t end;
+
+	if (request->flags != 0) {
+		return kIOReturnBadArgument;
+	}
+	IOLockLock(gMaliLock);
+	b = buffer(request->handle);
+	if (b == NULL || request->offset >= b->size) {
+		IOLockUnlock(gMaliLock);
+		return b == NULL ? kIOReturnNotFound : kIOReturnBadArgument;
+	}
+	end = request->size > b->size - request->offset ? b->size : request->offset + request->size;
+	if (b->user) {
+		memory = b->memory;
+		memory->retain();
+	} else if (b->surface != NULL && gMaliFlush && b->surface->kpixels != NULL && b->surface->scanPhys == 0 &&
+	    request->offset < b->surface->info.allocSize) {
+		uint64_t stop = end < b->surface->info.allocSize ? end : b->surface->info.allocSize;
+
+		FlushPoC_DcacheRegion((vm_offset_t) b->surface->kpixels + request->offset, (size_t) (stop - request->offset));
+	}
+	IOLockUnlock(gMaliLock);
+	for (uint64_t at = request->offset; memory != NULL && at < end;) {
+		IOByteCount length = 0;
+		addr64_t phys = memory->getPhysicalSegment(at, &length, kIOMemoryMapperNone);
+
+		if (phys == 0 || length == 0) {
+			break;
+		}
+		if (length > end - at) {
+			length = (IOByteCount) (end - at);
+		}
+		flushPhysical(phys, length);
+		at += length;
+	}
+	OSSafeReleaseNULL(memory);
 	return kIOReturnSuccess;
 }
 
@@ -649,6 +735,7 @@ HakiosMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
 		struct mali_wait waitseq;
 		struct mali_surface_seq sseq;
 		struct mali_user_memory user;
+		struct mali_sync sync;
 	} r;
 	size_t size = args->structureInputSize;
 	struct mali_buffer * b;
@@ -693,6 +780,10 @@ HakiosMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
 			args->structureOutputSize = (uint32_t) size;
 		}
 		return ret;
+	}
+	/* lines cleaned and invalidated, a client's pages without the lock held (syncBuffer) */
+	if (selector == kHakiosMaliSync) {
+		return syncBuffer(&r.sync);
 	}
 	/* pages of the client's: wired before the lock is taken (userBuffer) */
 	if (selector == kHakiosMaliUserMemory) {
