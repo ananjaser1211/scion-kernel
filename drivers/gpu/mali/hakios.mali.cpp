@@ -56,6 +56,7 @@ bool hakios_mali_ready(void);
 bool hakios_mali_parameter(uint32_t which, uint64_t * value);
 uint64_t hakios_mali_address(uint64_t size, bool executable);
 bool hakios_mali_map(uint64_t gpu, uint64_t phys);
+bool hakios_mali_map_read_only(uint64_t gpu, uint64_t phys);
 void hakios_mali_mapped(void);
 void hakios_mali_unmap(uint64_t gpu, uint64_t size);
 void hakios_mali_tag(uint64_t address, uint32_t kind, uint32_t width, uint32_t height, uint32_t row_bytes,
@@ -108,8 +109,10 @@ struct mali_surface {
 struct mali_user_memory {
 	uint64_t address, size;                 /* in the caller, in whole pages */
 	uint32_t handle;                        /* back: the buffer */
-	uint32_t flags;
+	uint32_t flags;                         /* back: kMaliUserReadOnly */
 };
+#define kMaliUserReadOnly       1u              /* pages the client may only read, which the GPU may only read too */
+#define kMaliBufferReadOnly     (1u << 31)      /* newBuffer(): mapped for the GPU to read only (not Linux's PANFROST_BO_*) */
 
 /* kHakiosMaliSync: as tools/mesa/hakios-drm's hakios_drm_sync() passes it; bytes offset to offset + size of buffer `handle` */
 struct mali_sync {
@@ -427,7 +430,8 @@ HakiosMaliUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint
 		addr64_t phys = memory->getPhysicalSegment(from + offset, &length, kIOMemoryMapperNone);
 
 		/* (hakios_mali_map() takes only memory the kernel manages: pmap_valid_address()) */
-		mapped = phys != 0 && hakios_mali_map(b->address + offset, phys);
+		mapped = phys != 0 && ((flags & kMaliBufferReadOnly) ? hakios_mali_map_read_only(b->address + offset, phys) :
+		    hakios_mali_map(b->address + offset, phys));
 	}
 	if (b->address == 0 || !mapped) {
 		if (b->address != 0) {
@@ -550,8 +554,14 @@ HakiosMaliUserClient::surfaceBuffer(struct mali_surface * request)
  * commit. They are ordinary cached memory, which the GPU does not see through the processors' caches: whoever writes them
  * cleans its lines before a job reads them, and invalidates them before it reads what a job wrote (PanVK's
  * vkFlushMappedMemoryRanges and vkInvalidateMappedMemoryRanges over its non-coherent type, which metal2vulkan calls, and
- * which ask this client to do it: kHakiosMaliSync, syncBuffer()). Only
- * pages the client may write: a job could write any of them, and pages it may only read are not its to have written.
+ * which ask this client to do it: kHakiosMaliSync, syncBuffer()).
+ *
+ * Pages the client may write are wired for writing, and the GPU may write them. Pages it may only read are wired for
+ * reading and entered for the GPU to read only (kMaliUserReadOnly back in `flags`): a job that writes one faults, as
+ * the processor would. The window server on Metal had 168 of its 353 no-copy buffers refused when only writable pages
+ * were taken (docs/metal.md, phase 6), every one of them read only to it: CoreAnimation's images shared from other
+ * processes (VM tag 51, shared, mapped by 3 to 40 of them) and read-only copies of its own (tag 7, up to 9 MB), which
+ * metal2vulkan then copied in at every commit, 1.2 MB a commit.
  * Called without the lock: wiring may wait for the pages.
  */
 IOReturn
@@ -560,6 +570,7 @@ HakiosMaliUserClient::userBuffer(struct mali_user_memory * request)
 	IOMemoryDescriptor * memory;
 	struct mali_buffer * b;
 	IOReturn prepared;
+	bool readOnly = false;
 
 	if ((request->address & PAGE_MASK) || (request->size & PAGE_MASK) || request->size == 0 ||
 	    request->size > MALI_BUFFER_MAX || fTask == NULL) {
@@ -571,17 +582,28 @@ HakiosMaliUserClient::userBuffer(struct mali_user_memory * request)
 	}
 	prepared = memory->prepare();
 	if (prepared != kIOReturnSuccess) {
+		/* not writable by the client: for reading, then */
+		memory->release();
+		memory = IOMemoryDescriptor::withAddressRange(request->address, request->size, kIODirectionOut, fTask);
+		if (memory == NULL) {
+			return kIOReturnNoMemory;
+		}
+		readOnly = true;
+		prepared = memory->prepare();
+	}
+	if (prepared != kIOReturnSuccess) {
 		static uint32_t said;
 
 		if (said++ < 8) {
-			IOLog("HakiosMali: pages at %#llx (%llu bytes) of the client's cannot be wired for writing: %#x\n",
+			IOLog("HakiosMali: pages at %#llx (%llu bytes) of the client's cannot be wired: %#x\n",
 			    request->address, request->size, prepared);
 		}
 		memory->release();
 		return kIOReturnVMError;
 	}
 	IOLockLock(gMaliLock);
-	b = newBuffer(memory, 0, request->size, &request->handle, PANFROST_BO_NOEXEC);
+	b = newBuffer(memory, 0, request->size, &request->handle,
+	    PANFROST_BO_NOEXEC | (readOnly ? kMaliBufferReadOnly : 0));
 	if (b != NULL) {
 		b->memory = memory;
 		b->user = true;
@@ -593,6 +615,7 @@ HakiosMaliUserClient::userBuffer(struct mali_user_memory * request)
 		memory->release();
 		return kIOReturnNoMemory;
 	}
+	request->flags = readOnly ? kMaliUserReadOnly : 0;
 	return kIOReturnSuccess;
 }
 

@@ -500,6 +500,7 @@ as0_update(uint64_t transtab, uint32_t transcfg)
 #define PTE_AF              (1ull << 10)
 #define PTE_SH_INNER        (3ull << 8)
 #define PTE_AP_RW           (1ull << 6)
+#define PTE_AP_RO           (3ull << 6)         /* read only: a write is a permission fault (hakios_mali_map_read_only) */
 #define PTE_ADDRESS         0x0000fffffffff000ull
 #define GPU_VA_BITS         35u
 #define GPU_PA_BITS_NEEDED  36u         /* the S9's memory: 0x80000000-0xFFFFFFFF and 0x880000000-0x8FFFFFFFF */
@@ -595,9 +596,10 @@ pt_below(uint64_t *entry)
 	return table;
 }
 
-/* One 4 KB page of physical memory at GPU address `gpu` (with the lock held, or before anyone else runs). */
+/* One 4 KB page of physical memory at GPU address `gpu`, read only unless `writable` (with the lock held, or before
+ * anyone else runs). */
 static bool
-map_page(uint64_t gpu, uint64_t phys)
+map_page_as(uint64_t gpu, uint64_t phys, bool writable)
 {
 	uint64_t *middle, *bottom, *entry;
 
@@ -630,9 +632,15 @@ map_page(uint64_t gpu, uint64_t phys)
 		return false;
 	}
 	entry = &bottom[(gpu >> 12) & 511];
-	*entry = (phys & PTE_ADDRESS) | PTE_AF | PTE_SH_INNER | PTE_AP_RW | PTE_PAGE;
+	*entry = (phys & PTE_ADDRESS) | PTE_AF | PTE_SH_INNER | (writable ? PTE_AP_RW : PTE_AP_RO) | PTE_PAGE;
 	FlushPoC_DcacheRegion((vm_offset_t)entry, sizeof(*entry));
 	return true;
+}
+
+static bool
+map_page(uint64_t gpu, uint64_t phys)
+{
+	return map_page_as(gpu, phys, true);
 }
 
 /* The entries of `size` bytes from GPU address `gpu` emptied, as far as there are tables (with the lock held). */
@@ -1443,6 +1451,18 @@ hakios_mali_map(uint64_t gpu, uint64_t phys)
 
 	lck_mtx_lock(&mali_lock);
 	done = map_page(gpu, phys);
+	lck_mtx_unlock(&mali_lock);
+	return done;
+}
+
+/* As hakios_mali_map(), for the GPU to read only: pages a program may only read (hakios.mali.cpp's userBuffer) */
+bool
+hakios_mali_map_read_only(uint64_t gpu, uint64_t phys)
+{
+	bool done;
+
+	lck_mtx_lock(&mali_lock);
+	done = map_page_as(gpu, phys, false);
 	lck_mtx_unlock(&mali_lock);
 	return done;
 }
