@@ -1,0 +1,184 @@
+panvk: the Bifrost compiler's register allocator spills in growing batches, not one value per pass
+
+Applied by tools/mk-panvk.sh only, after tools/mesa/*.patch and the panvk patches before it, to Mesa 25.0.7 (Mesa's own licence, MIT,
+applies to the lines it changes). Written for Scion. The OpenGL ES driver (tools/mk-mesa.sh) does not take it.
+
+Why. bi_register_allocate() tries to colour the whole program, and when it fails it spills the one value that interferes most
+with the node that failed, then builds the interference graph again from nothing and tries again, up to 2000 times. metal2vulkan's
+capture replay kernels (the Astronomy wallpaper's first pass, docs/metal.md, phases 5 and 7) spill about a thousand values, and
+each pass over them costs a second or more of the Mali-G72's processor in bi_allocate_registers' liveness and interference
+(301 and 73 of 501 samples of a spindump), so the kernel took minutes to make, and AegirPoster's extension sat at 100% of a
+core for 9 minutes and more.
+
+What. A shader that colours after a few spills spills exactly as before: the first BI_SPILL_RAMP (8) failed passes each spill the
+best one value, as before. A shader that keeps failing spills twice as many values every 8 passes, up to BI_SPILL_BATCH_MAX (64)
+at a time, the best ones by the same measure (the most constraints), all among the values that interfere with the node that
+failed. A thousand spills then take about 60 passes, not a thousand.
+
+
+--- a/src/panfrost/compiler/bi_ra.c
++++ b/src/panfrost/compiler/bi_ra.c
+@@ -609,8 +609,43 @@
+ 
+ /* If register allocation fails, find the best spill node */
+ 
+-static signed
+-bi_choose_spill_node(bi_context *ctx, struct lcra_state *l)
++/* Scion: register allocation spills in batches (bi_register_allocate) */
++#define BI_SPILL_RAMP      8
++#define BI_SPILL_BATCH_MAX 64
++
++/* Scion: the candidate with the most constraints first; equal ones in node
++ * order, as the single choice took the first of them. */
++struct bi_spill_choice {
++   unsigned benefit;
++   unsigned node;
++};
++
++static void
++bi_keep_spill_choice(struct bi_spill_choice *best, unsigned *count,
++                     unsigned max, unsigned node, unsigned benefit)
++{
++   unsigned at = *count;
++
++   if (at == max) {
++      if (benefit <= best[max - 1].benefit)
++         return;
++      at = max - 1;
++   } else {
++      (*count)++;
++   }
++
++   while (at > 0 && best[at - 1].benefit < benefit) {
++      best[at] = best[at - 1];
++      at--;
++   }
++
++   best[at] = (struct bi_spill_choice){benefit, node};
++}
++
++/* Up to `max` nodes to spill, best first, into `nodes`: their number. */
++static unsigned
++bi_choose_spill_nodes(bi_context *ctx, struct lcra_state *l, signed *nodes,
++                      unsigned max)
+ {
+    /* Pick a node satisfying bi_spill_register's preconditions */
+    BITSET_WORD *no_spill =
+@@ -632,8 +667,8 @@
+       }
+    }
+ 
+-   unsigned best_benefit = 0.0;
+-   signed best_node = -1;
++   struct bi_spill_choice best[BI_SPILL_BATCH_MAX];
++   unsigned count = 0;
+ 
+    if (nodearray_is_sparse(&l->linear[l->spill_node])) {
+       nodearray_sparse_foreach(&l->linear[l->spill_node], elem) {
+@@ -650,10 +685,8 @@
+ 
+          unsigned benefit = lcra_count_constraints(l, i);
+ 
+-         if (benefit > best_benefit) {
+-            best_benefit = benefit;
+-            best_node = i;
+-         }
++         if (benefit > 0)
++            bi_keep_spill_choice(best, &count, max, i, benefit);
+       }
+    } else {
+       nodearray_value *row = l->linear[l->spill_node].dense;
+@@ -669,15 +702,17 @@
+ 
+          unsigned benefit = lcra_count_constraints(l, i);
+ 
+-         if (benefit > best_benefit) {
+-            best_benefit = benefit;
+-            best_node = i;
+-         }
++         if (benefit > 0)
++            bi_keep_spill_choice(best, &count, max, i, benefit);
+       }
+    }
+ 
+    free(no_spill);
+-   return best_node;
++
++   for (unsigned i = 0; i < count; ++i)
++      nodes[i] = best[i].node;
++
++   return count;
+ }
+ 
+ static unsigned
+@@ -1084,6 +1119,7 @@
+    bool success = false;
+ 
+    unsigned iter_count = 2000; /* max iterations */
++   unsigned failures = 0;
+ 
+    /* Number of bytes of memory we've spilled into */
+    unsigned spill_count = ctx->info.tls_size;
+@@ -1116,31 +1152,45 @@
+       if (success) {
+          ctx->info.work_reg_count = 64;
+       } else {
+-         signed spill_node = bi_choose_spill_node(ctx, l);
++         /* Scion: one node per pass, each pass building the interference
++          * graph again, took minutes over a kernel that spills thousands of
++          * values (metal2vulkan's capture replay on the Mali-G72). A shader
++          * that fits after a few spills spills exactly as before; one that
++          * keeps failing spills twice as many nodes each BI_SPILL_RAMP
++          * passes, up to BI_SPILL_BATCH_MAX at a time, all of them among
++          * the nodes that interfere with the one that failed.
++          */
++         signed spill_nodes[BI_SPILL_BATCH_MAX];
++         unsigned batch =
++            MIN2(1u << MIN2(failures / BI_SPILL_RAMP, 31), BI_SPILL_BATCH_MAX);
++         unsigned spills = bi_choose_spill_nodes(ctx, l, spill_nodes, batch);
++         failures++;
+          lcra_free(l);
+          l = NULL;
+ 
+-         if (spill_node == -1)
++         if (spills == 0)
+             unreachable("Failed to choose spill node\n");
+ 
+          if (ctx->inputs->is_blend)
+             unreachable("Blend shaders may not spill");
+ 
+-         /* By default, we use packed TLS addressing on Valhall.
+-          * We cannot cross 16 byte boundaries with packed TLS
+-          * addressing. Align to ensure this doesn't happen. This
+-          * could be optimized a bit.
+-          */
+-         if (ctx->arch >= 9)
+-            spill_count = ALIGN_POT(spill_count, 16);
+-
+-         spill_count +=
+-            bi_spill_register(ctx, bi_get_index(spill_node), spill_count);
+-
+-         /* In case the spill affected an instruction with tied
+-          * operands, we need to fix up.
+-          */
+-         bi_coalesce_tied(ctx);
++         for (unsigned i = 0; i < spills; ++i) {
++            /* By default, we use packed TLS addressing on Valhall.
++             * We cannot cross 16 byte boundaries with packed TLS
++             * addressing. Align to ensure this doesn't happen. This
++             * could be optimized a bit.
++             */
++            if (ctx->arch >= 9)
++               spill_count = ALIGN_POT(spill_count, 16);
++
++            spill_count +=
++               bi_spill_register(ctx, bi_get_index(spill_nodes[i]), spill_count);
++
++            /* In case the spill affected an instruction with tied
++             * operands, we need to fix up.
++             */
++            bi_coalesce_tied(ctx);
++         }
+       }
+    }
+ 
