@@ -701,3 +701,20 @@ HAKIOS_VK_ICD`, plus a `backboardd` line in the clients file; both were taken ba
 **Needs an image** (kernel and userland): HakiosMali `0x7a` and read-only `0x7b` in the kernel; PanVK with
 `panvk-host-memory.patch` and the new hakios-drm; metal2vulkan with 0009. Then backboardd on Metal is measured again the same
 way, against GLES. GLES stays the default until then.
+
+### On the phone, build 58 (kernel and image at 6607f09)
+
+- `vk_hostcoh ... 4 20 vk`: 4 MB imported in type 1, 20 rounds of 65536 lines, **0 lost** either way; 1.14 ms of
+  CPU and 1.12 ms of GPU a round (the trapped EL0 DC CIVAC cost 87 ms).
+- backboardd on Metal (`backboardd` line in the clients file, `camtl=1`): no copies at all (0 KB in, 0 KB out;
+  138 no-copy buffers imported, 7 over IOSurfaces). Home screen, dock translucency and blurs draw correctly.
+
+| | GLES (build 58) | Metal (build 58) | Metal (build 57, copies) |
+|---|---|---|---|
+| backboardd CPU, six swipes | 6–69% | 24–80% | 82–161% |
+| CPU idle after | ~20% | 27–33% | ~125% |
+| RSS | 105–113 MB | 79–86 MB | 140–158 MB |
+| commit to completion | ~9 ms | 20 ms average (111 ms slowest, start-up) | 82 ms |
+
+The window server on Metal now costs about what GLES costs and uses less memory. What is left: the commit to
+completion latency, and about 10% more idle CPU.
