@@ -473,3 +473,33 @@ shows stripes and a lavender background.
 
 **`setDepthClipMode:`** is now forwarded to the runtime (`nmb_render_set_depth_clip_mode`). CoreLocation's precise-location
 prompt plug-in threw on it as an unrecognized selector. The alert it left on the lock screen then stopped taking touches.
+
+### On the phone, builds 49 and 50 (14 November 2026)
+
+- **AegirPoster** makes every one of its blended `aegir_*` pipelines (`ok=1` in `/var/tmp/m2v/pipelines.log`, attachments 555 and 10)
+  and no command buffer is refused any more. When the Astronomy preview opens it runs about 100% CPU for about a minute (to about
+  225 MB) and then goes idle. It has **presented no drawable** through `presentDrawable:`: the conversion's log line never appears. The
+  gallery tile and the preview stay black. Next: find where that minute goes and whether the extension presents another way.
+- **The Weather wallpaper's** gallery tile now draws (build 50). The location prompt's map circle draws (`setDepthClipMode:`).
+- **MetalTri.app with its own plug-in** (`MTXRBlend over`): a blended `BGR10_XR` CAMetalLayer, every frame judged exact (largest error
+  1 code) and shown in the right colours through the GLES compositor. Before the conversion at present it showed stripes on lavender.
+
+## Phase 3, step 2: the window server on Metal (`camtl=1`), first tries
+
+`camtl=1` and a `backboardd` line in `/private/var/db/HakiosMetal.clients`, then backboardd restarted; reverted the same way.
+
+- **Build 49:**
+  - The device opens in about 520 ms and CoreAnimation makes 126 pipelines from its pipeline library.
+  - Then backboardd aborts at its first frame: QuartzCore says "Metal failed to specialize fragment function:
+    function=fixed_frag_lph_cph spec=A2Xhf".
+  - launchd counted 8 crashes in a row before the line was taken out.
+- **Build 50** (refused specializations are now logged):
+  - The cause is `constant type 51 is not qualified`. QuartzCore's uber shader takes a `uchar3` function constant, and the frontend
+    refused every 3-lane vector type.
+  - Fixed in `05e6bda`: lanes times the scalar, as the bridge packs it. That fix needs an image to be tried.
+- **The GLES baseline**, under six home-screen page swipes:
+  - backboardd CPU averages about 36% (peaks 67%), RSS about 129 MB;
+  - the eagl frame line (every 20th frame) shows 4 to 31 ms, a median of about 9 ms.
+- **What is not yet known:** Metal's numbers, which need a backboardd that survives its first frame.
+- **Default and fallback:** GLES stays the default and the fallback. The Metal road stays behind `camtl=1` plus the clients line, until
+  it has run a session without aborting.
