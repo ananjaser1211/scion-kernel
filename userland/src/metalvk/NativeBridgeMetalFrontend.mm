@@ -286,7 +286,7 @@ void (*native_bridge_metal_log_hook)(const char *);
 #define NBLOG(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];NSLog(@"%@",nbText);\
  if(native_bridge_metal_log_hook)native_bridge_metal_log_hook(nbText.UTF8String?:"?");noteProblem(nbText);}while(0)
 
-// ---- what a process does with its drawables: said once each, and as a tally at its 1st, 100th, 1000th and 10000th commit ----
+// ---- what a process does with its drawables: said once each, and as a tally at its 1st, 100th and 1000th commit and every 1000th after ----
 // The Astronomy wallpaper (AegirPoster) made every pipeline and presented nothing (docs/metal.md, builds 49 and 50). These lines say which of
 // the steps between happen: textures over IOSurfaces (a CAMetalLayer's drawables), presents through a command buffer (presentDrawable:) and
 // presents by the drawable itself (-[CAMetalDrawable present], which this device never sees otherwise), commits, and large texture loads.
@@ -294,6 +294,8 @@ void (*native_bridge_metal_log_hook)(const char *);
 #define NBSAY(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];NSLog(@"%@",nbText);\
  if(native_bridge_metal_log_hook)native_bridge_metal_log_hook(nbText.UTF8String?:"?");}while(0)
 static std::atomic<uint64_t> gSaidSurfaceTextures,gBufferPresents,gDrawablePresents,gBigLoads,gBigLoadBytes,gBigLoadUs;
+// (no-copy buffers made, by callers and over IOSurfaces, and released: newBufferWithBytesNoCopy:, surfaceBuffer below)
+static std::atomic<uint64_t> gNoCopyAll,gNoCopyMade,gNoCopyReleased,gSurfaceImportsMade,gSurfaceImportsReleased;
 static std::atomic<bool> gSaidSurface,gSaidBufferPresent,gSaidDrawablePresent,gSaidBigLoad,gSaidCommit;
 static thread_local bool tPresentingForBuffer;
 // A texture load (replaceRegion:) of this many bytes or more is a large one.
@@ -304,6 +306,22 @@ static void sayTally(uint64_t commits) {
   "themselves (-present), %llu large texture loads (%llu MB in %llu ms)",(unsigned long long)commits,(unsigned long long)gSaidSurfaceTextures.load(),
   (unsigned long long)gBufferPresents.load(),(unsigned long long)gDrawablePresents.load(),(unsigned long long)gBigLoads.load(),
   (unsigned long long)(gBigLoadBytes.load()>>20),(unsigned long long)(gBigLoadUs.load()/1000));
+ // Since the last tally: how fast commits came, the GPU's commit-to-completion, and what the runtime copied of no-copy buffers the driver
+ // could not import (tools/metal/m2v/0002), against the no-copy buffers made, by callers and over IOSurfaces (the window server on Metal:
+ // docs/metal.md, phase 5).
+ static std::mutex lock;static uint64_t lastCommits,lastUs,lastDone,lastDoneUs,lastCopies[4];
+ std::lock_guard<std::mutex> held(lock);
+ uint64_t copies[4]={};nmb_host_copies(copies);
+ const uint64_t now=nowUs(),done=gTimeEncodeToCommit.count.load(),doneUs=gTimeEncodeToCommit.total.load();
+ const uint64_t n=commits-lastCommits,span=lastUs?now-lastUs:0,completions=done-lastDone;
+ NBSAY(@"native-metal: commits %llu to %llu: %llu ms apart on average, the GPU's commit to completion %llu us on average (%llu ms the "
+  "slowest yet); copies of no-copy buffers not imported: %llu KB in (%llu ms), %llu KB out (%llu ms); no-copy buffers %llu by callers, %llu over "
+  "IOSurfaces",(unsigned long long)lastCommits+1,(unsigned long long)commits,(unsigned long long)(lastUs&&n?span/n/1000:0),
+  (unsigned long long)(completions?(doneUs-lastDoneUs)/completions:0),(unsigned long long)(gTimeEncodeToCommit.slowest.load()/1000),
+  (unsigned long long)((copies[0]-lastCopies[0])>>10),(unsigned long long)((copies[2]-lastCopies[2])/1000000),
+  (unsigned long long)((copies[1]-lastCopies[1])>>10),(unsigned long long)((copies[3]-lastCopies[3])/1000000),
+  (unsigned long long)gNoCopyAll.load(),(unsigned long long)gSurfaceImportsMade.load());
+ lastCommits=commits;lastUs=now;lastDone=done;lastDoneUs=doneUs;memcpy(lastCopies,copies,sizeof copies);
 }
 // -[CAMetalDrawable present] and its timed forms, counted and said the first time, then QuartzCore's own: a present not through a command
 // buffer reaches the drawable only. Installed once, with the device (native_bridge_metal_adopt).
@@ -469,7 +487,6 @@ drawable_xr_to_surface(id<MTLDrawable> drawable)
 // A no-copy import keeps its pages until the runtime frees it, which can be after the buffer object goes (a command buffer still using
 // it). The owner's release (Metal's deallocator, an IOSurface's mapping) waits for that, as Metal's does: run earlier, the owner could
 // unmap or reuse pages the GPU still reads or writes.
-static std::atomic<uint64_t> gNoCopyAll,gNoCopyMade,gNoCopyReleased,gSurfaceImportsMade,gSurfaceImportsReleased;
 static void releaseBlock(void *context,void *pointer,uint64_t length) {
  gNoCopyReleased++;
  void (^deallocator)(void *,NSUInteger)=(__bridge_transfer void (^)(void *,NSUInteger))context;deallocator(pointer,(NSUInteger)length);
@@ -1327,7 +1344,7 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs);
  if(self.commitIndex==1 && firstTime(gSaidCommit))
   NBSAY(@"native-metal: the first commit: %u render passes, %u draws, %llu thousand pixels, %u dispatches, %u blits",encodedWork.passes,
    encodedWork.draws,(unsigned long long)(encodedWork.pixels>>10),encodedWork.dispatches,encodedWork.blits);
- if(self.commitIndex==1 || self.commitIndex==100 || self.commitIndex==1000 || self.commitIndex==10000)sayTally(self.commitIndex);
+ if(self.commitIndex==1 || self.commitIndex==100 || self.commitIndex%1000==0)sayTally(self.commitIndex);
  dispatch_group_enter(_handlers);
  dispatch_group_enter(_schedulingHandlers);
  @synchronized(gInFlight){[gInFlight addObject:self];}
