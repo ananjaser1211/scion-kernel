@@ -1,0 +1,95 @@
+metal2vulkan: on PanVK, a texture over padded rows that a pass renders is an image over the bytes, not a shadow (Scion)
+
+Upstream:  metal2vulkan, https://github.com/steelbrain/metal2vulkan, at 720ef1ce9ae2a2068999a8675717418b9416283e, after
+           AdrenoMetal's 16 patches to it and Scion's 0001 to 0009; tools/metal/mk-metal2vulkan.sh applies them in that order,
+           then this.
+Licence:   GPL-2.0-or-later OR LGPL-3.0-or-later, metal2vulkan's (its LICENSE); this patch is a change to it and under the same
+           terms. Nothing of it is in Scion's MIT or APSL files.
+Author:    the HakiOS authors (Scion), 14 November 2026.
+
+Why. The window server's framebuffers are IOSurfaces 1125 pixels wide at rows of 4608 (and 4544) bytes. The bridge asks for
+padded rows to be aliased even where a pass writes them (PaddedReadsPolicy::AliasWrites), but the runtime takes that back
+where a tile store at the right or bottom edge could reach past the buffer: it assumes every driver stores whole 16x4-texel
+blocks there, and 2313 rows rounded up to 2316 end past the surface's last page. So every framebuffer was a shadow image:
+copied in from the surface before every command buffer and back after it, 1.2 to 1.3 ms of the GPU each way at every frame,
+in two more job chains (docs/metal.md, phase 7).
+
+What. The block a tile store writes is a fact of the driver (Device::tile_store_block). PanVK's Mali writes back each tile's
+pixels inside the framebuffer descriptor's width and height and none past them, which Mesa's own linear layout relies on (it
+pads no linear image's height and rounds rows only to 64 bytes): 1x1 there, the 16x4 block on every other driver.
+`metal_tri --surface --size 1125 --row-bytes 4608` checks on the phone that the bytes between the rows and after the last
+row keep what was there.
+
+--- a/crates/metal2vulkan-runtime/src/linear_plan.rs
++++ b/crates/metal2vulkan-runtime/src/linear_plan.rs
+@@ -766,18 +766,27 @@
+     )
+ }
+ 
++/// The texels a tile store writes as one block at a render target's right or bottom edge, where
++/// the driver is not known to keep to the attachment's extent: 16x4.
++pub(super) const TILE_STORE_BLOCK: (u64, u64) = (16, 4);
++
+ /// Whether a render pass that keeps a texture `width` texels wide over `layout`'s texels in tile
+ /// memory stores it back within the bytes an image over them may hold, in a buffer of
+ /// `buffer_length` bytes: a tile store reaching the texture's right or bottom edge writes whole
+-/// 16x4-texel blocks, so up to 15 texels past a row's last and 3 rows past its last row. Every
++/// blocks of `tile` texels ([`TILE_STORE_BLOCK`], 16x4: up to 15 texels past a row's last and 3
++/// rows past its last row; 1x1 on a driver whose stores keep to the attachment's extent). Every
+ /// row's block must end within its pitch, and the last block within the buffer; one slice only.
+-pub(super) fn tile_store_fits(layout: &BufferLayout, width: u64, buffer_length: u64) -> bool {
+-    const TILE: (u64, u64) = (16, 4);
++pub(super) fn tile_store_fits(
++    layout: &BufferLayout,
++    width: u64,
++    buffer_length: u64,
++    tile: (u64, u64),
++) -> bool {
+     if layout.slices != 1 || width == 0 || !layout.row_bytes.is_multiple_of(width) {
+         return false;
+     }
+-    let block_row = width.next_multiple_of(TILE.0) * (layout.row_bytes / width);
+-    let last_row = layout.rows.next_multiple_of(TILE.1) - 1;
++    let block_row = width.next_multiple_of(tile.0) * (layout.row_bytes / width);
++    let last_row = layout.rows.next_multiple_of(tile.1) - 1;
+     layout.row_pitch >= block_row
+         && layout
+             .offset
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -1387,6 +1387,21 @@
+ }
+ 
+ impl Device {
++    /// The block a tile store of this device's driver writes at a render target's right or
++    /// bottom edge (`linear_plan::tile_store_fits`). Scion (0010): PanVK's Mali (Bifrost and
++    /// Valhall's job manager) writes back each tile's pixels inside the framebuffer descriptor's
++    /// width and height and none past them, which Mesa's own linear layout relies on (it pads no
++    /// linear image's height and only rounds its rows to 64 bytes), so a store there reaches no
++    /// byte past a row's last texel or the last row; `metal_tri --surface --row-bytes` checks the
++    /// bytes between the rows and after the last one on the phone (docs/metal.md, phase 7). Every
++    /// other driver keeps the 16x4 block.
++    pub(super) fn tile_store_block(&self) -> (u64, u64) {
++        match self.properties().description.driver_id {
++            Some(metal2vulkan::vk::DriverId::MESA_PANVK) => (1, 1),
++            _ => super::linear_plan::TILE_STORE_BLOCK,
++        }
++    }
++
+     /// `newTextureWithDescriptor:`: a texture of `descriptor`, its contents undefined.
+     ///
+     /// A texture buffer's texels are a new buffer's, of the descriptor's options and as long as
+@@ -1966,7 +1981,12 @@
+         // A written texture's tile stores may reach past its rows (`linear_plan::tile_store_fits`):
+         // where they would leave the row gaps or the buffer, only a texture that reads aliases.
+         if policy == PaddedReadsPolicy::AliasWrites
+-            && !tile_store_fits(&texels.layout, u64::from(layout.extent[0]), texels.buffer.length())
++            && !tile_store_fits(
++                &texels.layout,
++                u64::from(layout.extent[0]),
++                texels.buffer.length(),
++                self.tile_store_block(),
++            )
+         {
+             policy = PaddedReadsPolicy::Alias;
+         }
