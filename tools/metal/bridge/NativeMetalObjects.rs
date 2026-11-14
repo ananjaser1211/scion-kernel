@@ -190,9 +190,10 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         // refused. Programs written for Apple's GPUs assume the fetch (CoreAnimation's luma_boost_lph), and a full-screen pass that reads
         // each pixel once reads Metal's value. The compile layer announces the precision note once per pipeline that takes it.
         options.policy.framebuffer_fetch = metal2vulkan::device::FramebufferFetchPolicy::AcceptUnordered;
-        // Every texture given a shadow image is announced with why no image aliases its bytes (`shadow.log`).
+        // Every texture given a shadow image is announced with why no image aliases its bytes (`shadow.log`), and every other
+        // degradation once (`degradations.log`).
         options.announce_each.insert(metal2vulkan_runtime::Degradation::ShadowedTexture);
-        let _ = SHADOW_LOG.set(PathBuf::from(cache.to_string_lossy().into_owned()).join("shadow.log"));
+        let _ = NOTICE_DIR.set(PathBuf::from(cache.to_string_lossy().into_owned()));
         Ok(boxed(NmbDevice(Device::system_default_with(&options).map_err(e("device"))?, std::sync::OnceLock::new(), std::sync::Mutex::new(()))))
     })
 }
@@ -211,31 +212,40 @@ fn millis_after(text: &str, marker: &str) -> Option<f64> {
     rest[..end].parse().ok()
 }
 
-// The distinct reasons textures were given shadow images, their numbers masked, each written once to the cache directory's shadow.log
-// with the first such texture's message, at most SHADOW_REASONS of them.
-static SHADOW_LOG: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-static SHADOW_SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-const SHADOW_REASONS: usize = 64;
+// The runtime's degradation notices (`metal2vulkan-degrade-<kind>`), each distinct text with its numbers masked written once into the
+// cache directory, at most NOTICES of them: each reason a texture was given a shadow image (announced at every such texture) to
+// shadow.log, every other kind once to degradations.log. The shadows used to be matched by the bare kind ("shadowed-texture"),
+// which no notice's id is, so the window server's shadowed framebuffers, copied in and out at every frame, went unseen
+// (docs/metal.md, phase 7).
+static NOTICE_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+static NOTICES_SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+const NOTICES: usize = 96;
 
-fn note_shadow(text: &str) {
+fn note_degradation(code: &str, text: &str) {
     let masked: String = text.chars().map(|c| if c.is_ascii_digit() { '#' } else { c }).collect();
-    let Ok(mut seen) = SHADOW_SEEN.lock() else { return };
-    if seen.len() >= SHADOW_REASONS || seen.contains(&masked) {
+    let Ok(mut seen) = NOTICES_SEEN.lock() else { return };
+    if seen.len() >= NOTICES || seen.contains(&masked) {
         return;
     }
     seen.push(masked);
-    if let Some(path) = SHADOW_LOG.get() {
+    if let Some(dir) = NOTICE_DIR.get() {
         use std::io::Write;
+        let shadow = code == metal2vulkan_runtime::Degradation::ShadowedTexture.code();
+        let path = dir.join(if shadow { "shadow.log" } else { "degradations.log" });
         if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(file, "{text}");
+            let _ = if shadow {
+                writeln!(file, "{text}")
+            } else {
+                writeln!(file, "{}: {text}", code.trim_start_matches("metal2vulkan-degrade-"))
+            };
         }
     }
 }
 
 fn observe_message(message: &DebugMessage) {
     use std::sync::atomic::Ordering::Relaxed;
-    if message.id_name == "shadowed-texture" {
-        note_shadow(&message.text);
+    if message.id_name.starts_with("metal2vulkan-degrade-") {
+        note_degradation(&message.id_name, &message.text);
     }
     if message.id_name == "metal2vulkan-pipeline-creation" {
         let made = millis_after(&message.text, " made in ");
