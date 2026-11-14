@@ -7,7 +7,7 @@
  * render pass, read back, on metal2vulkan's runtime over PanVK on the Mali-G72.
  *
  *   metal_tri [--bundle DIR] [--metallib FILE] [--size N] [--out FILE.ppm] [--surface] [--register] [--hold SECONDS]
- *             [--xr none|over|add] [--fetch]
+ *             [--xr none|over|add] [--fetch] [--row-bytes B] [--frames K]
  *
  * The device: MTLCreateSystemDefaultDevice() first, Metal's own discovery (the kernel names the plug-in with boot-arg metal=N). When it
  * answers nil, the plug-in at --bundle (default /redwood/lib/HakiosMetal.bundle) is loaded and its class made the way Metal makes it,
@@ -37,6 +37,12 @@
  * --fetch draws the triangle twice in one pass with a fragment function that reads its colour attachment ([[color(0)]], framebuffer
  * fetch: tools/metal/air/tri_fetch.ll, the corners' mix over 2 plus the attachment over 2) and judges every pixel against 3/4 of the mix
  * plus 1/4 of the clear (fetch_check below); with --surface into a texture over an IOSurface.
+ *
+ * --row-bytes B makes the --surface surface's rows B bytes apart instead of 4 N (a multiple of 16, as Metal asks): the window server's
+ * framebuffers are 1125 pixels wide at 4608-byte rows, wider than the driver's own linear rows (4544), so they are textures whose
+ * image cannot be the driver's linear one (docs/metal.md, phase 7). --frames K draws the triangle K more times, a command buffer each
+ * waited for, and says how long a commit took to complete on average: where a texture is a shadow of its surface, every frame copies
+ * the surface in and back out.
  */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -240,11 +246,35 @@ make_target(id<MTLDevice> device, unsigned n, IOSurfaceRef ios)
 }
 
 static IOSurfaceRef
-make_surface(unsigned n)
+make_surface(unsigned n, unsigned row_bytes)
 {
 	NSDictionary *props = @{ (id)kIOSurfaceWidth: @(n), (id)kIOSurfaceHeight: @(n), (id)kIOSurfaceBytesPerElement: @4,
-		(id)kIOSurfaceBytesPerRow: @(n * 4), (id)kIOSurfacePixelFormat: @((unsigned)'BGRA') };
+		(id)kIOSurfaceBytesPerRow: @(row_bytes != 0 ? row_bytes : n * 4), (id)kIOSurfacePixelFormat: @((unsigned)'BGRA') };
 	return IOSurfaceCreate((__bridge CFDictionaryRef)props);
+}
+
+/* every byte of the surface's memory set to `value`, the texels' too (the pass clears them) */
+static void
+fill_surface(IOSurfaceRef ios, unsigned char value)
+{
+	IOSurfaceLock(ios, 0, NULL);
+	memset(IOSurfaceGetBaseAddress(ios), value, IOSurfaceGetAllocSize(ios));
+	IOSurfaceUnlock(ios, 0, NULL);
+}
+
+/* the bytes of the surface that are no texel's (between the rows, and after the last row) that no longer hold `value` */
+static size_t
+padding_changed(IOSurfaceRef ios, unsigned n, unsigned char value)
+{
+	size_t changed = 0, row = IOSurfaceGetBytesPerRow(ios), size = IOSurfaceGetAllocSize(ios);
+	IOSurfaceLock(ios, kIOSurfaceLockReadOnly, NULL);
+	const unsigned char *base = IOSurfaceGetBaseAddress(ios);
+	for (size_t at = 0; at < size; at++) {
+		bool texel = at / row < n && at % row < (size_t)n * 4;
+		changed += !texel && base[at] != value;
+	}
+	IOSurfaceUnlock(ios, kIOSurfaceLockReadOnly, NULL);
+	return changed;
 }
 
 /* the surface's rows into pixels (n x n x 4, tightly packed) */
@@ -514,7 +544,7 @@ fetch_check(id<MTLDevice> device, const char *metallib, unsigned n, bool surface
 		return false;
 	}
 	printf("ok    render pipeline reading [[color(0)]]\n");
-	IOSurfaceRef ios = surface ? make_surface(n) : NULL;
+	IOSurfaceRef ios = surface ? make_surface(n, 0) : NULL;
 	id<MTLTexture> target = (!surface || ios != NULL) ? make_target(device, n, ios) : nil;
 	if (target == nil) {
 		printf("metal_tri: FAIL: no %ux%u BGRA8 %s\n", n, n, surface ? "texture over an IOSurface" : "Shared texture");
@@ -760,7 +790,7 @@ static struct {
 		app.pipeline = make_pipeline(app.device, metallib.UTF8String);
 		app.queue = [app.device newCommandQueue];
 		for (int i = 0; i < 2 && app.pipeline != nil; i++) {
-			app.surface[i] = make_surface(app.n);
+			app.surface[i] = make_surface(app.n, 0);
 			app.target[i] = app.surface[i] ? make_target(app.device, app.n, app.surface[i]) : nil;
 			if (app.target[i] == nil) {
 				app.pipeline = nil;
@@ -798,6 +828,7 @@ main(int argc, char *argv[])
 		unsigned hold = 0;
 		const char *xr = NULL;
 		bool fetch = false;
+		unsigned row_bytes = 0, frames = 0;
 		for (int i = 1; i < argc; i++) {
 			if (strcmp(argv[i], "--bundle") == 0 && i + 1 < argc) {
 				bundle_path = argv[++i];
@@ -817,14 +848,22 @@ main(int argc, char *argv[])
 				xr = argv[++i];
 			} else if (strcmp(argv[i], "--fetch") == 0) {
 				fetch = true;
+			} else if (strcmp(argv[i], "--row-bytes") == 0 && i + 1 < argc) {
+				row_bytes = (unsigned)atoi(argv[++i]);
+			} else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
+				frames = (unsigned)atoi(argv[++i]);
 			} else {
 				fprintf(stderr, "usage: metal_tri [--bundle DIR] [--metallib FILE] [--size N] [--out FILE.ppm] [--surface] "
-				    "[--register] [--hold SECONDS] [--xr none|over|add] [--fetch]\n");
+				    "[--register] [--hold SECONDS] [--xr none|over|add] [--fetch] [--row-bytes B] [--frames K]\n");
 				return 2;
 			}
 		}
 		if (n < 16 || n > 4096) {
 			n = 256;
+		}
+		if (row_bytes != 0 && (row_bytes < n * 4 || row_bytes % 16 != 0)) {
+			fprintf(stderr, "metal_tri: --row-bytes %u: at least %u and a multiple of 16\n", row_bytes, n * 4);
+			return 2;
 		}
 		id<MTLDevice> device = make_device(bundle_path, register_it, true);
 		if (device == nil) {
@@ -844,14 +883,35 @@ main(int argc, char *argv[])
 		if (pipeline == nil) {
 			return 1;
 		}
-		IOSurfaceRef ios = surface ? make_surface(n) : NULL;
+		IOSurfaceRef ios = surface ? make_surface(n, row_bytes) : NULL;
 		id<MTLTexture> target = (!surface || ios != NULL) ? make_target(device, n, ios) : nil;
 		if (target == nil) {
 			printf("metal_tri: FAIL: no %ux%u BGRA8 %s\n", n, n, surface ? "texture over an IOSurface" : "Shared texture");
 			return 1;
 		}
-		if (!render([device newCommandQueue], pipeline, target, clear_rgb, false)) {
+		if (ios != NULL && row_bytes != 0) {
+			fill_surface(ios, 0xa5);
+		}
+		id<MTLCommandQueue> queue = [device newCommandQueue];
+		if (!render(queue, pipeline, target, clear_rgb, false)) {
 			return 1;
+		}
+		if (frames != 0) {
+			/* the same draw again, each command buffer waited for: what a frame costs, copies of a shadowed surface included */
+			double total = 0, slowest = 0;
+			for (unsigned f = 0; f < frames; f++) {
+				struct timespec a, b;
+				clock_gettime(CLOCK_MONOTONIC, &a);
+				if (!render(queue, pipeline, target, clear_rgb, true)) {
+					return 1;
+				}
+				clock_gettime(CLOCK_MONOTONIC, &b);
+				double ms = (b.tv_sec - a.tv_sec) * 1e3 + (b.tv_nsec - a.tv_nsec) / 1e6;
+				total += ms;
+				slowest = ms > slowest ? ms : slowest;
+			}
+			printf("ok    %u more frames: %.2f ms each from encoding to completion on average, %.2f ms the slowest\n", frames,
+			    total / frames, slowest);
 		}
 		unsigned char *pixels = calloc(n, (size_t)n * 4);
 		if (surface) {
@@ -863,6 +923,13 @@ main(int argc, char *argv[])
 		bool pass = inside > 0 && wrong == 0;
 		printf("%s triangle: %ux%u %s, %u pixels inside and %u outside judged, %u wrong\n", pass ? "ok   " : "FAIL ", n, n,
 		    surface ? "read from the IOSurface's own memory" : "read with getBytes:", inside, outside, wrong);
+		if (ios != NULL && row_bytes != 0) {
+			/* a render pass over the surface writes its texels and no other byte of it */
+			size_t changed = padding_changed(ios, n, 0xa5), rows = IOSurfaceGetBytesPerRow(ios);
+			printf("%s surface rows %zu bytes apart, %zu bytes in all: %zu bytes between the rows or after the last changed\n",
+			    changed == 0 ? "ok   " : "FAIL ", rows, IOSurfaceGetAllocSize(ios), changed);
+			pass = pass && changed == 0;
+		}
 		if (out != NULL) {
 			FILE *f = fopen(out, "wb");
 			if (f != NULL) {
