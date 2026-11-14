@@ -17,8 +17,9 @@
  * What there is: parameters, buffers (made, entered into the GPU's address space, told their address, mapped, given
  * back), and job chains, queued and run one at a time by a thread of hakios.mali.c's, with a number to wait for. A
  * buffer is wired kernel memory, zero when made and write-combined, so what the program writes goes to memory where the
- * GPU, which does not look into the processors' caches here, reads it. Requests 0x7c to 0x7f are ours: an IOSurface's
- * memory as a buffer, the job a surface is drawn by, a wait for a job by its number, and a test's pixels shown. Not here
+ * GPU, which does not look into the processors' caches here, reads it. Requests 0x7b to 0x7f are ours: pages of the
+ * program's own as a buffer, an IOSurface's memory as a buffer, the job a surface is drawn by, a wait for a job by its
+ * number, and a test's pixels shown. Not here
  * yet: an address space for each program, interrupts, buffers shared between programs as file descriptors.
  *
  * Who may open it: whoever asks, as HakiosGPU. The window server's process, backboardd, does not run as root (PixOS
@@ -85,6 +86,7 @@ enum {
 	kPanfrostGetParam       = 0x44,
 	kPanfrostGetBOOffset    = 0x45,
 	kPanfrostMadvise        = 0x48,
+	kHakiosMaliUserMemory   = 0x7b,         /* ours: pages of the caller's own as a buffer, as HakiosGPU's 0x7d (struct mali_user_memory) */
 	kHakiosMaliSurfaceSeq   = 0x7c,         /* ours: a surface's last job, or "drawing, not yet sent" (struct mali_surface_seq) */
 	kHakiosMaliWait         = 0x7d,         /* ours: wait for a job by its number (struct mali_wait) */
 	kHakiosMaliSurface      = 0x7e,         /* ours, as HakiosGPU's: an IOSurface's memory as a buffer */
@@ -99,6 +101,13 @@ struct mali_surface {
 	uint32_t width, height, pixelFormat, planes;    /* and what they are */
 };
 #define kMaliDescribe           0xffffffffu
+
+/* kHakiosMaliUserMemory: as tools/mesa/hakios-drm's hakios_drm_user_memory() passes it (HakiosGPU's struct hakios_user_memory) */
+struct mali_user_memory {
+	uint64_t address, size;                 /* in the caller, in whole pages */
+	uint32_t handle;                        /* back: the buffer */
+	uint32_t flags;
+};
 
 /* kHakiosMaliWait: job `seq` (what kPanfrostSubmit gave back in `jc`) done within timeout_ns, or kIOReturnTimeout */
 struct mali_wait {
@@ -176,6 +185,7 @@ struct mali_buffer {
 	MiniIOSurface * surface;
 	uint64_t address, size;
 	uint64_t last_seq;                      /* the last job given it (kPanfrostSubmit's bo_handles) */
+	bool user;                              /* pages of the client's, wired while the buffer is there (userBuffer) */
 };
 
 static IOLock * gMaliLock;
@@ -299,6 +309,7 @@ class HakiosMaliUserClient : public IOUserClient
 	struct mali_buffer *    fBuffers;               /* handle n is fBuffers[n - 1] */
 	uint32_t                fNextBuffer;
 	uint32_t                fSubmits, fFailed, fRequests;
+	task_t                  fTask;
 
 	struct mali_buffer * buffer(uint32_t handle);
 	void freeBuffer(struct mali_buffer * b);
@@ -306,8 +317,10 @@ class HakiosMaliUserClient : public IOUserClient
 	struct mali_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t * handle,
 	    uint32_t flags);
 	IOReturn surfaceBuffer(struct mali_surface * request);
+	IOReturn userBuffer(struct mali_user_memory * request);
 
 public:
+	virtual bool initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties) APPLE_KEXT_OVERRIDE;
 	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
 	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
 	virtual void free(void) APPLE_KEXT_OVERRIDE;
@@ -317,6 +330,16 @@ public:
 };
 
 OSDefineMetaClassAndStructors(HakiosMaliUserClient, IOUserClient);
+
+bool
+HakiosMaliUserClient::initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties)
+{
+	if (!IOUserClient::initWithTask(owningTask, securityID, type, properties)) {
+		return false;
+	}
+	fTask = owningTask;
+	return true;
+}
 
 bool
 HakiosMaliUserClient::start(IOService * provider)
@@ -349,6 +372,9 @@ HakiosMaliUserClient::freeBuffer(struct mali_buffer * b)
 		(void)hakios_mali_wait(b->last_seq, 2ull * NSEC_PER_SEC);
 	}
 	hakios_mali_unmap(b->address, b->size);
+	if (b->user) {
+		b->memory->complete();          /* (the client's pages unwired) */
+	}
 	b->memory->release();
 	if (b->surface != NULL) {
 		MiniIOSurfaceDrop(b->surface);
@@ -507,6 +533,58 @@ HakiosMaliUserClient::surfaceBuffer(struct mali_surface * request)
 	return kIOReturnSuccess;
 }
 
+/*
+ * Pages of the client's own as a buffer, as Linux's userptr and HakiosGPU's request 0x7d: wired for as long as the buffer
+ * is there and entered into the GPU's address space. Vulkan's VK_EXT_external_memory_host over it (PanVK,
+ * tools/mesa/panvk/panvk-host-surfaces.patch): Metal's no-copy buffers, which metal2vulkan otherwise copies at every
+ * commit. They are ordinary cached memory, which the GPU does not see through the processors' caches: whoever writes them
+ * cleans its lines before a job reads them, and invalidates them before it reads what a job wrote (PanVK's
+ * vkFlushMappedMemoryRanges and vkInvalidateMappedMemoryRanges over its non-coherent type, which metal2vulkan calls). Only
+ * pages the client may write: a job could write any of them, and pages it may only read are not its to have written.
+ * Called without the lock: wiring may wait for the pages.
+ */
+IOReturn
+HakiosMaliUserClient::userBuffer(struct mali_user_memory * request)
+{
+	IOMemoryDescriptor * memory;
+	struct mali_buffer * b;
+	IOReturn prepared;
+
+	if ((request->address & PAGE_MASK) || (request->size & PAGE_MASK) || request->size == 0 ||
+	    request->size > MALI_BUFFER_MAX || fTask == NULL) {
+		return kIOReturnBadArgument;
+	}
+	memory = IOMemoryDescriptor::withAddressRange(request->address, request->size, kIODirectionInOut, fTask);
+	if (memory == NULL) {
+		return kIOReturnNoMemory;
+	}
+	prepared = memory->prepare();
+	if (prepared != kIOReturnSuccess) {
+		static uint32_t said;
+
+		if (said++ < 8) {
+			IOLog("HakiosMali: pages at %#llx (%llu bytes) of the client's cannot be wired for writing: %#x\n",
+			    request->address, request->size, prepared);
+		}
+		memory->release();
+		return kIOReturnVMError;
+	}
+	IOLockLock(gMaliLock);
+	b = newBuffer(memory, 0, request->size, &request->handle, PANFROST_BO_NOEXEC);
+	if (b != NULL) {
+		b->memory = memory;
+		b->user = true;
+		hakios_mali_tag(b->address, 3, 0, 0, 0, 0, 0);
+	}
+	IOLockUnlock(gMaliLock);
+	if (b == NULL) {
+		memory->complete();
+		memory->release();
+		return kIOReturnNoMemory;
+	}
+	return kIOReturnSuccess;
+}
+
 IOReturn
 HakiosMaliUserClient::clientClose(void)
 {
@@ -570,6 +648,7 @@ HakiosMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
 		struct mali_surface surface;
 		struct mali_wait waitseq;
 		struct mali_surface_seq sseq;
+		struct mali_user_memory user;
 	} r;
 	size_t size = args->structureInputSize;
 	struct mali_buffer * b;
@@ -610,6 +689,15 @@ HakiosMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
 			IOLockUnlock(gMaliLock);
 		}
 		if (args->structureOutput != NULL && args->structureOutputSize >= size) {
+			memcpy(args->structureOutput, &r, size);
+			args->structureOutputSize = (uint32_t) size;
+		}
+		return ret;
+	}
+	/* pages of the client's: wired before the lock is taken (userBuffer) */
+	if (selector == kHakiosMaliUserMemory) {
+		ret = userBuffer(&r.user);
+		if (ret == kIOReturnSuccess && args->structureOutput != NULL && args->structureOutputSize >= size) {
 			memcpy(args->structureOutput, &r, size);
 			args->structureOutputSize = (uint32_t) size;
 		}

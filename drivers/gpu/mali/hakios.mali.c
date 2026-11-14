@@ -1360,7 +1360,7 @@ static struct mali_va mali_va;          /* with mali_lock held */
 #define MALI_RECENT 4096
 static struct {
 	uint64_t address, size;
-	uint32_t freed, kind;                   /* kind: 0 not said, 1 a panfrost BO, 2 an IOSurface */
+	uint32_t freed, kind;                   /* kind: 0 not said, 1 a panfrost BO, 2 an IOSurface, 3 a client's pages */
 	uint32_t width, height, row_bytes, format, offset;
 } mali_recent[MALI_RECENT];
 static uint32_t mali_recent_next;
@@ -1391,7 +1391,8 @@ say_kind(int i)
 		printf("mali:     an IOSurface %ux%u, %u bytes a row, format %#x, from byte %u\n", mali_recent[i].width,
 		    mali_recent[i].height, mali_recent[i].row_bytes, mali_recent[i].format, mali_recent[i].offset);
 	} else {
-		printf("mali:     %s\n", mali_recent[i].kind == 1 ? "a panfrost BO" : "made by nothing that said");
+		printf("mali:     %s\n", mali_recent[i].kind == 1 ? "a panfrost BO" :
+		    mali_recent[i].kind == 3 ? "pages of a client's own (kHakiosMaliUserMemory)" : "made by nothing that said");
 	}
 }
 
