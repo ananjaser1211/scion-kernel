@@ -1124,3 +1124,22 @@ PANVK_DIR=... M2V_DIR=... METAL=vk METAL_ICD=/redwood/lib/libvulkan_panfrost.dyl
    the 16-byte alignment; and A8 images whose rounded height runs past the buffer.
 3. The cleans of CoreAnimation's images shared with other processes (3.5 MB a second idle): their producers write them
    once; knowing that needs the kernel (a seed of the memory, as an IOSurface has).
+
+### On the phone, build 61 (userland at e940f80, kernel as build 60; boot line `metal=2`, no `camtl=`)
+
+- With no line in the clients file, backboardd says "the window server draws with Metal ... by default" and opens
+  the device at `-initWithAcceleratorPort:` (969 ms at the first boot, while the shader cache fills).
+- `-backboardd` in the clients file: "backboardd is not shown the device", no Vulkan driver in the process, and the
+  home screen draws on GLES. Taking the line out again brings Metal back at the next start of backboardd.
+- `metal_tri` passes. backboardd on Metal by default, six swipes:
+
+| | GLES (build 58) | Metal (build 60) | Metal by default (build 61) |
+|---|---|---|---|
+| backboardd CPU, swipes | 6–69% | 6–80% | 9–64% |
+| CPU idle after | ~20% | 26–32% | 21–25% |
+| RSS | 105–113 MB | 77–78 MB | 66–71 MB |
+| commit to completion | ~9 ms | 12.9 ms | 9.0 ms (commits 101–1000) |
+| GPU busy, idle / swipes | 1% / 18–23% | 1% / 21–37% | 1% / 10–38% |
+
+The window server on Metal now matches GLES in GPU time, is within a few points of its CPU, and uses about 40 MB
+less memory. Metal is the default on the S9+ from this build on.
