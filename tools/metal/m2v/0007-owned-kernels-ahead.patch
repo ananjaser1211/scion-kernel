@@ -1,0 +1,100 @@
+metal2vulkan: capture replay's kernels are made off the program's thread (Scion)
+
+Upstream:  metal2vulkan, https://github.com/steelbrain/metal2vulkan, at 720ef1ce9ae2a2068999a8675717418b9416283e, after
+           AdrenoMetal's 16 patches to it and Scion's 0001 to 0006; tools/metal/mk-metal2vulkan.sh applies them in that order,
+           then this.
+Licence:   GPL-2.0-or-later OR LGPL-3.0-or-later, metal2vulkan's (its LICENSE); this patch is a change to it and under the same
+           terms. Nothing of it is in Scion's MIT or APSL files.
+Author:    the HakiOS authors (Scion), 14 November 2026.
+
+Why. The Astronomy wallpaper (AegirPoster, build 53) made its pipelines and then spent about a minute at 100% CPU and presented
+nothing. A spindump of its launch showed every sample of the main thread in -[MTLRenderCommandEncoder endEncoding] of its first
+pass, under RenderCommandEncoder::capture_steps -> Device::owned_kernel -> vkCreateComputePipelines -> PanVK's
+bi_register_allocate. The pass loads its BGR10_XR_sRGB drawable, so it keeps its draws for capture replay. At its end, the
+three kernels of the replay (capture assembly, tile reach, capture settle) were made on the program's thread. PanVK's Bifrost
+compiler takes about a minute over them on the Mali-G72, and this happened inside the extension's launch, so launchd killed
+AegirPoster for not checking in (XPC_EXIT_REASON_EXTENSION_CHECK_IN_TIMEOUT) and started it again, over and over. The module's
+own rule says the replay's capture forms are made off the program's thread and that the pass uses the host's reach until they
+are made; the kernels did not follow that rule.
+
+What. Device::owned_kernel_ahead gives a kernel that is already made. Otherwise it starts the making on a thread of its own the
+first time, without the kernels' lock (it takes a making's turn there), and gives None. capture_steps takes the replay's kernels
+that way, so until they are made a pass keeps the host's reach and announces it as before, the case the module documents for
+capture forms not yet made. A kernel the device cannot make is not tried again.
+
+--- a/crates/metal2vulkan-runtime/src/owned_kernel.rs
++++ b/crates/metal2vulkan-runtime/src/owned_kernel.rs
+@@ -345,6 +345,9 @@
+     extended_shadow_loads: HashMap<ExtendedRange, OwnedKernel>,
+     predication_step: Option<OwnedKernel>,
+     block_decodes: HashMap<BlockDecode, OwnedKernel>,
++    /// Scion: the kernels being made, or that failed, off the program's thread
++    /// ([`Device::owned_kernel_ahead`]).
++    ahead: Vec<OwnedModule>,
+ }
+ 
+ impl OwnedKernels {
+@@ -470,6 +473,42 @@
+ }
+ 
+ impl Device {
++    /// Scion: the kernel of `which` where it is made; else `None`, its making begun on a thread
++    /// of its own the first time (the owner's HITCH rule: nothing waits on the program's thread).
++    /// For a kernel a caller can do without until it is made: capture replay's (`render/capture.rs`),
++    /// which PanVK's compiler took a minute to make for the Astronomy wallpaper's first pass, on
++    /// the extension's main thread at its launch, so launchd killed it for not checking in, again
++    /// and again. A kernel the device cannot make stays `None`, its making not tried again.
++    pub(super) fn owned_kernel_ahead(&self, which: OwnedModule) -> Option<OwnedKernel> {
++        {
++            let mut kernels = lock(&self.shared().owned_kernels);
++            if let Some(kernel) = kernels.get(which) {
++                return Some(kernel);
++            }
++            if kernels.ahead.contains(&which) {
++                return None;
++            }
++            kernels.ahead.push(which);
++        }
++        let device = self.clone();
++        let builder = std::thread::Builder::new().name("metal2vulkan-owned-kernel".into());
++        let started = exit_guard::spawn(builder, move || {
++            // A making's turn, as the program's thread would take it, without the kernels' lock.
++            let _turn = crate::pipeline::budget::program_turn();
++            let made = which.build(&device).and_then(|(spirv, buffers, push_bytes)| {
++                let bindings = (which.images(), which.storage_images(), buffers);
++                make(&device, &spirv, bindings, push_bytes)
++            });
++            if let Ok(kernel) = made {
++                lock(&device.shared().owned_kernels).put(which, kernel);
++            }
++        });
++        if started.is_err() {
++            lock(&self.shared().owned_kernels).ahead.retain(|&w| w != which);
++        }
++        None
++    }
++
+     /// The kernel of `which`, made on first use.
+     pub(super) fn owned_kernel(&self, which: OwnedModule) -> Result<OwnedKernel, Error> {
+         // A making's turn before the lock (`budget::helper_turn`): none where it is made.
+--- a/crates/metal2vulkan-runtime/src/render/capture.rs
++++ b/crates/metal2vulkan-runtime/src/render/capture.rs
+@@ -329,7 +329,8 @@
+ 
+     /// The scratch and kernels of a pass's capture of `records` records and `total`
+     /// primitives: `None` where the device makes no kernel (the tile reach's `shaderInt64`, among
+-    /// others) or gives no device address.
++    /// others), where the kernels are still being made off the program's thread
++    /// (`Device::owned_kernel_ahead`), or where it gives no device address.
+     fn capture_steps(&mut self, records: u64, total: u32) -> Option<CaptureSteps> {
+         let device = self.core.device().clone();
+         let kernels = [
+@@ -337,7 +338,7 @@
+             OwnedModule::TileReach,
+             OwnedModule::CaptureSettle,
+         ]
+-        .map(|which| device.owned_kernel(which).ok());
++        .map(|which| device.owned_kernel_ahead(which));
+         let [Some(assembly), Some(reach), Some(settle)] = kernels else {
+             return None;
+         };
