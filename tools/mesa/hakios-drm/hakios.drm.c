@@ -41,6 +41,8 @@
 #define HAKIOS_GPU_DESCRIBE    0xffffffffu     /* ... asked only what the buffer would be like */
 #define HAKIOS_MALI_WAIT       0x7d            /* HakiosMali's own: wait for a job by its number */
 #define HAKIOS_MALI_SYNC       0x7a            /* HakiosMali's own: a range of a buffer's lines cleaned and invalidated */
+#define HAKIOS_MALI_WRITTEN    0x79            /* HakiosMali's own: a surface's pixels written by work this process submitted */
+#define HAKIOS_MALI_PARAM_WRITTEN 0x7900       /* HakiosMali's parameter: 1 where bo_handles may carry HAKIOS_DRM_BO_WRITTEN */
 
 /* The kernel's services, by the names of the Linux drivers they stand in for. */
 static const struct service {
@@ -165,6 +167,7 @@ call(unsigned number, void *data, size_t size)
 
 static int submit(struct drm_panfrost_submit *request);
 static void forget_mapping(uint32_t handle);
+static void forget_surface_handle(uint32_t handle);
 static int wait_buffer(struct drm_panfrost_wait_bo *request);
 static bool pan_syncobj_ioctl(unsigned number, void *arg, int *error);
 
@@ -184,6 +187,7 @@ drmIoctl(int fd, unsigned long request, void *arg)
 	} else {
 		if (number == (DRM_IOCTL_GEM_CLOSE & 0xff)) {
 			forget_mapping(((struct drm_gem_close *)arg)->handle);
+			forget_surface_handle(((struct drm_gem_close *)arg)->handle);
 		}
 		error = call(number, arg, IOCPARM_LEN(request));
 	}
@@ -389,6 +393,49 @@ hakios_drm_surface(int fd, struct hakios_drm_surface *surface)
 	return 0;
 }
 
+/*
+ * The kernel's buffers of IOSurfaces in this process (drmPrimeFDToHandle), by the surface's ID, for
+ * hakios_drm_surface_written(): the latest buffer of each surface, until it is closed.
+ */
+#define SURFACE_HANDLES 1024
+static struct { uint32_t surface, handle; } surface_handles[SURFACE_HANDLES];
+static unsigned surface_handles_next;
+static pthread_mutex_t surface_handles_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void
+note_surface_handle(uint32_t surface, uint32_t handle)
+{
+	unsigned i, free_slot = SURFACE_HANDLES;
+
+	pthread_mutex_lock(&surface_handles_lock);
+	for (i = 0; i < SURFACE_HANDLES; i++) {
+		if (surface_handles[i].surface == surface) {
+			break;
+		}
+		if (surface_handles[i].surface == 0 && free_slot == SURFACE_HANDLES) {
+			free_slot = i;
+		}
+	}
+	if (i == SURFACE_HANDLES) {
+		i = free_slot != SURFACE_HANDLES ? free_slot : surface_handles_next++ % SURFACE_HANDLES;
+	}
+	surface_handles[i].surface = surface;
+	surface_handles[i].handle = handle;
+	pthread_mutex_unlock(&surface_handles_lock);
+}
+
+static void
+forget_surface_handle(uint32_t handle)
+{
+	pthread_mutex_lock(&surface_handles_lock);
+	for (unsigned i = 0; i < SURFACE_HANDLES; i++) {
+		if (surface_handles[i].surface != 0 && surface_handles[i].handle == handle) {
+			surface_handles[i].surface = 0;
+		}
+	}
+	pthread_mutex_unlock(&surface_handles_lock);
+}
+
 int
 drmPrimeFDToHandle(int fd, int surface, uint32_t *handle)
 {
@@ -401,6 +448,38 @@ drmPrimeFDToHandle(int fd, int surface, uint32_t *handle)
 		return -1;
 	}
 	*handle = request.handle;
+	if (surface != 0) {
+		note_surface_handle((uint32_t)surface, request.handle);
+	}
+	return 0;
+}
+
+__attribute__((visibility("default")))     /* (called by the Metal frontend, outside the driver) */
+int
+hakios_drm_surface_written(uint32_t surface)
+{
+	struct { uint32_t handle, surface; } request = { 0, surface };   /* struct mali_written */
+	int error = ENOENT;
+
+	if (opened != PANFROST) {
+		errno = ENOSYS;
+		return -1;
+	}
+	pthread_mutex_lock(&surface_handles_lock);
+	for (unsigned i = 0; surface != 0 && i < SURFACE_HANDLES; i++) {
+		if (surface_handles[i].surface == surface) {
+			request.handle = surface_handles[i].handle;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&surface_handles_lock);
+	if (request.handle != 0) {
+		error = call(HAKIOS_MALI_WRITTEN, &request, sizeof(request));
+	}
+	if (error != 0) {
+		errno = error;
+		return -1;
+	}
 	return 0;
 }
 
@@ -482,12 +561,46 @@ static uint64_t *pan_syncobj(uint32_t handle);
  * wait for before the job (in_syncs) are looked at neither here nor by the kernel: they can only
  * stand for jobs given before this one, which the queue has run by the time this one begins.
  */
+/*
+ * Whether the kernel takes HAKIOS_DRM_BO_WRITTEN on a submission's handles (asked once): one that does not would find
+ * no buffer of such a handle, so the bit is taken off for it.
+ */
+static bool
+written_handles(void)
+{
+	static int taken = -1;
+
+	if (taken < 0) {
+		struct drm_panfrost_get_param param = { .param = HAKIOS_MALI_PARAM_WRITTEN };
+
+		taken = call(DRM_COMMAND_BASE + DRM_PANFROST_GET_PARAM, &param, sizeof(param)) == 0 && param.value == 1;
+	}
+	return taken;
+}
+
 static int
 submit(struct drm_panfrost_submit *request)
 {
-	uint64_t chain = request->jc, seq, *fence;
-	int error = call(DRM_COMMAND_BASE + DRM_PANFROST_SUBMIT, request, sizeof(*request));
+	uint64_t chain = request->jc, handles = request->bo_handles, seq, *fence;
+	uint32_t *given = (uint32_t *)(uintptr_t)request->bo_handles, *plain = NULL;
+	int error;
 
+	for (uint32_t i = 0; i < request->bo_handle_count; i++) {
+		if ((given[i] & HAKIOS_DRM_BO_WRITTEN) && !written_handles()) {
+			plain = malloc(request->bo_handle_count * sizeof(*plain));
+			if (plain == NULL) {
+				return ENOMEM;
+			}
+			for (uint32_t k = 0; k < request->bo_handle_count; k++) {
+				plain[k] = given[k] & ~HAKIOS_DRM_BO_WRITTEN;
+			}
+			request->bo_handles = (uintptr_t)plain;
+			break;
+		}
+	}
+	error = call(DRM_COMMAND_BASE + DRM_PANFROST_SUBMIT, request, sizeof(*request));
+	request->bo_handles = handles;
+	free(plain);
 	if (error != 0) {
 		return error;
 	}

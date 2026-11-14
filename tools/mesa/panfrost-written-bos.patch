@@ -1,0 +1,39 @@
+panfrost: a submission's handles that the job chain writes carry HAKIOS_DRM_BO_WRITTEN (Darwin only)
+
+Scion's own (Mesa's licence applies to the patched file). Applies to Mesa 25.0.7 after the other
+tools/mesa/*.patch. HakiosMali (drivers/gpu/mali/hakios.mali.cpp) changes an IOSurface's seed when a
+job chain that writes it is queued, as a processor's lock for writing does, so a reader in another
+process that keeps what it made of the pixels (metal2vulkan's converted YCbCr textures,
+surface_watch.rs) makes it again. Linux's submission names its buffers without saying which are
+written; the batch knows (PAN_BO_ACCESS_WRITE). hakios-drm takes the bit off for a kernel that does
+not take it. Buffers the chain only reads (a sampled surface) keep their seed.
+
+--- a/src/gallium/drivers/panfrost/pan_jm.c
++++ b/src/gallium/drivers/panfrost/pan_jm.c
+@@ -33,6 +33,9 @@
+ #include "pan_indirect_dispatch.h"
+ #include "pan_jm.h"
+ #include "pan_job.h"
++#ifdef __APPLE__
++#include "xf86drm.h"
++#endif
+ 
+ #if PAN_ARCH >= 10
+ #error "JM helpers are only used for gen < 10"
+@@ -131,7 +134,16 @@
+          continue;
+ 
+       assert(submit.bo_handle_count < batch->num_bos);
++#ifdef __APPLE__
++      /* HakiosMali: a handle the chain writes carries HAKIOS_DRM_BO_WRITTEN, and
++       * the kernel changes a surface's seed once the chain is queued, so a
++       * reader in another process sees that its pixels changed (hakios-drm
++       * takes the bit off where the kernel does not take it). */
++      bo_handles[submit.bo_handle_count++] =
++         i | ((flags[i] & PAN_BO_ACCESS_WRITE) ? HAKIOS_DRM_BO_WRITTEN : 0);
++#else
+       bo_handles[submit.bo_handle_count++] = i;
++#endif
+ 
+       /* Update the BO access flags so that panfrost_bo_wait() knows
+        * about all pending accesses.

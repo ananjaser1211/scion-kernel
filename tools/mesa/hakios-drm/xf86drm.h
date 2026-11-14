@@ -112,6 +112,20 @@ int hakios_drm_user_memory(int fd, const void *address, uint64_t size, uint32_t 
 /* Not libdrm's: a range of a buffer's lines cleaned and invalidated by the kernel (HakiosMali's request 0x7a), for such a
  * buffer of the process's own cached pages; -1 with errno ENOSYS where the kernel has no such request */
 int hakios_drm_sync(int fd, uint32_t handle, uint64_t offset, uint64_t size);
+/*
+ * Not libdrm's: work this process submitted writes the pixels of IOSurface SURFACE, whose buffer the kernel made
+ * (drmPrimeFDToHandle): its seed changes, as at a device's write (HakiosMali's request 0x79), for readers in other processes
+ * that keep what they made of the pixels. Called once the work is queued (the Metal frontend, for metal2vulkan's
+ * surface_watch.rs). 0, or -1 with errno: ENOENT where no buffer of this process is the surface's, ENOSYS where the kernel
+ * has no such request.
+ */
+int hakios_drm_surface_written(uint32_t surface);
+/*
+ * Not libdrm's: a handle of a submission's bo_handles that a job chain writes may carry this bit (Mesa's panfrost knows
+ * which, tools/mesa/panfrost-written-bos.patch): the kernel then changes a surface's seed once the chain is queued. Taken
+ * off here where the kernel does not take it (its parameter 0x7900).
+ */
+#define HAKIOS_DRM_BO_WRITTEN   (1u << 31)
 
 #ifdef __cplusplus
 }
