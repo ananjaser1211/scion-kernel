@@ -1,0 +1,72 @@
+panvk: a pipeline barrier before a render pass's first draw keeps the pass's clears (JM: Bifrost and Midgard)
+
+Applied by tools/mk-panvk.sh only, after tools/mesa/*.patch and the other tools/mesa/panvk patches, to Mesa 25.0.7 (Mesa's own
+licence, MIT, applies to the lines it changes). Written for Scion.
+  - jm/panvk_vX_cmd_buffer.c: CmdPipelineBarrier2 inside a render pass splits the batch. A batch without a draw has no
+    framebuffer descriptor, so cmd_close_batch dropped it as content-less, and cmd_preload_fb_after_batch_split then turned every
+    load operation clear into a preload: the attachments kept what memory held. The barrier now gives such a batch its
+    framebuffer descriptor first, as CmdEndRendering does for a pass without draws, so the clears are written before the split.
+  - jm/panvk_vX_cmd_draw.c, panvk_cmd_draw.h: render.active, set by CmdBeginRendering and cleared by the CmdEndRendering that
+    ends the pass, so the barrier knows the batch is a render pass's (the clear flags outlive the pass).
+  Why it matters here: input attachments are texture reads through memory on these GPUs, so metal2vulkan's unordered
+  framebuffer fetch (tools/metal/m2v/0005) records a by-region barrier before the first fetching draw of a cleared pass to make
+  the clear visible, as Vulkan says a load operation is. Before this the barrier lost the clear (metal_tri --fetch read zeros).
+
+--- a/src/panfrost/vulkan/panvk_cmd_draw.h
++++ b/src/panfrost/vulkan/panvk_cmd_draw.h
+@@ -40,6 +40,11 @@
+ struct panvk_rendering_state {
+    VkRenderingFlags flags;
+    uint32_t layer_count;
++#if PAN_ARCH <= 7
++   /* Scion: between CmdBeginRendering and the CmdEndRendering that ends the pass (not one that
++    * suspends it), so a barrier knows the current batch is the pass's. */
++   bool active;
++#endif
+    uint32_t view_mask;
+ 
+    enum vk_rp_attachment_flags bound_attachments;
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+@@ -321,6 +321,23 @@
+     * barrier flag set to true.
+     */
+    if (cmdbuf->cur_batch) {
++      /* Scion: inside a render pass, a batch with no draw yet still holds the pass's load
++       * operation clears. A content-less batch is dropped on close and the split below turns
++       * every clear into a preload, so a barrier before the first draw lost them (the attachments
++       * kept what memory held). Give the batch its framebuffer descriptor, as CmdEndRendering
++       * does for a pass without draws, so the clears are written before the split. A draw reading
++       * an input attachment, which this driver reads through memory, then sees the clear values
++       * after such a barrier.
++       */
++      if (cmdbuf->state.gfx.render.active) {
++         const struct pan_fb_info *fbinfo = &cmdbuf->state.gfx.render.fb.info;
++         bool clear = fbinfo->zs.clear.z | fbinfo->zs.clear.s;
++         for (unsigned i = 0; i < fbinfo->rt_count; i++)
++            clear |= fbinfo->rts[i].clear;
++
++         if (clear)
++            panvk_per_arch(cmd_alloc_fb_desc)(cmdbuf);
++      }
+       panvk_per_arch(cmd_close_batch)(cmdbuf);
+       panvk_per_arch(cmd_preload_fb_after_batch_split)(cmdbuf);
+       panvk_per_arch(cmd_open_batch)(cmdbuf);
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+@@ -1510,6 +1510,8 @@
+ 
+    if (!resuming)
+       panvk_per_arch(cmd_preload_render_area_border)(cmdbuf, pRenderingInfo);
++
++   cmdbuf->state.gfx.render.active = true;
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+@@ -1529,5 +1531,6 @@
+       panvk_per_arch(cmd_close_batch)(cmdbuf);
+       cmdbuf->cur_batch = NULL;
+       panvk_per_arch(cmd_resolve_attachments)(cmdbuf);
++      cmdbuf->state.gfx.render.active = false;
+    }
+ }
