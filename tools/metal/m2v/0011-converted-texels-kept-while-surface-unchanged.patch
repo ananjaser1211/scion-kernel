@@ -1,0 +1,664 @@
+metal2vulkan: a YCbCr texture over a watched IOSurface converts its planes again only where the surface changed (Scion)
+
+Upstream:  metal2vulkan, https://github.com/steelbrain/metal2vulkan, at 720ef1ce9ae2a2068999a8675717418b9416283e, after
+           AdrenoMetal's 16 patches to it and Scion's 0001 to 0010; tools/metal/mk-metal2vulkan.sh applies them in that order,
+           then this.
+Licence:   GPL-2.0-or-later OR LGPL-3.0-or-later, metal2vulkan's (its LICENSE); this patch is a change to it and under the same
+           terms. Nothing of it is in Scion's MIT or APSL files.
+Author:    the HakiOS authors (Scion), 14 November 2026.
+
+Why. The window server samples the home screen's wallpaper, a 4:2:0 YCbCr texture over an IOSurface, at every frame, and the
+runtime converts the planes into the texture's image before every encoder that uses it, because the surface's bytes are the
+CPU's to write unseen: 9.4 ms of the Mali-G72's 16 ms a frame, against GLES's 0.6 ms for the whole frame (docs/metal.md,
+phase 7). The planes never change.
+
+What (surface_watch.rs states the rules).
+- Buffer::watch_surface: the frontend gives a surface's buffer the surface's seed (IOSurfaceGetSeed, which a processor's lock
+  for writing changes, and Scion's kernel changes at a device's write) and a call announcing this process's GPU writes.
+- An encoder's first copy in of such a texture's converted texels, where no command of its command buffer before it wrote the
+  planes' bytes or the image, records nothing (ShadowSync::before_with, `elided`); the command buffer notes the texture.
+- As the command buffer's first batch is submitted, in the queue's order, each noted texture whose image does not hold the
+  planes as of the seed read then is converted at the batch's start, in a command buffer of its own between barriers from and
+  to every command; what each image holds (the seed, the VkQueue) is noted once the batch is submitted, and forgotten once a
+  batch writes the image or the planes' bytes. A batch's writes of a watched surface are announced after its submission.
+- A texture over an unwatched buffer converts at every encoder, as before. A use after a write of the planes in the same
+  command buffer converts in its encoder, as before.
+
+diff --git a/crates/metal2vulkan-runtime/src/buffer.rs b/crates/metal2vulkan-runtime/src/buffer.rs
+index f2960ffd..6ba7bb88 100644
+--- a/crates/metal2vulkan-runtime/src/buffer.rs
++++ b/crates/metal2vulkan-runtime/src/buffer.rs
+@@ -34,6 +34,7 @@ use super::host_memory::{Deallocator, KeepAlive, Release};
+ use super::memory::{MemoryClass, Placement, BLOCK_BYTES};
+ use super::rebind::Unexact;
+ use super::resource::{Identity, ObjectId, ResourceKey};
++use super::surface_watch::SurfaceWatch;
+ use super::texture::first_move::Filled;
+ use super::texture::AliasWatch;
+ use super::values::{CpuCacheMode, HazardTrackingMode, ResourceOptions, StorageMode};
+@@ -81,6 +82,9 @@ struct BufferShared {
+     /// Scion (`host_sync.rs`): a no-copy buffer on a device that imports no host memory stands
+     /// for the caller's bytes, which `contents` answers, in memory of its own.
+     copied: OnceLock<CopiedHost>,
++    /// Scion (`surface_watch.rs`): the IOSurface a no-copy buffer is the pixels of, as the
++    /// frontend watches it.
++    surface: OnceLock<Arc<SurfaceWatch>>,
+ }
+ 
+ /// Scion (`host_sync.rs`): the caller's bytes a no-copy buffer stands for where the device imports
+@@ -1464,6 +1468,7 @@ impl Device {
+             attributes: ResourceAttributes::new(),
+             bytes: Bytes::Own(own),
+             copied: OnceLock::new(),
++            surface: OnceLock::new(),
+         }))
+     }
+ 
+@@ -1643,6 +1648,7 @@ impl Heap {
+                 aliasable: AtomicBool::new(self.heap_type() == HeapType::Placement),
+             }),
+             copied: OnceLock::new(),
++            surface: OnceLock::new(),
+         }))
+     }
+ }
+@@ -1883,6 +1889,28 @@ impl Buffer {
+         self.0.clone()
+     }
+ 
++    /// Scion (`surface_watch.rs`): the buffer is the pixels of an IOSurface, which `watch`
++    /// watches: a two-plane YCbCr texture over it converts again only where the surface changed,
++    /// and the GPU writes of it this process submits are announced. Once per buffer; a later
++    /// call changes nothing and answers `false`.
++    pub fn watch_surface(&self, watch: SurfaceWatch) -> bool {
++        let watch = Arc::new(watch);
++        if self.0.surface.set(Arc::clone(&watch)).is_err() {
++            return false;
++        }
++        let key = self.identity().key;
++        let alias = self.alias().map(|alias| alias.key);
++        let keys = [Some(key), alias].into_iter().flatten();
++        self.0.device.shared().surfaces.watch(keys, &watch);
++        true
++    }
++
++    /// Scion: the watch of the IOSurface the buffer is the pixels of
++    /// ([`watch_surface`](Self::watch_surface)).
++    pub(super) fn surface_watch(&self) -> Option<Arc<SurfaceWatch>> {
++        self.0.surface.get().cloned()
++    }
++
+     /// The buffer's address: no other object's while it lives.
+     pub(super) fn address(&self) -> usize {
+         Arc::as_ptr(&self.0) as usize
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+index c986cb32..437bc937 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -479,6 +479,10 @@ pub(super) struct State {
+     /// one they name; invalidated as it completes, with what it uses untracked.
+     host_written: BTreeSet<crate::resource::ResourceKey>,
+     host_summarized: BTreeSet<crate::resource::ResourceKey>,
++    /// Scion (`surface_watch.rs`): every key its ended encoders wrote, and the converted textures
++    /// whose conversion its encoders left to its first batch (`submit.rs`), each once.
++    pub(super) encoders_wrote: BTreeSet<ResourceKey>,
++    pub(super) elided: Vec<Arc<crate::shadow::ShadowCopies>>,
+     /// Its root tables, until its first submission points them at its resident set as the
+     /// live buffers stand then (`first_submission.rs`); the commit points them first.
+     root_tables: Vec<NotedTable>,
+@@ -869,6 +873,20 @@ impl State {
+         self.faulted.insert(encoder);
+     }
+ 
++    /// Scion (`surface_watch.rs`): every key its ended encoders wrote.
++    pub(super) fn written_keys(&self) -> BTreeSet<ResourceKey> {
++        self.encoders_wrote.clone()
++    }
++
++    /// Scion: converted textures whose conversion an encoder left to the first batch, each once.
++    pub(super) fn elided_conversions(&mut self, elided: Vec<Arc<crate::shadow::ShadowCopies>>) {
++        for copies in elided {
++            if !self.elided.iter().any(|kept| kept.shadow_key == copies.shadow_key) {
++                self.elided.push(copies);
++            }
++        }
++    }
++
+     /// The encoders (or parts of them) of batch `index`.
+     pub(super) fn batch_range(&self, index: usize) -> Range<usize> {
+         let batches = self.batches.all();
+@@ -892,6 +910,7 @@ impl State {
+     /// An encoder ended with `recorded`: it joins the current batch, or a new one after the
+     /// batch's signals.
+     pub(super) fn end_encoder(&mut self, recorded: Recorded) {
++        self.encoders_wrote.extend(recorded.summary.written());
+         self.recorded.push(recorded);
+         self.batches.encoder();
+         self.encoder_open = false;
+@@ -1207,6 +1226,8 @@ impl CommandBuffer {
+                 ended: Vec::new(),
+                 host_written: BTreeSet::new(),
+                 host_summarized: BTreeSet::new(),
++                encoders_wrote: BTreeSet::new(),
++                elided: Vec::new(),
+                 root_tables: Vec::new(),
+                 root_ranges: HashSet::new(),
+                 resident: None,
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+index fb4bac92..11b57477 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+@@ -87,7 +87,10 @@ use crate::exit_guard::{self, Call};
+ use crate::gpu_time;
+ use crate::release;
+ use crate::replay::Replay;
++use crate::resource::ResourceKey;
+ use crate::retained::Retained;
++use crate::shadow::ShadowSource;
++use crate::surface_watch::Held;
+ use crate::scheduler;
+ use crate::sparse::bind::{bind_batch, BindFailure, Bound};
+ use crate::sparse::encoder::SparseUpdate;
+@@ -364,6 +367,72 @@ impl CommandBufferShared {
+             })?;
+             work.insert(0, staged);
+         }
++        // Scion (`surface_watch.rs`): at the command buffer's first batch, the conversions its
++        // encoders left to it, of each texture whose image does not hold its surface as the
++        // surface's seed says it is now, in a command buffer of their own before every other one
++        // of the work, between barriers from and to every command (the work before on the queue
++        // reads the image, and the work after reads it). What they ran is noted once the batch
++        // is submitted; the textures are held until the command buffer completes.
++        let mut converted = Vec::new();
++        if first_batch && !state.elided.is_empty() {
++            let elided = std::mem::take(&mut state.elided);
++            let mut due = Vec::new();
++            for copies in &elided {
++                let ShadowSource::Converted {
++                    buffer,
++                    key,
++                    alias,
++                    conversion,
++                    watch: Some(watch),
++                    ..
++                } = &copies.source
++                else {
++                    continue;
++                };
++                let source = buffer.raw();
++                if source == vk::Buffer::null() {
++                    continue;
++                }
++                let seed = watch.seed();
++                let held = shared.surfaces.held(copies.shadow_key);
++                if held.is_some_and(|held| held.seed == seed && held.queue == queue) {
++                    continue;
++                }
++                due.push((conversion, source));
++                let held = Held::new(seed, queue, *key, *alias);
++                converted.push((copies.shadow_key, held, Arc::downgrade(copies)));
++            }
++            if !due.is_empty() {
++                let conversions = self.record_raw(&mut state, |_, buffer| {
++                    // SAFETY: the command buffer is recording, outside a render pass; the
++                    // textures, their staging buffers and images (in `GENERAL` since their first
++                    // move, in the first work's `VkSubmitInfo` or a submission before) and their
++                    // surfaces' buffers live until the command buffer completes (held below, and
++                    // by the encoders that use them).
++                    unsafe {
++                        Barrier::everything().record(raw, buffer);
++                        for (conversion, source) in &due {
++                            conversion.record(raw, buffer, *source);
++                        }
++                        Barrier::everything().record(raw, buffer);
++                    }
++                    Ok(())
++                })?;
++                work.insert(0, conversions);
++            }
++            state.retained.push(Box::new(elided));
++        }
++        let batch_written: Vec<ResourceKey> = state.recorded[range.clone()]
++            .iter()
++            .flat_map(|recorded| {
++                let segments = recorded.segments.iter();
++                let segments = segments.filter_map(|segment| segment.recorded.as_ref());
++                recorded
++                    .summary
++                    .written()
++                    .chain(segments.flat_map(|segment| segment.summary.written()))
++            })
++            .collect();
+         let mut wait_semaphores = Vec::new();
+         let mut wait_values = Vec::new();
+         let mut wait_stages = Vec::new();
+@@ -634,6 +703,10 @@ impl CommandBufferShared {
+             false => Vec::new(),
+         };
+         drop(state);
++        // Scion (`surface_watch.rs`): what the batch converted at its start, then what it wrote,
++        // in the queue's order: images and planes written are forgotten, and every watched
++        // surface written announced, now that the work is queued.
++        shared.surfaces.submitted(converted, &batch_written);
+         if rebound {
+             device.degrade_encoded_use_rebound();
+         }
+diff --git a/crates/metal2vulkan-runtime/src/device/mod.rs b/crates/metal2vulkan-runtime/src/device/mod.rs
+index 494302c8..49d52236 100644
+--- a/crates/metal2vulkan-runtime/src/device/mod.rs
++++ b/crates/metal2vulkan-runtime/src/device/mod.rs
+@@ -316,6 +316,8 @@ pub(super) struct DeviceShared {
+     pub(super) rebinds: super::rebind::Rebinds,
+     /// The no-copy buffers by the host memory they were made over (`host_aliases.rs`).
+     pub(super) aliases: super::host_aliases::HostAliases,
++    /// Scion: the watched surfaces and what each converted image holds (`surface_watch.rs`).
++    pub(super) surfaces: super::surface_watch::SurfaceWatches,
+     /// The new textures that read zero where Metal reads its pattern, until a command observes
+     /// or covers that (`fresh_unwritten.rs`).
+     pub(super) fresh: super::fresh_unwritten::FreshUnwritten,
+@@ -1296,6 +1298,7 @@ impl Device {
+             heap_keys: Default::default(),
+             rebinds: Default::default(),
+             aliases: Default::default(),
++            surfaces: Default::default(),
+             fresh: Default::default(),
+             owners: Default::default(),
+             live_buffers: Default::default(),
+diff --git a/crates/metal2vulkan-runtime/src/encoder.rs b/crates/metal2vulkan-runtime/src/encoder.rs
+index 1194f785..a897bd35 100644
+--- a/crates/metal2vulkan-runtime/src/encoder.rs
++++ b/crates/metal2vulkan-runtime/src/encoder.rs
+@@ -703,9 +703,24 @@ impl EncoderCore {
+         let device = self.device().clone();
+         let aliased = self.aliased(uses);
+         let uses = aliased.as_deref().unwrap_or(uses);
+-        let copies = self.shadows.before(shadows, uses, |copies| {
+-            ShadowMerge::new(&device, copies).map(Arc::new)
+-        })?;
++        // Scion (`surface_watch.rs`): a converted texture over a watched surface may leave its
++        // conversion to the command buffer's first batch, where no encoder before wrote its
++        // planes or its image.
++        let prior = match ShadowSync::<Arc<ShadowMerge>>::may_elide(shadows) {
++            true => Some(self.open.command_buffer.state().written_keys()),
++            false => None,
++        };
++        let written_before =
++            |key: ResourceKey| prior.as_ref().is_none_or(|keys| keys.contains(&key));
++        let copies = self
++            .shadows
++            .before_with(shadows, uses, &written_before, |copies| {
++                ShadowMerge::new(&device, copies).map(Arc::new)
++            })?;
++        let elided = self.shadows.take_elided();
++        if !elided.is_empty() {
++            (self.open.command_buffer.state()).elided_conversions(elided);
++        }
+         let texels = copies.iter().map(ShadowCopy::texels_back).sum();
+         (device.shared().counts).shadow_copies_planned(copies.len(), texels);
+         for copy in &copies {
+diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
+index 424bfa06..140fec13 100644
+--- a/crates/metal2vulkan-runtime/src/lib.rs
++++ b/crates/metal2vulkan-runtime/src/lib.rs
+@@ -108,6 +108,9 @@ mod host_aliases;
+ mod host_memory;
+ // Scion: host-visible memory that is not coherent (tools/metal/m2v/).
+ mod host_sync;
++// Scion: converted texels kept while their surface is unchanged (tools/metal/m2v/).
++mod surface_watch;
++pub use surface_watch::SurfaceWatch;
+ pub use host_sync::copied_host_counts;
+ mod image_plan;
+ mod index_bounds;
+diff --git a/crates/metal2vulkan-runtime/src/shadow.rs b/crates/metal2vulkan-runtime/src/shadow.rs
+index 9e37fb96..149b4178 100644
+--- a/crates/metal2vulkan-runtime/src/shadow.rs
++++ b/crates/metal2vulkan-runtime/src/shadow.rs
+@@ -99,6 +99,7 @@ use super::error::{Error, RuntimeGap};
+ use super::resource::ResourceKey;
+ use super::rotated::{RotatedCopies, Turn};
+ use super::shadow_merge::ShadowMerge;
++use super::surface_watch::SurfaceWatch;
+ use super::texture::heap_tiled::HeapTiledCopies;
+ use super::texture::heap_two_planes::HeapPlaneCopies;
+ use super::texture::Texture;
+@@ -175,6 +176,10 @@ pub(super) enum ShadowSource {
+         conversion: Box<YCbCrConversion>,
+         /// The texture's format, which a refusal names.
+         pixel_format: PixelFormat,
++        /// Scion (`surface_watch.rs`): the watch of the surface the buffer is the pixels of, where
++        /// the frontend gave one: an encoder's first conversion is then left to the command
++        /// buffer's first batch, which converts only where the surface changed.
++        watch: Option<Arc<SurfaceWatch>>,
+     },
+     /// A surface's two planes in a buffer's bytes, into which the texels a function writes to a
+     /// 4:4:4 two-plane YCbCr texture are stored (`ycbcr.rs`): the shadow is an image of the
+@@ -1023,17 +1028,65 @@ fn bounding(a: Option<[u32; 4]>, b: Option<[u32; 4]>) -> Option<[u32; 4]> {
+ /// the scratch of a merge.
+ pub(super) struct ShadowSync<M = Arc<ShadowMerge>> {
+     entries: Vec<Entry<M>>,
++    /// Scion (`surface_watch.rs`): every key the encoder's commands wrote so far.
++    written: Vec<ResourceKey>,
++    /// Scion: the converted textures whose first conversion in the encoder was left to the
++    /// command buffer's first batch, until the encoder hands them on ([`take_elided`](Self::take_elided)).
++    elided: Vec<Arc<ShadowCopies>>,
+ }
+ 
+ impl<M> Default for ShadowSync<M> {
+     fn default() -> Self {
+         ShadowSync {
+             entries: Vec::new(),
++            written: Vec::new(),
++            elided: Vec::new(),
+         }
+     }
+ }
+ 
+ impl<M: Clone> ShadowSync<M> {
++    /// Scion (`surface_watch.rs`): whether a copy in of `shadow` is left to its command buffer's
++    /// first batch: converted texels over a watched surface, a copy in that keeps no texels in
++    /// place, and neither the planes' bytes nor the image written by a command before, in the
++    /// encoder or (`prior`) in the command buffer.
++    fn elides(&self, shadow: &ShadowUse, prior: &dyn Fn(ResourceKey) -> bool) -> bool {
++        let copies = &shadow.copies;
++        let ShadowSource::Converted {
++            key,
++            alias,
++            watch: Some(_),
++            ..
++        } = &copies.source
++        else {
++            return false;
++        };
++        let keys = [Some(*key), *alias, Some(copies.shadow_key)];
++        !shadow.kept
++            && keys
++                .into_iter()
++                .flatten()
++                .all(|key| !self.written.contains(&key) && !prior(key))
++    }
++
++    /// Scion: the converted textures whose first conversion the encoder left to its command
++    /// buffer's first batch since the last call.
++    pub(super) fn take_elided(&mut self) -> Vec<Arc<ShadowCopies>> {
++        std::mem::take(&mut self.elided)
++    }
++
++    /// Scion: whether a command that uses `shadows` may leave a conversion to the command
++    /// buffer's first batch, so [`before_with`](Self::before_with) needs to know what the
++    /// command buffer wrote before.
++    pub(super) fn may_elide(shadows: &[ShadowUse]) -> bool {
++        shadows.iter().any(|shadow| {
++            matches!(
++                shadow.copies.source,
++                ShadowSource::Converted { watch: Some(_), .. }
++            )
++        })
++    }
++
+     /// The entry of `copies`, made when the encoder had none.
+     fn entry(&mut self, copies: &Arc<ShadowCopies>) -> usize {
+         match self
+@@ -1101,10 +1154,26 @@ impl<M: Clone> ShadowSync<M> {
+     /// writes an image two ways, through a view's shadow of it and another alias, which no merge
+     /// serves (`Unsupported`, `Feature::ViewFormatReinterpretation`), or a rotated texture's bytes
+     /// two ways (`NotImplemented(RotatedTexture)`).
++    #[cfg(test)]
+     pub(super) fn before(
+         &mut self,
+         shadows: &[ShadowUse],
+         uses: &[Use<ResourceKey>],
++        merge: impl FnMut(&ShadowCopies) -> Result<M, Error>,
++    ) -> Result<Vec<ShadowCopy<M>>, Error> {
++        self.before_with(shadows, uses, &|_| true, merge)
++    }
++
++    /// [`before`](Self::before), where `prior` answers whether a command of the command buffer
++    /// before the encoder wrote a key: Scion (`surface_watch.rs`), an encoder's first copy in of
++    /// converted texels over a watched surface, neither of whose planes' bytes nor image any
++    /// command before wrote, is left to the command buffer's first batch
++    /// ([`take_elided`](Self::take_elided)) and records nothing here.
++    pub(super) fn before_with(
++        &mut self,
++        shadows: &[ShadowUse],
++        uses: &[Use<ResourceKey>],
++        prior: &dyn Fn(ResourceKey) -> bool,
+         mut merge: impl FnMut(&ShadowCopies) -> Result<M, Error>,
+     ) -> Result<Vec<ShadowCopy<M>>, Error> {
+         // A copy back of an image's shadow would replace the other alias's writes, and only a
+@@ -1148,7 +1217,12 @@ impl<M: Clone> ShadowSync<M> {
+                     .iter()
+                     .any(|(copies, _)| copies.shadow_key == shadow.copies.shadow_key);
+             if !self.entries[i].current {
+-                if !overwrites {
++                if !overwrites && self.elides(shadow, prior) {
++                    let key = shadow.copies.shadow_key;
++                    if !self.elided.iter().any(|copies| copies.shadow_key == key) {
++                        self.elided.push(Arc::clone(&shadow.copies));
++                    }
++                } else if !overwrites {
+                     copies.push(ShadowCopy {
+                         copies: Arc::clone(&shadow.copies),
+                         step: Step::Into,
+@@ -1176,6 +1250,21 @@ impl<M: Clone> ShadowSync<M> {
+     /// leaves its image to copy back; a write of the bytes another way leaves the images over
+     /// them stale.
+     pub(super) fn after(&mut self, shadows: &[ShadowUse], uses: &[Use<ResourceKey>]) {
++        // Scion (`surface_watch.rs`): what the encoder wrote, for the conversions it may leave to
++        // the first batch.
++        let images = shadows
++            .iter()
++            .filter(|shadow| shadow.writes)
++            .map(|shadow| shadow.copies.shadow_key);
++        let keys = uses
++            .iter()
++            .filter(|used| !used.write.is_empty())
++            .map(|used| used.key);
++        for key in keys.chain(images) {
++            if !self.written.contains(&key) {
++                self.written.push(key);
++            }
++        }
+         for entry in &mut self.entries {
+             // A texture's own uses are its image's, never its bytes'.
+             let stale = uses
+diff --git a/crates/metal2vulkan-runtime/src/surface_watch.rs b/crates/metal2vulkan-runtime/src/surface_watch.rs
+new file mode 100644
+index 00000000..0be2cd1a
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/surface_watch.rs
+@@ -0,0 +1,182 @@
++//! Scion: converted texels kept while their surface is unchanged (tools/metal/m2v/).
++//!
++//! A two-plane YCbCr texture over an IOSurface is an image of the texels Metal reads of its planes
++//! (`ycbcr.rs`), which an encoder converts again before its first command that uses the texture.
++//! The window server samples the home screen's wallpaper so at every frame, and its conversion was
++//! 9.4 ms of the Mali-G72's 16 ms a frame (docs/metal.md, phase 7). Its planes never change.
++//!
++//! - **What tells a change.** The surface's seed (`IOSurfaceGetSeed`), which the system changes at
++//!   each lock and unlock for writing by the CPU, and which Scion's kernel also changes as the video
++//!   decoder writes a frame into a surface and as a GPU job of a process that does not announce its
++//!   own writes is queued (HakiosMali). This runtime announces its own GPU writes of a watched
++//!   surface after their batch is submitted ([`SurfaceWatch::written`]), so other processes see
++//!   them, and it forgets the conversions over the bytes it wrote, so it sees them itself. The
++//!   frontend gives the seed and the announcement of a surface's buffer ([`Buffer::watch_surface`]);
++//!   a texture over a buffer no one watches converts at every encoder, as before.
++//! - **Where it is decided.** An encoder's first use of such a texture records no conversion where
++//!   no command of its command buffer before it wrote the planes' bytes (`shadow.rs`, `elided`);
++//!   the texture is noted with the command buffer instead. As the command buffer's first batch is
++//!   submitted, in the queue's order, each noted texture whose image does not hold the planes as of
++//!   the seed read then is converted, in a command buffer of its own at the batch's start, between
++//!   two barriers from and to every command (`command_buffer/submit.rs`). A use after a write of the
++//!   planes in the same command buffer converts in the encoder, as before.
++//! - **What an image holds** ([`Held`]): the seed its last conversion at a batch's start read, and
++//!   the `VkQueue` it ran on; forgotten once a batch writes the image (a conversion in an encoder, a
++//!   function's write Metal drops) or the planes' bytes. A texture used on another `VkQueue` than its
++//!   last conversion's converts again.
++//! - **What the seed does not tell**: a CPU write of the surface's pixels without the lock IOSurface
++//!   asks for. The frontend takes the lock around the writes it makes for the program
++//!   (`replaceRegion:` of a texture over a surface).
++//!
++//! Patch for Scion (tools/metal/m2v/), under metal2vulkan's licence.
++
++use super::device::lock;
++use super::resource::ResourceKey;
++use super::shadow::ShadowCopies;
++use std::collections::HashMap;
++use std::ffi::c_void;
++use std::sync::{Arc, Mutex, Weak};
++
++/// The frontend's view of an IOSurface: its seed, and the announcement of a GPU write of its
++/// pixels (both called on any thread, with `context`).
++pub struct SurfaceWatch {
++    seed: unsafe extern "C" fn(*mut c_void) -> u32,
++    written: Option<unsafe extern "C" fn(*mut c_void)>,
++    context: Context,
++}
++
++struct Context(*mut c_void);
++// SAFETY: the frontend's contract (`SurfaceWatch::new`): its calls take the context on any thread.
++unsafe impl Send for Context {}
++// SAFETY: as above.
++unsafe impl Sync for Context {}
++
++impl SurfaceWatch {
++    /// A surface's watch: `seed(context)` answers the surface's seed now, `written(context)`
++    /// announces that work this process submitted writes its pixels.
++    ///
++    /// # Safety
++    ///
++    /// Both calls are safe on any thread with `context` for as long as the buffer the watch is
++    /// given to lives (the frontend's surface import, which holds the surface until then).
++    pub unsafe fn new(
++        seed: unsafe extern "C" fn(*mut c_void) -> u32,
++        written: Option<unsafe extern "C" fn(*mut c_void)>,
++        context: *mut c_void,
++    ) -> SurfaceWatch {
++        SurfaceWatch {
++            seed,
++            written,
++            context: Context(context),
++        }
++    }
++
++    /// The surface's seed now.
++    pub(super) fn seed(&self) -> u32 {
++        // SAFETY: the contract of `new`.
++        unsafe { (self.seed)(self.context.0) }
++    }
++
++    /// Announce a GPU write of the surface's pixels, once its batch is submitted.
++    pub(super) fn written(&self) {
++        if let Some(written) = self.written {
++            // SAFETY: the contract of `new`.
++            unsafe { written(self.context.0) }
++        }
++    }
++}
++
++/// What a converted image holds as of the batches submitted so far (the module's rules).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(super) struct Held {
++    /// The seed the conversion read.
++    pub(super) seed: u32,
++    /// The `VkQueue` it ran on.
++    pub(super) queue: usize,
++    /// The planes' buffer's key, and the key of the host memory it joined.
++    truth: (ResourceKey, Option<ResourceKey>),
++}
++
++impl Held {
++    pub(super) fn new(
++        seed: u32,
++        queue: usize,
++        truth: ResourceKey,
++        alias: Option<ResourceKey>,
++    ) -> Held {
++        Held {
++            seed,
++            queue,
++            truth: (truth, alias),
++        }
++    }
++}
++
++/// The device's watched surfaces and converted images (the module's rules).
++#[derive(Default)]
++pub(super) struct SurfaceWatches {
++    /// The watch of each surface buffer by its key (and its host memory's), while it lives.
++    watched: Mutex<HashMap<ResourceKey, Weak<SurfaceWatch>>>,
++    /// What each converted image holds, by the image's key, while its texture's copies live.
++    held: Mutex<HashMap<ResourceKey, (Held, Weak<ShadowCopies>)>>,
++}
++
++impl SurfaceWatches {
++    /// Note `watch` as the watch of the buffer of `keys`.
++    pub(super) fn watch(&self, keys: impl IntoIterator<Item = ResourceKey>, watch: &Arc<SurfaceWatch>) {
++        let mut watched = lock(&self.watched);
++        watched.retain(|_, held| held.strong_count() > 0);
++        for key in keys {
++            watched.insert(key, Arc::downgrade(watch));
++        }
++    }
++
++    /// What image `image` holds, where a batch's start converted it.
++    pub(super) fn held(&self, image: ResourceKey) -> Option<Held> {
++        lock(&self.held).get(&image).map(|(held, _)| *held)
++    }
++
++    /// A batch submitted: the conversions it ran at its start (`converted`), then every key its
++    /// commands wrote (`written`): an image written is forgotten, as is every image over bytes
++    /// written, and each watched surface written is announced.
++    pub(super) fn submitted(
++        &self,
++        converted: impl IntoIterator<Item = (ResourceKey, Held, Weak<ShadowCopies>)>,
++        written: &[ResourceKey],
++    ) {
++        {
++            let mut held = lock(&self.held);
++            held.extend(
++                converted
++                    .into_iter()
++                    .map(|(image, h, copies)| (image, (h, copies))),
++            );
++            // An image whose texture went is forgotten too (keys are never reused).
++            held.retain(|image, (h, copies)| {
++                copies.strong_count() > 0
++                    && !written.iter().any(|key| {
++                        key == image || *key == h.truth.0 || Some(*key) == h.truth.1
++                    })
++            });
++        }
++        if written.is_empty() {
++            return;
++        }
++        let watches: Vec<Arc<SurfaceWatch>> = {
++            let watched = lock(&self.watched);
++            if watched.is_empty() {
++                return;
++            }
++            let mut found: Vec<Arc<SurfaceWatch>> = Vec::new();
++            for watch in written.iter().filter_map(|key| watched.get(key)?.upgrade()) {
++                if !found.iter().any(|seen| Arc::ptr_eq(seen, &watch)) {
++                    found.push(watch);
++                }
++            }
++            found
++        };
++        for watch in watches {
++            watch.written();
++        }
++    }
++}
+diff --git a/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs b/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs
+index 9c67ea3a..8299da4e 100644
+--- a/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs
++++ b/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs
+@@ -180,6 +180,7 @@ impl Device {
+                 alias: texels.buffer.alias().map(|alias| alias.key),
+                 conversion: Box::new(conversion),
+                 pixel_format: pf,
++                watch: texels.buffer.surface_watch(),
+             },
+             shadow_key: image.identity.key,
+             shadow_range: UseRange::Image {

@@ -81,6 +81,10 @@ NmbBuffer *nmb_buffer_new_no_copy(NmbDevice *, void *pointer, uint64_t length, u
  * buffer and every command buffer using them are gone). A refused call (NULL) never runs it. */
 NmbBuffer *nmb_buffer_new_no_copy_releasing(NmbDevice *, void *pointer, uint64_t length, uint64_t options,
                                             void (*release)(void *context, void *pointer, uint64_t length), void *context);
+/* Scion: the buffer is the pixels of an IOSurface: seed(context) answers its seed, written(context) (or NULL) announces work this process
+ * submitted that writes its pixels. Two-plane YCbCr textures over it convert again only where the surface changed. Both are called on any
+ * thread until the buffer's import is freed. Once per buffer (false after). */
+bool nmb_buffer_watch_surface(const NmbBuffer *, uint32_t (*seed)(void *context), void (*written)(void *context), void *context);
 void nmb_buffer_release(NmbBuffer *);
 void *nmb_buffer_contents(const NmbBuffer *);
 uint64_t nmb_buffer_length(const NmbBuffer *);

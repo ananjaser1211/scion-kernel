@@ -23,7 +23,7 @@ use metal2vulkan_runtime::{
     BinaryArchive, BinaryArchiveDescriptor, BlitCommandEncoder, FamilyRow, FeatureRow, GpuFamily, RowState, BlitOption, Buffer, ClearColor, CommandBuffer, CommandQueue, ComputeCommandEncoder,
     ComputePipelineState, Deallocator, DebugMessage, DepthStencilState, Device, DeviceOptions, MessageSeverity, MessageSink, Event, EventRef, Fence, Function, Heap, HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, IoSurfaceYCbCr, Library, LoadAction,
     MetalLevel, Origin, PipelineOption, PipelineOptions, PurgeableState, PrivateCount, PrivateFlag, PrivateProperties, MAX_COLOR_ATTACHMENTS, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions,
-    SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, Texture, TextureDescriptor, Viewport, VisibilityResultMode,
+    SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, SurfaceWatch, Texture, TextureDescriptor, Viewport, VisibilityResultMode,
 };
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr};
@@ -677,6 +677,24 @@ unsafe fn no_copy(device: *mut NmbDevice, pointer: *mut c_void, length: u64, opt
             unsafe { device.0.new_buffer_with_bytes_no_copy(memory, length, modes, deallocator) }
         };
         Ok(boxed(NmbBuffer(buffer.map_err(e("no-copy buffer"))?)))
+    })
+}
+
+/// Scion: the buffer is the pixels of an IOSurface, which the frontend watches: `seed(context)` answers its seed
+/// (`IOSurfaceGetSeed`), `written(context)` (optional) announces that work this process submitted writes its pixels. A two-plane
+/// YCbCr texture over the buffer then converts its planes again only where the surface changed (the runtime's `surface_watch.rs`).
+/// Once per buffer: false for a later call, which changes nothing.
+///
+/// # Safety
+/// Both calls are safe on any thread with `context` until the buffer's import is freed (its deallocator runs).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nmb_buffer_watch_surface(buffer: *const NmbBuffer, seed: Option<unsafe extern "C" fn(*mut c_void) -> u32>,
+                                                  written: Option<unsafe extern "C" fn(*mut c_void)>, context: *mut c_void) -> bool {
+    guard(false, || {
+        let seed = seed.ok_or("no seed")?;
+        // SAFETY: the caller's contract.
+        let watch = unsafe { SurfaceWatch::new(seed, written, context) };
+        Ok(get(buffer)?.0.watch_surface(watch))
     })
 }
 
