@@ -1,61 +1,96 @@
-panvk: VK_EXT_external_memory_host for the pages of IOSurfaces, on Darwin
+panvk: VK_EXT_external_memory_host on Darwin, for the pages of IOSurfaces and of the process's own
 
 Applied by tools/mk-panvk.sh only, after tools/mesa/*.patch and the panvk patches before it, to Mesa 25.0.7 (Mesa's own
 licence, MIT, applies to the lines it adds). Written for Scion, after tools/mesa/turnip-darwin.patch's import for Turnip.
 
-Why. Every texture over an IOSurface is, in the Metal frontend (userland/src/metalvk), a no-copy buffer over the surface's
-pages. PanVK imported no host memory, so metal2vulkan made each one a buffer of its own memory and copied the caller's bytes
-into it at every commit, compared 4 KiB at a time (tools/metal/m2v/0002). The window server on Metal (build 53) spent 116 of
-399 display-thread samples there during home swipes, at 120 to 168% CPU against GLES's 25 to 38% (docs/metal.md, phase 4).
+Why. Metal's no-copy buffers (newBufferWithBytesNoCopy:), and every texture over an IOSurface, which the frontend
+(userland/src/metalvk) makes a no-copy buffer over the surface's pages, are imports of host memory. PanVK imported none, so
+metal2vulkan made each one a buffer of its own memory and copied the caller's bytes in and out around every command buffer
+(tools/metal/m2v/0002, 0006). The window server on Metal ran at 115 to 166% CPU, idle or not, against GLES's 20 to 72%
+(build 54); on build 55, with the surfaces imported, its 137 other no-copy buffers still cost 78 ms a commit copied in and
+48 ms compared out (docs/metal.md, phase 5).
 
-What. On Darwin, PanVK offers VK_EXT_external_memory_host for the pages of IOSurfaces only:
-  - panvk_AllocateMemory: a host pointer the frontend told src/hakios-drm is a surface's mapping (hakios_drm_host_surface) is
-    imported as the surface's buffer, which HakiosMali makes by its ID (kHakiosMaliSurface, what pan_kmod_bo_import already
-    does with a surface ID on Darwin). Any other pointer is refused (VK_ERROR_INVALID_EXTERNAL_HANDLE), since HakiosMali has no
-    buffer of a process's other pages, and so is a surface whose pixels do not start at its first page or that is smaller
-    than the import. metal2vulkan takes the refusal as before: it copies.
-  - vkGetMemoryHostPointerPropertiesEXT: the one memory type for a surface's pages, none for others.
-  - minImportedHostPointerAlignment 16 KiB, a page of Darwin's on arm64.
-  - external buffer properties and linear 2D images: importable from host allocations, never exported.
+What. On Darwin, PanVK offers VK_EXT_external_memory_host, minImportedHostPointerAlignment 16 KiB (a page of Darwin's on
+arm64):
+  - An IOSurface's pages, which the frontend told src/hakios-drm of (hakios_drm_host_surface), are imported as the surface's
+    buffer, which HakiosMali makes by its ID (kHakiosMaliSurface, what pan_kmod_bo_import already does with a surface ID on
+    Darwin), in the one coherent memory type: the frontend cleans and invalidates a surface's lines around the command
+    buffers that use it (flushSurfaces), and HakiosMali flushes a surface a submission names. A surface whose pixels do not
+    start at its first page, or that is smaller than the import, is refused.
+  - Other whole pages of the process's own are wired by HakiosMali as a buffer (its request 0x7b, hakios_drm_user_memory,
+    pan_kmod_bo_import_user), if the process may write them, in a second memory type, HOST_VISIBLE | HOST_CACHED and not
+    coherent: the Mali does not see the processors' caches, so vkFlushMappedMemoryRanges and
+    vkInvalidateMappedMemoryRanges clean and invalidate the lines of such memory (sys_dcache_flush), which metal2vulkan calls
+    around a command buffer's use of it (0001, 0008). Memory allocated in that type without an import is the first type's.
+  - vkGetMemoryHostPointerPropertiesEXT: the coherent type for a surface's pages, the cached one for other whole pages.
+  - Buffers and images take either type; external buffer properties and linear 2D images are importable from host
+    allocations, never exported.
   - vkMapMemory of imported memory is the caller's pointer, and is never unmapped here.
-The memory stays coherent the way the frontend keeps it for Turnip: it cleans and invalidates the CPU's cache lines of the
-surfaces a command buffer uses at its commit and at its completion (flushSurfaces), and HakiosMali flushes a surface it is
-named in a submission.
+Anything refused (VK_ERROR_INVALID_EXTERNAL_HANDLE: pages the process may only read, among them) metal2vulkan copies, as
+before.
 
 --- a/src/panfrost/vulkan/panvk_physical_device.c
 +++ b/src/panfrost/vulkan/panvk_physical_device.c
-@@ -232,6 +232,11 @@
+@@ -232,6 +232,12 @@
        .EXT_custom_border_color = true,
        .EXT_depth_clip_enable = true,
        .EXT_external_memory_dma_buf = true,
 +#ifdef __APPLE__
 +      /* the memory of IOSurfaces, by their address (src/hakios-drm:
-+       * hakios_drm_host_surface; panvk_device_memory.c) */
++       * hakios_drm_host_surface), and other pages of the process's own
++       * (hakios_drm_user_memory; panvk_device_memory.c) */
 +      .EXT_external_memory_host = true,
 +#endif
        .EXT_global_priority = true,
        .EXT_global_priority_query = true,
        .EXT_graphics_pipeline_library = true,
-@@ -846,6 +851,12 @@
+@@ -846,6 +852,12 @@
        /* VK_EXT_custom_border_color */
        .maxCustomBorderColorSamplers = 32768,
  
 +#ifdef __APPLE__
-+      /* VK_EXT_external_memory_host: an IOSurface's pages, whole ones of
-+       * Darwin's (16 KiB on arm64) */
++      /* VK_EXT_external_memory_host: an IOSurface's pages or the process's
++       * own, whole ones of Darwin's (16 KiB on arm64) */
 +      .minImportedHostPointerAlignment = 16384,
 +#endif
 +
        /* VK_EXT_graphics_pipeline_library */
        .graphicsPipelineLibraryFastLinking = true,
        .graphicsPipelineLibraryIndependentInterpolationDecoration = true,
-@@ -1469,6 +1480,25 @@
+@@ -1120,11 +1132,26 @@
+       .memoryHeapCount = 1,
+       .memoryHeaps[0].size = get_system_heap_size(),
+       .memoryHeaps[0].flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT,
++#ifdef __APPLE__
++      .memoryTypeCount = 2,
++#else
+       .memoryTypeCount = 1,
++#endif
+       .memoryTypes[0].propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+       .memoryTypes[0].heapIndex = 0,
++#ifdef __APPLE__
++      /* Host memory imported from this process's own pages
++       * (VK_EXT_external_memory_host, panvk_device_memory.c): cached as the
++       * process has them, which the Mali does not see through the
++       * processors' caches, so flushed and invalidated by whoever uses it.
++       * Memory allocated in it otherwise is the first type's. */
++      .memoryTypes[1].propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
++                                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                                      VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
++      .memoryTypes[1].heapIndex = 0,
++#endif
+    };
+ }
+ 
+@@ -1469,6 +1496,25 @@
        VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
        VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
  
 +#ifdef __APPLE__
-+   /* An IOSurface's pages (VK_EXT_external_memory_host): rows as the surface
-+    * has them, so a linear 2D image only, imported and never exported. */
++   /* Host pages (VK_EXT_external_memory_host): rows as the host has them, so
++    * a linear 2D image only, imported and never exported. */
 +   if (handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT) {
 +      if (pImageFormatInfo->type != VK_IMAGE_TYPE_2D ||
 +          pImageFormatInfo->tiling != VK_IMAGE_TILING_LINEAR) {
@@ -75,12 +110,12 @@ named in a submission.
     if (!(handleType & supported_handle_types)) {
        return panvk_errorf(physical_device, VK_ERROR_FORMAT_NOT_SUPPORTED,
                            "VkExternalMemoryTypeFlagBits(0x%x) unsupported",
-@@ -1671,6 +1701,12 @@
+@@ -1671,6 +1717,12 @@
        features |= VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT |
                    VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
     }
 +#ifdef __APPLE__
-+   /* an IOSurface's pages (VK_EXT_external_memory_host), imported only */
++   /* host pages (VK_EXT_external_memory_host), imported only */
 +   if (pExternalBufferInfo->handleType ==
 +       VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT)
 +      features |= VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
@@ -90,12 +125,40 @@ named in a submission.
        (VkExternalMemoryProperties){
 --- a/src/panfrost/vulkan/panvk_device_memory.c
 +++ b/src/panfrost/vulkan/panvk_device_memory.c
-@@ -13,9 +13,17 @@
+@@ -13,9 +13,45 @@
  
  #include "vk_log.h"
  
 +#ifdef __APPLE__
++#include <libkern/OSCacheControl.h> /* sys_dcache_flush */
++#include <unistd.h>                 /* getpagesize */
 +#include <xf86drm.h> /* hakios_drm_host_surface_at, hakios_drm_surface (src/hakios-drm) */
++
++/* Imported pages of the process's own (the cached type), not an IOSurface's:
++ * the Mali does not see them through the processors' caches. */
++static bool
++panvk_memory_host_cached(const struct panvk_device_memory *mem)
++{
++   return mem->vk.host_ptr != NULL && mem->vk.memory_type_index == 1;
++}
++
++/* Clean and invalidate the processors' lines of a range of such memory: what
++ * the host wrote goes out to memory for the GPU, and what the GPU wrote is read
++ * from memory, not from stale lines. */
++static void
++panvk_memory_host_sync(uint32_t count, const VkMappedMemoryRange *ranges)
++{
++   for (uint32_t i = 0; i < count; i++) {
++      VK_FROM_HANDLE(panvk_device_memory, mem, ranges[i].memory);
++
++      if (mem == NULL || !panvk_memory_host_cached(mem))
++         continue;
++
++      VkDeviceSize size = vk_device_memory_range(&mem->vk, ranges[i].offset,
++                                                 ranges[i].size);
++      sys_dcache_flush((char *)mem->vk.host_ptr + ranges[i].offset, size);
++   }
++}
 +#endif
 +
  static void *
@@ -108,7 +171,7 @@ named in a submission.
     if (!mem->addr.host) {
        void *addr = pan_kmod_bo_mmap(mem->bo, 0, pan_kmod_bo_size(mem->bo),
                                      PROT_READ | PROT_WRITE, MAP_SHARED, NULL);
-@@ -31,6 +39,11 @@
+@@ -31,6 +67,11 @@
  static void
  panvk_memory_munmap(struct panvk_device_memory *mem)
  {
@@ -120,7 +183,7 @@ named in a submission.
     if (mem->addr.host) {
        ASSERTED int ret =
           os_munmap((void *)mem->addr.host, pan_kmod_bo_size(mem->bo));
-@@ -78,6 +91,15 @@
+@@ -78,6 +119,15 @@
     if (fd_info && !fd_info->handleType)
        fd_info = NULL;
  
@@ -136,30 +199,43 @@ named in a submission.
     if (fd_info) {
        assert(
           fd_info->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT ||
-@@ -88,6 +110,31 @@
+@@ -88,6 +138,44 @@
           result = panvk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
           goto err_destroy_mem;
        }
 +#ifdef __APPLE__
 +   } else if (host_info) {
-+      /* Only an IOSurface's pages, which the frontend told src/hakios-drm
-+       * of (hakios_drm_host_surface): HakiosMali makes a buffer of the
++      /* An IOSurface's pages, which the frontend told src/hakios-drm of
++       * (hakios_drm_host_surface): HakiosMali makes a buffer of the
 +       * surface by its ID, the pages the surface is mapped at here
-+       * (pan_kmod_bo_import takes the ID as a dma-buf's fd). It has no
-+       * buffer of a process's other pages, so any other pointer is
-+       * refused, and so is a surface whose pixels do not start at its
-+       * first page or that is smaller than the import. */
++       * (pan_kmod_bo_import takes the ID as a dma-buf's fd), in the
++       * coherent type (the frontend cleans and invalidates a surface's
++       * lines around the command buffers that use it). A surface whose
++       * pixels do not start at its first page, or that is smaller than the
++       * import, is refused.
++       * Any other pages, in the cached type (vkFlushMappedMemoryRanges and
++       * vkInvalidateMappedMemoryRanges keep them): HakiosMali wires them as
++       * a buffer (pan_kmod_bo_import_user), if the process may write them. */
 +      uint32_t surface = hakios_drm_host_surface_at(
 +         host_info->pHostPointer, pAllocateInfo->allocationSize);
 +      struct hakios_drm_surface described = {.surface = surface};
++      const uintptr_t page = (uintptr_t)getpagesize() - 1;
 +
-+      if (surface == 0 || hakios_drm_surface(device->kmod.dev->fd, &described) ||
-+          described.offset != 0 ||
-+          described.size < pAllocateInfo->allocationSize) {
-+         result = panvk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
-+         goto err_destroy_mem;
++      if (surface != 0) {
++         if (hakios_drm_surface(device->kmod.dev->fd, &described) ||
++             described.offset != 0 ||
++             described.size < pAllocateInfo->allocationSize) {
++            result = panvk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++            goto err_destroy_mem;
++         }
++         mem->bo = pan_kmod_bo_import(device->kmod.dev, (int)surface, 0);
++      } else if (pAllocateInfo->memoryTypeIndex == 1 &&
++                 ((uintptr_t)host_info->pHostPointer & page) == 0 &&
++                 (pAllocateInfo->allocationSize & page) == 0) {
++         mem->bo = pan_kmod_bo_import_user(device->kmod.dev,
++                                           host_info->pHostPointer,
++                                           pAllocateInfo->allocationSize);
 +      }
-+      mem->bo = pan_kmod_bo_import(device->kmod.dev, (int)surface, 0);
 +      if (!mem->bo) {
 +         result = panvk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
 +         goto err_destroy_mem;
@@ -168,7 +244,27 @@ named in a submission.
     } else {
        mem->bo = pan_kmod_bo_alloc(device->kmod.dev,
                                    can_be_exported ? NULL : device->kmod.vm,
-@@ -326,6 +373,26 @@
+@@ -283,6 +371,9 @@
+ panvk_FlushMappedMemoryRanges(VkDevice _device, uint32_t memoryRangeCount,
+                               const VkMappedMemoryRange *pMemoryRanges)
+ {
++#ifdef __APPLE__
++   panvk_memory_host_sync(memoryRangeCount, pMemoryRanges);
++#endif
+    return VK_SUCCESS;
+ }
+ 
+@@ -290,6 +381,9 @@
+ panvk_InvalidateMappedMemoryRanges(VkDevice _device, uint32_t memoryRangeCount,
+                                    const VkMappedMemoryRange *pMemoryRanges)
+ {
++#ifdef __APPLE__
++   panvk_memory_host_sync(memoryRangeCount, pMemoryRanges);
++#endif
+    return VK_SUCCESS;
+ }
+ 
+@@ -326,6 +420,30 @@
     return VK_SUCCESS;
  }
  
@@ -184,10 +280,14 @@ named in a submission.
 +   if (handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT)
 +      return panvk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
 +
-+   /* the one memory type, for an IOSurface's pages; none for others, which
-+    * panvk_AllocateMemory cannot import */
-+   pMemoryHostPointerProperties->memoryTypeBits =
-+      hakios_drm_host_surface_at(pHostPointer, 0) != 0 ? 1 : 0;
++   /* the coherent type for an IOSurface's pages, the cached one for other
++    * whole pages of the process's own (panvk_AllocateMemory) */
++   if (hakios_drm_host_surface_at(pHostPointer, 0) != 0)
++      pMemoryHostPointerProperties->memoryTypeBits = 1;
++   else if (((uintptr_t)pHostPointer & ((uintptr_t)getpagesize() - 1)) == 0)
++      pMemoryHostPointerProperties->memoryTypeBits = 2;
++   else
++      pMemoryHostPointerProperties->memoryTypeBits = 0;
 +   return VK_SUCCESS;
 +}
 +#endif
@@ -195,3 +295,93 @@ named in a submission.
  VKAPI_ATTR void VKAPI_CALL
  panvk_GetDeviceMemoryCommitment(VkDevice device, VkDeviceMemory memory,
                                  VkDeviceSize *pCommittedMemoryInBytes)
+--- a/src/panfrost/vulkan/panvk_buffer.c
++++ b/src/panfrost/vulkan/panvk_buffer.c
+@@ -36,7 +36,12 @@
+    const uint64_t align = 64;
+    const uint64_t size = align64(pInfo->pCreateInfo->size, align);
+ 
++#ifdef __APPLE__
++   /* (and the cached type of imported host pages: panvk_physical_device.c) */
++   pMemoryRequirements->memoryRequirements.memoryTypeBits = 3;
++#else
+    pMemoryRequirements->memoryRequirements.memoryTypeBits = 1;
++#endif
+    pMemoryRequirements->memoryRequirements.alignment = align;
+    pMemoryRequirements->memoryRequirements.size = size;
+ 
+--- a/src/panfrost/vulkan/panvk_image.c
++++ b/src/panfrost/vulkan/panvk_image.c
+@@ -438,7 +438,12 @@
+       disjoint ? image->planes[plane].layout.data_size :
+       panvk_image_get_total_size(image);
+ 
++#ifdef __APPLE__
++   /* (and the cached type of imported host pages: panvk_physical_device.c) */
++   pMemoryRequirements->memoryRequirements.memoryTypeBits = 3;
++#else
+    pMemoryRequirements->memoryRequirements.memoryTypeBits = 1;
++#endif
+    pMemoryRequirements->memoryRequirements.alignment = alignment;
+    pMemoryRequirements->memoryRequirements.size = size;
+ 
+--- a/src/panfrost/lib/kmod/pan_kmod.h
++++ b/src/panfrost/lib/kmod/pan_kmod.h
+@@ -560,6 +560,13 @@
+ struct pan_kmod_bo *pan_kmod_bo_import(struct pan_kmod_dev *dev, int fd,
+                                        uint32_t flags);
+ 
++#ifdef __APPLE__
++/* Pages of this process's own, whole ones, as a buffer (src/hakios-drm:
++ * hakios_drm_user_memory, HakiosMali's request 0x7b): Linux's userptr. */
++struct pan_kmod_bo *pan_kmod_bo_import_user(struct pan_kmod_dev *dev,
++                                            void *address, size_t size);
++#endif
++
+ static inline int
+ pan_kmod_bo_export(struct pan_kmod_bo *bo)
+ {
+--- a/src/panfrost/lib/kmod/pan_kmod.c
++++ b/src/panfrost/lib/kmod/pan_kmod.c
+@@ -149,6 +149,41 @@
+    return (bo->flags & mask) == (flags & mask);
+ }
+ 
++#ifdef __APPLE__
++struct pan_kmod_bo *
++pan_kmod_bo_import_user(struct pan_kmod_dev *dev, void *address, size_t size)
++{
++   struct pan_kmod_bo *bo = NULL;
++   struct pan_kmod_bo **slot;
++   uint32_t handle;
++
++   simple_mtx_lock(&dev->handle_to_bo.lock);
++
++   if (hakios_drm_user_memory(dev->fd, address, size, &handle))
++      goto err_unlock;
++
++   /* a new buffer every time: the kernel makes one for each request */
++   slot = util_sparse_array_get(&dev->handle_to_bo.array, handle);
++   if (!slot || *slot)
++      goto err_close_handle;
++
++   bo = dev->ops->bo_import(dev, handle, size, 0);
++   if (!bo)
++      goto err_close_handle;
++
++   *slot = bo;
++   simple_mtx_unlock(&dev->handle_to_bo.lock);
++   return bo;
++
++err_close_handle:
++   drmCloseBufferHandle(dev->fd, handle);
++
++err_unlock:
++   simple_mtx_unlock(&dev->handle_to_bo.lock);
++   return NULL;
++}
++#endif
++
+ struct pan_kmod_bo *
+ pan_kmod_bo_import(struct pan_kmod_dev *dev, int fd, uint32_t flags)
+ {
