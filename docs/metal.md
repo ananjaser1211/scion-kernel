@@ -718,3 +718,116 @@ way, against GLES. GLES stays the default until then.
 
 The window server on Metal now costs about what GLES costs and uses less memory. What is left: the commit to
 completion latency, and about 10% more idle CPU.
+
+## Phase 7: where the window server's GPU time goes, and the Astronomy wallpaper's kernels (14 November 2026, on build 58)
+
+**How it was measured.** The kernel's own line every 5 s (`dmesg`, "mali: GPU busy"), spindumps symbolicated against the
+unstripped metal2vulkan and PanVK, and a test PanVK that is not committed: hakios-drm kept, for each job chain, when it was
+submitted and when it was done (a thread waiting the job numbers in order), and PanVK described the chain's batch (its job
+types, a compute job's grid, the shader's name or its kinds of bindings, a copy's image: size, tiling, row pitch, usage). It was
+given to backboardd through `launchctl setenv HAKIOS_VK_ICD` (the file must be named `libvulkan_panfrost*`, or the plug-in does
+not set PanVK's switches and the device is refused) and taken back after. Test runtimes ran in `metal_tri` through
+`DYLD_LIBRARY_PATH`, which a program in `/redwood/bin` honours and backboardd does not.
+
+**What the kernel says** (jobs and GPU time in 5 s):
+
+| | vertex, tiler, compute | fragment | GPU busy |
+|---|---|---|---|
+| GLES, home screen idle | 150 (about 95 us each) | 150 (about 510 us) | 1% |
+| GLES, swipes | 1850 to 1900 (86 to 99 us) | the same number (460 to 545 us) | 18 to 23% |
+| Metal, idle | 650 to 755 (about 1 ms each) | 150 to 200 (about 300 us) | 15% |
+| Metal, swipes | 2630 to 4290 (310 to 430 us) | 845 to 1490 (0.8 to 1.5 ms) | 39 to 70% |
+
+A GLES frame is one vertex/tiler chain and one fragment chain. A Metal frame was about 20 job chains, most of them compute.
+
+**One idle frame on Metal** (the trace; durations on the GPU):
+
+| what | job chains | GPU |
+|---|---|---|
+| the home wallpaper, a 4:2:0 YCbCr texture over an IOSurface: its planes copied into a staging buffer (`vk-meta-copy-buffer`) | 2 | 0.4 ms |
+| and converted to `RGBA16F` texels (metal2vulkan's `ycbcr_convert` kernel, 139x145 groups of 8x8) | 1 | **9.4 ms** |
+| the framebuffer (1125x2313 BGRA8, rows of 4608 or 4544 bytes) copied into a shadow image before the frame | 1 | 1.3 ms |
+| and copied back out after it | 1 | 1.2 ms |
+| a 1271x1823 BGRA8 texture over rows of 5088 bytes, copied into its shadow | 1 | 1.2 ms |
+| smaller textures copied in (656x688, 192x192, ...) | 3 to 6 | 0.1 to 0.3 ms each |
+| CoreAnimation's render passes (4) | 8 | about 2 ms |
+
+About 16 ms of GPU for a frame that costs GLES 0.6 ms. The conversion kernel compiles to 863 instructions, 80 cycles of loads and
+stores, one thread per core (BIFROST_MESA_DEBUG=shaderdb), and metal2vulkan converts at every encoder that samples such a texture,
+because the surface's bytes are the CPU's to write unseen (`ycbcr.rs`). Under swipes, the display thread spent 72 of 250 samples
+in `panvk_queue_submit` asleep in `hakios_mali_enqueue`: the kernel's queue of 64 job chains was full, and it sleeps with
+HakiosMali's lock held. Idle, backboardd's display thread used 12% of a core, most of it in metal2vulkan's
+`RenderCommandEncoder::draw` / `draw_resident` (CoreAnimation redraws its layer tree every frame).
+
+**Why the framebuffers were shadows.**
+
+- The bridge's `shadow.log` was never written: it matched the notice's id against `shadowed-texture`, and every notice's id is
+  `metal2vulkan-degrade-<kind>`. Fixed (`1aeb783`); every other degradation kind is now written once to `degradations.log` beside
+  it.
+- The reason, then (`metal_tri --surface --size 1125 --row-bytes 4608`, a new test option, `4701f2a`): the runtime takes back the
+  bridge's `PaddedReadsPolicy::AliasWrites` for a texture a pass renders where a tile store at the right or bottom edge could
+  reach past the buffer: it assumes every driver stores 16x4-texel blocks there, and 2313 rows round up past the surface's last
+  page. **metal2vulkan 0010** (`09afad9`): the block is a fact of the driver, and PanVK's Mali writes back each tile's pixels
+  inside the framebuffer descriptor's width and height (Mesa's own linear layout pads no height and rounds rows only to 64
+  bytes): 1x1 on PanVK, 16x4 elsewhere.
+- With that, the next refusal: the driver's linear image lays 1125 BGRA pixels 4544 bytes apart, and PanVK refused a
+  `DRM_FORMAT_MOD_LINEAR` image at the surface's own rows for host memory (only `VK_IMAGE_TILING_LINEAR` was importable).
+  **panvk-host-memory.patch** (`a98eb2a`) takes the modifier too. The same refusal made every padded texture that only reads (the
+  1271x1823 one) a shadow; with this PanVK alone, backboardd's per-frame copy of it is gone (trace, build 58's runtime).
+- `metal_tri --surface --size 1125 --row-bytes 4608 --frames 30`, every byte of the surface set to 0xA5 first: in place, the
+  triangle is right and **no byte between the rows or after the last row changed**. Per frame: as a shadow, a 0.66 ms fragment
+  job and a 0.66 ms copy back (two job chains); in place, one 1.05 ms fragment job into the linear surface.
+- In place, HakiosMali's submit cleans the whole surface's cache lines (`flushSurface`, 5 MB for that test surface) at every
+  submission that names it, under its lock: the time between a pass's two submissions went from 23 us to about 416 us. A
+  surface of the display's scan-out pool is write-combined and skipped, which the window server's framebuffers are expected to
+  be; others pay it.
+
+**The Astronomy wallpaper.**
+
+- **The kernels' compile.** `bi_register_allocate` spilled one value per pass, building the interference graph again each time
+  (301 and 73 of 501 samples in `bi_allocate_registers` and `lcra_add_node_interference`), up to 2000 passes.
+  **panvk-bifrost-spill-batches.patch** (`e7e3964`): the first 8 failed passes spill one value each, as before; after that twice
+  as many every 8 passes, up to 64 at a time, the best by the same measure among the values that interfere with the node that
+  failed. Capture replay's largest kernel (made by `metal_tri --xr over` with the pass loading its target, a test build): **93 s**
+  (4320 bytes of spills), against more than 10 minutes, unfinished when the test ended, with Mesa's allocator. A shader that fits
+  after a few spills is unchanged. Only PanVK takes the patch; the GLES driver does not.
+- **Why there is no second frame.** Opening Settings > Wallpaper > Add New Wallpaper starts the gallery's snapshotter, which starts
+  AegirPoster again every few seconds (a new pid each time, 100% of a core: the capture kernels begin compiling again in each).
+  Each makes its first commit (3 render passes, 5 draws, 1 blit; three 2048x2048 texture loads of 4 MB, 12 ms in all) and its
+  main thread then waits in `-[CAMetalDrawable present]` → the frontend's `drawableXrBeforePresent` → `waitForResource` →
+  `-[NBCommandBuffer waitUntilCompleted]` for the frame's GPU work, which does not end: meanwhile the kernel logged **fragment
+  jobs on slot 0 that did not finish within its 1 s limit** (`status 0x8`, still active, no MMU fault), 15 of them, each followed
+  by a GPU reset, and 86% GPU busy. The extension is stopped before its frame completes. A hung fragment job holds the one
+  queue for every client: backboardd's slowest commit-to-completion went to 1657 ms meanwhile.
+- PosterBoard was restarted afterwards to end the loop (the lock screen came back with its default wallpaper). Extensions do not
+  take `launchctl setenv`, so a test PanVK cannot be given to AegirPoster without an image.
+
+**Needs an image** (userland only, no kernel change): PanVK with `panvk-host-memory.patch` and
+`panvk-bifrost-spill-batches.patch`; metal2vulkan with 0010 and the bridge's notice log; `metal_tri`. Then backboardd on Metal
+is measured again as in phase 6, and `degradations.log` and `shadow.log` in `/var/tmp/com.apple.backboardd/m2v` say what is
+still degraded. Expected from the trace: about 4 ms and 3 job chains less per frame (the framebuffer's two copies and the padded
+texture's), the conversion left.
+
+**Next walls.**
+
+1. **The wallpaper's conversion, 9.4 ms of every frame.** Exact and cheap needs to know when the planes changed: the runtime
+   converts again only where the surface's bytes may have changed since the last conversion, decided where the command buffer
+   commits (the host-sync step, as 0002's copies), from what the frontend can know (the surface's seed, which a CPU writer's
+   unlock changes) and what the runtime knows (its own writes); the kernel would have to change a surface's seed when the
+   video decoder or another process's GPU job writes it, which it does not today. Making the kernel itself cheaper (bytes
+   loaded a word at a time) helps every conversion but not this many.
+2. **HakiosMali's queue and lock**: a submission that finds the 64-chain queue full sleeps with the lock every other request
+   takes; the whole-surface flush at each submission; and one client's fragment job that never ends stalls every client for
+   1 s and resets the GPU.
+3. **The Astronomy wallpaper's hung fragment job**: which pass (the trace PanVK in AegirPoster needs an image, or a
+   `HakiosMetal.icd` naming it), then whether the shader loops or is only slow.
+4. metal2vulkan's per-draw recording on the display thread (idle CPU).
+
+**Making the window server's Metal the default (proposal, not done).** It is not close enough yet: about 16 ms of GPU a frame
+against GLES's 0.6 ms (about 11 ms expected with this phase's patches), idle 27 to 33% CPU against about 20%, and a hung job of
+any client stalls it. When the conversion is solved and a frame's GPU time is within twice GLES's: `userland/src/inject.c` leaves
+the device in backboardd by default in a METAL=vk image whose `HakiosMetal.icd` names PanVK, with boot-arg `camtl=0` to keep it on
+GLES (today `camtl=1` is needed); and the plug-in opens the device at once in backboardd (at `-initWithAcceleratorPort:`, since
+the window server uses it within a second anyway) and answers nil when it cannot, so that CoreAnimation takes its GLES path: today
+a device that fails to open answers nil from its first use on, after CoreAnimation has chosen Metal, and backboardd ends (seen
+here with a driver path the plug-in refused). The clients file keeps its `-backboardd` line as the switch back without a new image.
