@@ -40,6 +40,7 @@
 #define HAKIOS_GPU_SURFACE     0x7e            /* the request that is not Linux's (both services) */
 #define HAKIOS_GPU_DESCRIBE    0xffffffffu     /* ... asked only what the buffer would be like */
 #define HAKIOS_MALI_WAIT       0x7d            /* HakiosMali's own: wait for a job by its number */
+#define HAKIOS_MALI_SYNC       0x7a            /* HakiosMali's own: a range of a buffer's lines cleaned and invalidated */
 
 /* The kernel's services, by the names of the Linux drivers they stand in for. */
 static const struct service {
@@ -1247,6 +1248,27 @@ hakios_drm_user_memory(int fd, const void *address, uint64_t size, uint32_t *han
 		return -1;
 	}
 	*handle = request.handle;
+	return 0;
+}
+
+/*
+ * Bytes `offset` to `offset + size` of buffer `handle` cleaned and invalidated in the processors' caches, to the point of
+ * coherency (HakiosMali's request 0x7a): a buffer of this process's own pages (hakios_drm_user_memory) is cached memory,
+ * which the Mali does not see through those caches. The kernel does it at the instruction's own cost; this process
+ * cannot (its DC CIVAC traps with the Exynos M3s up, xnu patch 1511, and sys_dcache_flush() is a DSB alone). ENOSYS
+ * from a kernel without the request; the Adreno's service has none.
+ */
+int
+hakios_drm_sync(int fd, uint32_t handle, uint64_t offset, uint64_t size)
+{
+	struct { uint32_t handle, flags; uint64_t offset, size; } request = { handle, 0, offset, size };
+	int error = opened == PANFROST ? call(HAKIOS_MALI_SYNC, &request, sizeof(request)) : ENOSYS;
+
+	(void)fd;
+	if (error != 0) {
+		errno = error;
+		return -1;
+	}
 	return 0;
 }
 

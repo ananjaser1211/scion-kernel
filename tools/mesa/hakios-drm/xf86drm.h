@@ -109,6 +109,9 @@ void hakios_drm_host_surface(const void *base, uint64_t size, uint32_t surface);
 uint32_t hakios_drm_host_surface_at(const void *base, uint64_t size);
 /* Not libdrm's: pages of this process (whole ones) as a buffer, Linux's userptr (HakiosGPU's request 0x7d, HakiosMali's 0x7b) */
 int hakios_drm_user_memory(int fd, const void *address, uint64_t size, uint32_t *handle);
+/* Not libdrm's: a range of a buffer's lines cleaned and invalidated by the kernel (HakiosMali's request 0x7a), for such a
+ * buffer of the process's own cached pages; -1 with errno ENOSYS where the kernel has no such request */
+int hakios_drm_sync(int fd, uint32_t handle, uint64_t offset, uint64_t size);
 
 #ifdef __cplusplus
 }
