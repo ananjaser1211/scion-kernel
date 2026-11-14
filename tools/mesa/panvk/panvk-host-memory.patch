@@ -41,6 +41,12 @@ arm64):
   - Images of host pages are 2D and linear: VK_IMAGE_TILING_LINEAR, or DRM_FORMAT_MOD_LINEAR at the caller's rows
     (VkImageDrmFormatModifierExplicitCreateInfoEXT), which metal2vulkan asks for where a surface's rows are not the
     driver's own (docs/metal.md, phase 7); the image format query takes no other modifier.
+  - Such an image asks 64 bytes of alignment, not a page (Mesa's own minimum for a linear surface), and 16 on a Bifrost
+    v6 GPU where it is no storage image: so a texture over a no-copy buffer at the caller's offset in its pages is the
+    image itself, not a shadow copied at each use. Measured on the Galaxy S9+'s Mali-G72 with metal_tri --texel-buffer
+    (scion-kernel docs/metal.md, phase 9): RGBA8 and A8 textures at offsets 16 to 6912 with rows of 224, 288 and 720
+    bytes are sampled, blitted into and rendered to right; Metal itself takes no offset below 16. A storage image keeps
+    64 bytes: v6's attribute buffer, through which it is written, has no lower 6 bits of its pointer.
 Anything refused (VK_ERROR_INVALID_EXTERNAL_HANDLE) metal2vulkan copies, as before.
 
 --- a/src/panfrost/vulkan/panvk_physical_device.c
@@ -392,13 +398,43 @@ Anything refused (VK_ERROR_INVALID_EXTERNAL_HANDLE) metal2vulkan copies, as befo
  
 --- a/src/panfrost/vulkan/panvk_image.c
 +++ b/src/panfrost/vulkan/panvk_image.c
-@@ -438,7 +438,12 @@
+@@ -427,7 +427,7 @@
+ {
+    VK_FROM_HANDLE(panvk_image, image, pInfo->image);
+ 
+-   const uint64_t alignment = 4096;
++   uint64_t alignment = 4096;
+    const VkImagePlaneMemoryRequirementsInfo *plane_info =
+       vk_find_struct_const(pInfo->pNext, IMAGE_PLANE_MEMORY_REQUIREMENTS_INFO);
+    const bool disjoint = is_disjoint(image);
+@@ -438,7 +438,33 @@
        disjoint ? image->planes[plane].layout.data_size :
        panvk_image_get_total_size(image);
  
 +#ifdef __APPLE__
 +   /* (and the cached type of imported host pages: panvk_physical_device.c) */
 +   pMemoryRequirements->memoryRequirements.memoryTypeBits = 3;
++
++   /* A linear image of host allocations is bound where the caller's texels
++    * are, inside its pages, not at a page of its own: as far as the hardware
++    * allows. Mesa's linear layout asks 64 bytes of a surface's address
++    * (format_minimum_alignment, pan_layout.c); a Bifrost v6 GPU (the Galaxy
++    * S9's Mali-G72) samples such a texture, copies into it and renders to it
++    * at any 16 bytes, with rows any multiple of the texel apart (scion-kernel
++    * metal_tri --texel-buffer, --blit and --render: offsets 16 to 6912, rows
++    * of 224, 288 and 720 bytes), which is Metal's own floor for a texture
++    * over a buffer. A storage image keeps the 64 bytes: its attribute
++    * buffer's pointer has no lower 6 bits (Attribute Buffer, v6.xml). */
++   if ((image->vk.external_handle_types &
++        VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT) &&
++       image->planes[plane].layout.modifier == DRM_FORMAT_MOD_LINEAR) {
++      const struct panvk_physical_device *phys_dev =
++         to_panvk_physical_device(image->vk.base.device->physical);
++      const bool storage = image->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT;
++
++      alignment =
++         pan_arch(phys_dev->kmod.props.gpu_prod_id) == 6 && !storage ? 16 : 64;
++   }
 +#else
     pMemoryRequirements->memoryRequirements.memoryTypeBits = 1;
 +#endif
