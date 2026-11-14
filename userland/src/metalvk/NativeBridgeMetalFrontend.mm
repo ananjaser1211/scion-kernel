@@ -609,23 +609,14 @@ static bool methodABI(id object,SEL selector,const char *encoding) {
  Method method=class_getInstanceMethod(object_getClass(object),selector);
  return method && !strcmp(method_getTypeEncoding(method),encoding);
 }
-// Bytes of a function constant of MTLDataType `type` (scalars and 2/4-wide vectors; 3-wide vectors are not qualified).
+// Bytes of a function constant of MTLDataType `type`: lanes times the scalar, as the bridge packs it (constant_bytes in
+// NativeMetalObjects.rs). MTLDataType numbers each scalar family's 1- to 4-lane types consecutively. A 3-lane value is read as its three
+// lanes, which come first whether the caller's data is packed or padded to four (QuartzCore's fixed_frag_lph_cph takes a uchar3, and the
+// window server on Metal aborted where it was refused).
 static uint64_t constantBytes(uint64_t type) {
- switch(type) {
-  case 3:case 29:case 33:return 4;
-  case 4:case 30:case 34:return 8;
-  case 6:case 32:case 36:return 16;
-  case 16:case 37:case 41:return 2;
-  case 17:case 38:case 42:return 4;
-  case 19:case 40:case 44:return 8;
-  case 45:case 49:case 53:return 1;
-  case 46:case 50:case 54:return 2;
-  case 48:case 52:case 56:return 4;
-  case 81:case 85:return 8;
-  case 82:case 86:return 16;
-  case 84:case 88:return 32;
-  default:return 0;
- }
+ struct {uint64_t first,scalar;} families[]={{3,4},{16,2},{29,4},{33,4},{37,2},{41,2},{45,1},{49,1},{53,1},{81,8},{85,8},{121,2}};
+ for(auto f:families)if(type>=f.first && type<f.first+4)return (type-f.first+1)*f.scalar;
+ return 0;
 }
 static std::string quartzCoreCallers();
 @implementation NBLibrary
