@@ -17,9 +17,10 @@
  * What there is: parameters, buffers (made, entered into the GPU's address space, told their address, mapped, given
  * back), and job chains, queued and run one at a time by a thread of hakios.mali.c's, with a number to wait for. A
  * buffer is wired kernel memory, zero when made and write-combined, so what the program writes goes to memory where the
- * GPU, which does not look into the processors' caches here, reads it. Requests 0x7a to 0x7f are ours: a range of a
- * buffer's lines cleaned and invalidated, pages of the program's own as a buffer, an IOSurface's memory as a buffer, the
- * job a surface is drawn by, a wait for a job by its number, and a test's pixels shown. Not here yet: an address space for each program, interrupts, buffers shared between programs as file descriptors.
+ * GPU, which does not look into the processors' caches here, reads it. Requests 0x79 to 0x7f are ours: a surface's
+ * pixels written by the client's GPU work (its seed changed), a range of a buffer's lines cleaned and invalidated, pages
+ * of the program's own as a buffer, an IOSurface's memory as a buffer, the job a surface is drawn by, a wait for a job by
+ * its number, and a test's pixels shown. Not here yet: an address space for each program, interrupts, buffers shared between programs as file descriptors.
  *
  * Who may open it: whoever asks, as HakiosGPU. The window server's process, backboardd, does not run as root (PixOS
  * found that out on another phone), so nothing here asks for root.
@@ -62,7 +63,10 @@ void hakios_mali_unmap(uint64_t gpu, uint64_t size);
 void hakios_mali_tag(uint64_t address, uint32_t kind, uint32_t width, uint32_t height, uint32_t row_bytes,
     uint32_t format, uint32_t offset);
 uint32_t hakios_mali_submit(uint64_t chain, bool fragment);
-uint64_t hakios_mali_enqueue(uint64_t chain, bool fragment);
+uint64_t hakios_mali_enqueue_for(uint64_t chain, bool fragment, uint32_t owner);
+void hakios_mali_room(void);
+bool hakios_mali_refused(uint32_t owner);
+void hakios_mali_forget(uint32_t owner);
 bool hakios_mali_wait(uint64_t seq, uint64_t timeout_ns);
 
 void HakiosMaliStart(void);
@@ -88,6 +92,7 @@ enum {
 	kPanfrostGetParam       = 0x44,
 	kPanfrostGetBOOffset    = 0x45,
 	kPanfrostMadvise        = 0x48,
+	kHakiosMaliWritten      = 0x79,         /* ours: a surface's pixels written by work the client submitted (struct mali_written) */
 	kHakiosMaliSync         = 0x7a,         /* ours: a range of a buffer's lines cleaned and invalidated (struct mali_sync) */
 	kHakiosMaliUserMemory   = 0x7b,         /* ours: pages of the caller's own as a buffer, as HakiosGPU's 0x7d (struct mali_user_memory) */
 	kHakiosMaliSurfaceSeq   = 0x7c,         /* ours: a surface's last job, or "drawing, not yet sent" (struct mali_surface_seq) */
@@ -120,6 +125,24 @@ struct mali_sync {
 	uint32_t flags;                         /* none yet: 0 */
 	uint64_t offset, size;
 };
+
+/*
+ * kHakiosMaliWritten: work the client submitted writes the pixels of the surface of buffer `handle` (tools/mesa/hakios-drm's
+ * hakios_drm_surface_written(), which the Metal frontend calls once the work is queued): the surface's seed changes, as at a
+ * device's write (MiniIOSurfaceWritten()), so another process that keeps what it made of the pixels makes it again.
+ */
+struct mali_written {
+	uint32_t handle;
+	uint32_t surface;                       /* the surface's ID, which the buffer must be of */
+};
+
+/*
+ * Submissions (kPanfrostSubmit): a handle of bo_handles with kMaliSubmitWritten set names a buffer the job chain writes
+ * (tools/mesa/panfrost-written-bos.patch: Mesa's panfrost knows which), and a surface's seed then changes once the chain is
+ * queued. A client sees whether the kernel takes the bit as parameter kMaliParamWrittenHandles (1).
+ */
+#define kMaliSubmitWritten      (1u << 31)
+#define kMaliParamWrittenHandles 0x7900u
 
 /* kHakiosMaliWait: job `seq` (what kPanfrostSubmit gave back in `jc`) done within timeout_ns, or kIOReturnTimeout */
 struct mali_wait {
@@ -218,12 +241,17 @@ static IOLock * gMaliLock;
  * nothing; an IOSurface's pixels are ordinary cached memory, written by programs (CoreAnimation's layers drawn by the
  * processor, uploads) and read by the processor (the display, which copies them to the panel; a program reading back).
  * So their cache lines are written back and invalidated, to the point of coherency, around the GPU's use of them:
- *   - before a job that names one is queued (what a processor wrote, in memory for the GPU to read);
+ *   - before a job that names one is queued, where a processor may have written the pixels since they were last
+ *     cleaned: IOSurface asks a writer to lock the surface for writing, which changes its seed (MiniIOSurfaceLines(); a
+ *     device's writes keep the lines' state). Not under the lock every request takes, and not again at every submission
+ *     that names the surface: a framebuffer the GPU draws into frame after frame was cleaned whole at each of them (5 MB,
+ *     about 400 us of the submitting thread, docs/metal.md phase 7);
  *   - after a job that wrote one is waited for, by the display (HakiosMaliDrawn()) or by the program (WAIT_BO): what
  *     the GPU wrote is not hidden behind lines the processor fetched before.
  * Through the kernel's own mapping of the pixels (kpixels): the data caches are physically tagged, so that covers every
  * mapping of the same pages. An upstream port on a non-coherent Mali (the Infinix Hot 20's G52) saw some frames drawn
- * wrong and nothing here did this. Boot-arg mali_flush=0: not done (for measuring what it costs).
+ * wrong and nothing here did this. Boot-arg mali_flush=0: not done (for measuring what it costs); mali_flush=2: before
+ * every job that names a surface, whatever its seed (as before the seed was looked at, for comparing).
  */
 static uint32_t gMaliFlush = 1;
 
@@ -321,6 +349,7 @@ class HakiosMaliUserClient : public IOUserClient
 	struct mali_buffer *    fBuffers;               /* handle n is fBuffers[n - 1] */
 	uint32_t                fNextBuffer;
 	uint32_t                fSubmits, fFailed, fRequests;
+	uint32_t                fOwner;                 /* its number among the clients, for the queue (hakios.mali.c) */
 	task_t                  fTask;
 
 	struct mali_buffer * buffer(uint32_t handle);
@@ -331,6 +360,8 @@ class HakiosMaliUserClient : public IOUserClient
 	IOReturn surfaceBuffer(struct mali_surface * request);
 	IOReturn userBuffer(struct mali_user_memory * request);
 	IOReturn syncBuffer(const struct mali_sync * request);
+	IOReturn submit(struct drm_panfrost_submit * request);
+	IOReturn closeBuffer(uint32_t handle);
 
 public:
 	virtual bool initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties) APPLE_KEXT_OVERRIDE;
@@ -362,7 +393,7 @@ HakiosMaliUserClient::start(IOService * provider)
 		return false;
 	}
 	IOLog("HakiosMali: a client opened the GPU\n");
-	OSIncrementAtomic((SInt32 *) &gMaliClients);
+	fOwner = (uint32_t) OSIncrementAtomic((SInt32 *) &gMaliClients) + 1;
 	fBuffers = IONewZero(struct mali_buffer, MALI_BUFFERS);
 	return fBuffers != NULL;
 }
@@ -694,6 +725,125 @@ HakiosMaliUserClient::syncBuffer(const struct mali_sync * request)
 	return kIOReturnSuccess;
 }
 
+/*
+ * A job chain to the queue (kPanfrostSubmit): its number goes back in `jc`, and every buffer it names remembers it
+ * (kPanfrostWaitBO, and no buffer is freed under a job that uses it). The client's buffer list is read first, without the
+ * lock; the lines processors wrote into the surfaces it names are cleaned without it too; and a full queue is waited
+ * out without it (hakios_mali_room()): the lock is every other client's, and the window server's display thread slept
+ * here for room in a full queue with every other request held up behind it (docs/metal.md, phase 7). A surface the chain
+ * writes (kMaliSubmitWritten) gets a new seed once the chain is queued, so a reader in another process sees that the
+ * pixels changed, in the queue's order (a reader that saw the seed submits after this chain). A client whose jobs hung
+ * too often is answered with no job (`jc` 0, done) and nothing is run (hakios.mali.c).
+ */
+IOReturn
+HakiosMaliUserClient::submit(struct drm_panfrost_submit * request)
+{
+	uint32_t count = request->bo_handle_count < 4096 ? request->bo_handle_count : 4096;
+	uint32_t * handles = NULL;
+	MiniIOSurface * clean[16], * written[16];
+	uint32_t seeds[16], cleaned = 0, wrote = 0;
+	uint64_t seq = 0;
+	struct mali_buffer * b;
+
+	OSIncrementAtomic((SInt32 *) &fSubmits);
+	OSIncrementAtomic((SInt32 *) &gMaliSubmits);
+	if (request->jc == 0) {
+		return kIOReturnSuccess;
+	}
+	if (hakios_mali_refused(fOwner)) {
+		request->jc = 0;
+		return kIOReturnSuccess;
+	}
+	if (count != 0) {
+		handles = (uint32_t *) IOMallocData(count * sizeof(uint32_t));
+		if (handles == NULL) {
+			return kIOReturnNoMemory;
+		}
+		if (copyin((user_addr_t) request->bo_handles, handles, count * sizeof(uint32_t)) != 0) {
+			IOFreeData(handles, count * sizeof(uint32_t));
+			return kIOReturnBadArgument;
+		}
+	}
+	/* first what the processors wrote into the surfaces it names, out to memory (flushSurface), a few at a time */
+	for (uint32_t i = 0; gMaliFlush && i < count;) {
+		IOLockLock(gMaliLock);
+		for (; i < count && cleaned < 16; i++) {
+			uint32_t seed = 0;
+
+			b = buffer(handles[i] & ~kMaliSubmitWritten);
+			if (b != NULL && b->surface != NULL && (MiniIOSurfaceLines(b->surface, &seed) || gMaliFlush == 2) &&
+			    (clean[cleaned] = MiniIOSurfaceCopy(b->surface->sid)) != NULL) {
+				seeds[cleaned++] = seed;
+			}
+		}
+		IOLockUnlock(gMaliLock);
+		for (uint32_t k = 0; k < cleaned; k++) {
+			flushSurface(clean[k]);
+			MiniIOSurfaceCleaned(clean[k], seeds[k]);
+			MiniIOSurfaceDrop(clean[k]);
+		}
+		cleaned = 0;
+	}
+	IOLockLock(gMaliLock);
+	while ((seq = hakios_mali_enqueue_for(request->jc, request->requirements & PANFROST_JD_REQ_FS, fOwner)) == 0) {
+		IOLockUnlock(gMaliLock);
+		hakios_mali_room();
+		IOLockLock(gMaliLock);
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		b = buffer(handles[i] & ~kMaliSubmitWritten);
+		if (b == NULL) {
+			continue;
+		}
+		b->last_seq = seq;
+		if (b->surface != NULL) {
+			b->surface->maliSeq = seq;      /* (HakiosMaliDrawn) */
+			if ((handles[i] & kMaliSubmitWritten) && wrote < 16 && (written[wrote] = MiniIOSurfaceCopy(b->surface->sid)) != NULL) {
+				wrote++;
+			}
+		}
+	}
+	IOLockUnlock(gMaliLock);
+	for (uint32_t k = 0; k < wrote; k++) {
+		MiniIOSurfaceWritten(written[k]);
+		MiniIOSurfaceDrop(written[k]);
+	}
+	if (handles != NULL) {
+		IOFreeData(handles, count * sizeof(uint32_t));
+	}
+	request->jc = seq;
+	return kIOReturnSuccess;
+}
+
+/*
+ * A buffer given back (DRM_IOCTL_GEM_CLOSE): not while a job queued or running may still use it, and that is waited
+ * for without the lock (it was waited for, up to 2 s, with it).
+ */
+IOReturn
+HakiosMaliUserClient::closeBuffer(uint32_t handle)
+{
+	struct mali_buffer * b;
+	uint64_t seq;
+
+	IOLockLock(gMaliLock);
+	b = buffer(handle);
+	seq = b != NULL ? b->last_seq : 0;
+	IOLockUnlock(gMaliLock);
+	if (b == NULL) {
+		return kIOReturnNotFound;
+	}
+	if (seq != 0) {
+		(void)hakios_mali_wait(seq, 2ull * NSEC_PER_SEC);
+	}
+	IOLockLock(gMaliLock);
+	b = buffer(handle);
+	if (b != NULL) {
+		freeBuffer(b);
+	}
+	IOLockUnlock(gMaliLock);
+	return b != NULL ? kIOReturnSuccess : kIOReturnNotFound;
+}
+
 IOReturn
 HakiosMaliUserClient::clientClose(void)
 {
@@ -704,6 +854,7 @@ HakiosMaliUserClient::clientClose(void)
 		}
 	}
 	IOLockUnlock(gMaliLock);
+	hakios_mali_forget(fOwner);
 	if (fSubmits != 0) {
 		IOLog("HakiosMali: a client goes after %u job chains, %u of them unfinished\n", fSubmits, fFailed);
 	}
@@ -759,6 +910,7 @@ HakiosMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
 		struct mali_surface_seq sseq;
 		struct mali_user_memory user;
 		struct mali_sync sync;
+		struct mali_written written;
 	} r;
 	size_t size = args->structureInputSize;
 	struct mali_buffer * b;
@@ -808,6 +960,15 @@ HakiosMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
 	if (selector == kHakiosMaliSync) {
 		return syncBuffer(&r.sync);
 	}
+	/* a job chain, and a buffer given back: neither holds the lock while it waits (submit, closeBuffer) */
+	if (selector == kPanfrostSubmit || selector == kDrmGemClose) {
+		ret = selector == kPanfrostSubmit ? submit(&r.submit) : closeBuffer(r.close.handle);
+		if (ret == kIOReturnSuccess && args->structureOutput != NULL && args->structureOutputSize >= size) {
+			memcpy(args->structureOutput, &r, size);
+			args->structureOutputSize = (uint32_t) size;
+		}
+		return ret;
+	}
 	/* pages of the client's: wired before the lock is taken (userBuffer) */
 	if (selector == kHakiosMaliUserMemory) {
 		ret = userBuffer(&r.user);
@@ -823,7 +984,9 @@ HakiosMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
 	}
 	switch (selector) {
 	case kPanfrostGetParam:
-		if (!hakios_mali_parameter(r.param.param, &r.param.value)) {
+		if (r.param.param == kMaliParamWrittenHandles) {
+			r.param.value = 1;              /* (submit(): kMaliSubmitWritten) */
+		} else if (!hakios_mali_parameter(r.param.param, &r.param.value)) {
 			ret = kIOReturnBadArgument;
 		}
 		break;
@@ -839,53 +1002,16 @@ HakiosMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
 		ret = b != NULL ? kIOReturnSuccess : kIOReturnNotFound;
 		r.offset.offset = b != NULL ? b->address : 0;
 		break;
-	case kPanfrostSubmit: {
-		/* queued, not run here: the job's number goes back in `jc`, and every buffer it names
-		 * remembers it (kPanfrostWaitBO, and no buffer is freed under a job that uses it) */
-		uint64_t seq = 0;
-
-		fSubmits++;
-		gMaliSubmits++;
-		/* first what the processors wrote into the surfaces it names, out to memory (flushSurface) */
-		for (uint32_t i = 0; gMaliFlush && r.submit.jc != 0 && i < r.submit.bo_handle_count && i < 4096; i += 64) {
-			uint32_t handles[64];
-			uint32_t n = r.submit.bo_handle_count - i < 64 ? r.submit.bo_handle_count - i : 64;
-
-			if (copyin((user_addr_t) (r.submit.bo_handles + i * sizeof(uint32_t)), handles, n * sizeof(uint32_t)) != 0) {
-				break;
-			}
-			for (uint32_t k = 0; k < n; k++) {
-				b = buffer(handles[k]);
-				if (b != NULL && b->surface != NULL) {
-					flushSurface(b->surface);
-				}
-			}
-		}
-		if (r.submit.jc != 0) {
-			seq = hakios_mali_enqueue(r.submit.jc, r.submit.requirements & PANFROST_JD_REQ_FS);
-		}
-		for (uint32_t i = 0; seq != 0 && i < r.submit.bo_handle_count && i < 4096; i += 64) {
-			uint32_t handles[64];
-			uint32_t n = r.submit.bo_handle_count - i < 64 ? r.submit.bo_handle_count - i : 64;
-
-			if (copyin((user_addr_t) (r.submit.bo_handles + i * sizeof(uint32_t)), handles, n * sizeof(uint32_t)) != 0) {
-				break;
-			}
-			for (uint32_t k = 0; k < n; k++) {
-				b = buffer(handles[k]);
-				if (b != NULL) {
-					b->last_seq = seq;
-					if (b->surface != NULL) {
-						b->surface->maliSeq = seq;      /* (HakiosMaliDrawn) */
-					}
-				}
-			}
-		}
-		r.submit.jc = seq;
-		break;
-	}
 	case kHakiosMaliSurface:
 		ret = surfaceBuffer(&r.surface);
+		break;
+	case kHakiosMaliWritten:
+		b = buffer(r.written.handle);
+		if (b == NULL || b->surface == NULL || b->surface->sid != r.written.surface) {
+			ret = kIOReturnNotFound;
+		} else {
+			MiniIOSurfaceWritten(b->surface);       /* (the surfaces' lock under this one, as MiniIOSurfaceCopy() elsewhere) */
+		}
 		break;
 	case kHakiosMaliSurfaceSeq: {
 		MiniIOSurface * surface = MiniIOSurfaceCopy(r.sseq.surface);
@@ -933,14 +1059,6 @@ HakiosMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
 		break;
 	case kPanfrostMadvise:
 		r.madvise.retained = 1;
-		break;
-	case kDrmGemClose:
-		b = buffer(r.close.handle);
-		if (b != NULL) {
-			freeBuffer(b);
-		} else {
-			ret = kIOReturnNotFound;
-		}
 		break;
 	default:
 		IOLog("HakiosMali: request %#x (%zu bytes) is not known here\n", selector, size);

@@ -1324,20 +1324,27 @@ static int mali_wait_event;
 static uint32_t mali_nap_us = 50;       /* boot-arg mali_nap_us (10 to 1000) */
 static LCK_MTX_DECLARE(mali_wait_lock, &mali_lock_group);
 
+/* (want 0: any bit of mask) */
+static inline bool
+job_bits(uint32_t value, uint32_t mask, uint32_t want)
+{
+	return want == 0 ? (value & mask) != 0 : (value & mask) == want;
+}
+
 static bool
 wait_job(uint32_t at, uint32_t mask, uint32_t want, uint32_t ms)
 {
 	uint64_t deadline;
 
 	for (int i = 0; i < 20; i++) {
-		if ((rd(mali, at) & mask) == want) {
+		if (job_bits(rd(mali, at), mask, want)) {
 			return true;
 		}
 		delay(10);
 	}
 	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
 	while (mach_absolute_time() < deadline) {
-		if ((rd(mali, at) & mask) == want) {
+		if (job_bits(rd(mali, at), mask, want)) {
 			return true;
 		}
 		uint64_t nap;
@@ -1347,7 +1354,7 @@ wait_job(uint32_t at, uint32_t mask, uint32_t want, uint32_t ms)
 		(void)lck_mtx_sleep_deadline(&mali_wait_lock, LCK_SLEEP_DEFAULT, (event_t)&mali_wait_event, THREAD_UNINT, nap);
 		lck_mtx_unlock(&mali_wait_lock);
 	}
-	return (rd(mali, at) & mask) == want;
+	return job_bits(rd(mali, at), mask, want);
 }
 
 #define MMU_INT_RAWSTAT     0x2000
@@ -1623,9 +1630,10 @@ walk_tables(uint64_t gpu, uint64_t walk[3])
 
 /*
  * Runs one job chain, from GPU address `chain`, to its end before returning. Fragment jobs (`fragment`) go on slot 0,
- * the rest on slot 1. Returns 0 when it finished; otherwise the slot status, a fault, or 0xff for no answer within a
- * second. After a failure the GPU is reset, so the next job finds it working.
+ * the rest on slot 1. Returns 0 when it finished; otherwise the slot status of a fault, or MALI_HUNG when it neither
+ * finished nor failed within a second. After a failure the GPU is reset, so the next job finds it working.
  */
+#define MALI_HUNG       0xffu
 uint32_t
 hakios_mali_submit(uint64_t chain, bool fragment)
 {
@@ -1642,11 +1650,17 @@ hakios_mali_submit(uint64_t chain, bool fragment)
 	wr(mali, js + JS_CONFIG_NEXT, JS_CONFIG);
 	wr(mali, js + JS_COMMAND_NEXT, 1);
 	lck_mtx_unlock(&mali_lock);
-	finished = wait_job(JOB_INT_RAWSTAT, (1u << slot) | (1u << (slot + 16)), 1u << slot, 1000);
+	/*
+	 * Done, or failed: a job that faults raises its slot's failure bit at once, and is not waited on for the whole second
+	 * (it was: the wait asked for the done bit alone). One still running after the second has hung (status 0x8, ACTIVE).
+	 */
+	(void)wait_job(JOB_INT_RAWSTAT, (1u << slot) | (1u << (slot + 16)), 0, 1000);
+	raw = rd(mali, JOB_INT_RAWSTAT);
+	finished = (raw & ((1u << slot) | (1u << (slot + 16)))) == (1u << slot);
 	lck_mtx_lock(&mali_lock);
 	if (!finished) {
 		raw = rd(mali, JOB_INT_RAWSTAT);
-		status = (raw & (1u << (slot + 16))) ? rd(mali, js + JS_STATUS) : 0xff;
+		status = (raw & (1u << (slot + 16))) ? rd(mali, js + JS_STATUS) : MALI_HUNG;
 		last_failure.count++;
 		last_failure.slot = slot;
 		last_failure.raw = raw;
@@ -1685,14 +1699,106 @@ hakios_mali_submit(uint64_t chain, bool fragment)
 #define MALI_QUEUE      64
 static struct {
 	uint64_t chain, seq, queued;
+	uint32_t owner;                 /* the client's number (hakios_mali_enqueue_for), 0: none */
 	bool fragment;
 } mali_queue[MALI_QUEUE];
+
 /* boot-arg mali_trace=1: a line for every job, "tl: j SEQ f|v q QUEUED b BEGAN e ENDED" in us of mach_absolute_time */
 static uint32_t mali_trace;
 static unsigned mali_queue_head, mali_queue_count;
 static uint64_t mali_queued_seq, mali_done_seq;
 static bool mali_worker_started;
 static LCK_MTX_DECLARE(mali_queue_lock, &mali_lock_group);
+
+/*
+ * A client whose job hung (did not end within the second, MALI_HUNG): the GPU is reset under it, as before, and the
+ * client's other jobs already queued then are not run (they are counted as done, unrun): they are the same frame's,
+ * built on the hung job's output, and would each hold the one queue for every other client for a second more (the
+ * Astronomy wallpaper's 15 hung fragment jobs, docs/metal.md phase 7). A client whose jobs hung MALI_HANGS_REFUSED
+ * times is refused from then on (hakios_mali_refused(): its submissions are answered done, unrun), until it goes
+ * (hakios_mali_forget()). Under mali_queue_lock.
+ */
+#define MALI_OWNERS             16
+#define MALI_HANGS_REFUSED      3
+static struct {
+	uint32_t owner, hangs;
+	uint64_t drop_through;          /* its jobs up to this number are not run */
+} mali_owners[MALI_OWNERS];
+static uint32_t mali_dropped, mali_refused;
+
+static int
+owner_slot(uint32_t owner)
+{
+	for (int i = 0; owner != 0 && i < MALI_OWNERS; i++) {
+		if (mali_owners[i].owner == owner) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+/* (mali_queue_lock held) a job of `owner` numbered `seq` not to be run */
+static bool
+owner_drops(uint32_t owner, uint64_t seq)
+{
+	int i = owner_slot(owner);
+
+	return i >= 0 && (seq <= mali_owners[i].drop_through || mali_owners[i].hangs >= MALI_HANGS_REFUSED);
+}
+
+/* (mali_queue_lock held) `owner`'s job hung: its jobs queued now are dropped */
+static void
+owner_hung(uint32_t owner)
+{
+	int i = owner_slot(owner);
+
+	if (owner == 0) {
+		return;
+	}
+	if (i < 0) {
+		for (i = 0; i < MALI_OWNERS && mali_owners[i].owner != 0; i++) {
+		}
+		if (i == MALI_OWNERS) {
+			i = (int)(owner % MALI_OWNERS);         /* (more hung clients than slots: one is forgotten) */
+		}
+		mali_owners[i].owner = owner;
+		mali_owners[i].hangs = 0;
+	}
+	mali_owners[i].hangs++;
+	mali_owners[i].drop_through = mali_queued_seq;
+	printf("mali: client %u's job hung (%u so far): its %s\n", owner, mali_owners[i].hangs,
+	    mali_owners[i].hangs >= MALI_HANGS_REFUSED ? "jobs are refused from now on" : "jobs queued now are not run");
+}
+
+/* Whether the client's jobs are refused (its jobs hung MALI_HANGS_REFUSED times). */
+bool
+hakios_mali_refused(uint32_t owner)
+{
+	bool refused;
+
+	lck_mtx_lock(&mali_queue_lock);
+	int i = owner_slot(owner);
+
+	refused = i >= 0 && mali_owners[i].hangs >= MALI_HANGS_REFUSED;
+	if (refused) {
+		mali_refused++;
+	}
+	lck_mtx_unlock(&mali_queue_lock);
+	return refused;
+}
+
+/* The client went: what was kept about it goes. */
+void
+hakios_mali_forget(uint32_t owner)
+{
+	lck_mtx_lock(&mali_queue_lock);
+	int i = owner_slot(owner);
+
+	if (i >= 0) {
+		mali_owners[i].owner = 0;
+	}
+	lck_mtx_unlock(&mali_queue_lock);
+}
 
 /*
  * Counters for the last second, read by hakios_mali_second() for the display's fps_log (MiniIOMobileFramebuffer.cpp):
@@ -1988,16 +2094,29 @@ mali_worker(__unused void *parameter, __unused wait_result_t result)
 		chain = mali_queue[mali_queue_head].chain;
 		seq = mali_queue[mali_queue_head].seq;
 		uint64_t queued = mali_queue[mali_queue_head].queued, job_began = mach_absolute_time();
+		uint32_t owner = mali_queue[mali_queue_head].owner;
+		bool dropped = owner_drops(owner, seq);
+
 		fragment = mali_queue[mali_queue_head].fragment;
+		if (dropped) {
+			mali_dropped++;
+		}
 		lck_mtx_unlock(&mali_queue_lock);
 
-		{
+		if (!dropped) {
 			/* how busy the GPU is: every five seconds, its share of the time and by which slot */
 			static uint64_t busy[2], since, jobs[2];
 			uint64_t began = mach_absolute_time(), now, ns;
 
-			if (hakios_mali_submit(chain, fragment) != 0) {
+			uint32_t status = hakios_mali_submit(chain, fragment);
+
+			if (status != 0) {
 				gMaliFailed++;
+			}
+			if (status == MALI_HUNG) {
+				lck_mtx_lock(&mali_queue_lock);
+				owner_hung(owner);
+				lck_mtx_unlock(&mali_queue_lock);
 			}
 			now = mach_absolute_time();
 			if (mali_trace) {
@@ -2042,9 +2161,13 @@ mali_worker(__unused void *parameter, __unused wait_result_t result)
 	}
 }
 
-/* A job chain into the queue: its number. */
+/*
+ * A job chain of client `owner` into the queue: its number, or 0 when the queue is full (hakios_mali_room()). It never
+ * sleeps: HakiosMali calls it under the lock every client's requests take, and a submission that slept there for room
+ * held every other client up, the window server's waits and buffers among them (docs/metal.md, phase 7).
+ */
 uint64_t
-hakios_mali_enqueue(uint64_t chain, bool fragment)
+hakios_mali_enqueue_for(uint64_t chain, bool fragment, uint32_t owner)
 {
 	uint64_t seq;
 
@@ -2058,19 +2181,44 @@ hakios_mali_enqueue(uint64_t chain, bool fragment)
 			mali_worker_started = true;
 		}
 	}
-	while (mali_queue_count == MALI_QUEUE) {
-		lck_mtx_sleep(&mali_queue_lock, LCK_SLEEP_DEFAULT, (event_t)&mali_queue_head, THREAD_UNINT);
+	if (mali_queue_count == MALI_QUEUE) {
+		lck_mtx_unlock(&mali_queue_lock);
+		return 0;
 	}
 	seq = ++mali_queued_seq;
 	unsigned at = (mali_queue_head + mali_queue_count) % MALI_QUEUE;
 
 	mali_queue[at].chain = chain;
 	mali_queue[at].fragment = fragment;
+	mali_queue[at].owner = owner;
 	mali_queue[at].seq = seq;
 	mali_queue[at].queued = mach_absolute_time();
 	mali_queue_count++;
 	lck_mtx_unlock(&mali_queue_lock);
 	wakeup((caddr_t)&mali_queue_count);
+	return seq;
+}
+
+/* Wait, holding no lock of the caller's, until the queue has room for a job. */
+void
+hakios_mali_room(void)
+{
+	lck_mtx_lock(&mali_queue_lock);
+	while (mali_queue_count == MALI_QUEUE) {
+		lck_mtx_sleep(&mali_queue_lock, LCK_SLEEP_DEFAULT, (event_t)&mali_queue_head, THREAD_UNINT);
+	}
+	lck_mtx_unlock(&mali_queue_lock);
+}
+
+/* A job chain into the queue, waiting for room: its number (no client's). */
+uint64_t
+hakios_mali_enqueue(uint64_t chain, bool fragment)
+{
+	uint64_t seq;
+
+	while ((seq = hakios_mali_enqueue_for(chain, fragment, 0)) == 0) {
+		hakios_mali_room();
+	}
 	return seq;
 }
 
@@ -2147,6 +2295,10 @@ mali_thread(__unused void *parameter, __unused wait_result_t result)
 		    "%u pictures shown; %llu MB of the GPU's 4 GB of addresses in use\n", reached, STEPS, user_said,
 		    user_said == 1 ? " -- a program ran a job on the GPU" : "", gMaliClients, gMaliBuffers, gMaliSubmits,
 		    gMaliFailed, gMaliShown, mali_va.taken * MALI_VA_GRANULE >> 20);
+		if (mali_dropped != 0 || mali_refused != 0) {
+			printf("mali: %u job chains of clients whose jobs hung not run, %u submissions refused\n", mali_dropped,
+			    mali_refused);
+		}
 		lck_mtx_lock(&kept_lock);
 		for (uint32_t i = kept_next > KEPT_LINES ? kept_next - KEPT_LINES : 0; i < kept_next; i++) {
 			printf("kept: %s\n", kept_lines[i % KEPT_LINES]);
