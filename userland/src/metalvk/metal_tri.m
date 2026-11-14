@@ -7,7 +7,7 @@
  * render pass, read back, on metal2vulkan's runtime over PanVK on the Mali-G72.
  *
  *   metal_tri [--bundle DIR] [--metallib FILE] [--size N] [--out FILE.ppm] [--surface] [--register] [--hold SECONDS]
- *             [--xr none|over|add] [--fetch] [--row-bytes B] [--frames K]
+ *             [--xr none|over|add] [--fetch] [--row-bytes B] [--frames K] [--ycbcr]
  *
  * The device: MTLCreateSystemDefaultDevice() first, Metal's own discovery (the kernel names the plug-in with boot-arg metal=N). When it
  * answers nil, the plug-in at --bundle (default /redwood/lib/HakiosMetal.bundle) is loaded and its class made the way Metal makes it,
@@ -43,6 +43,14 @@
  * image cannot be the driver's linear one (docs/metal.md, phase 7). --frames K draws the triangle K more times, a command buffer each
  * waited for, and says how long a commit took to complete on average: where a texture is a shadow of its surface, every frame copies
  * the surface in and back out.
+ *
+ * --ycbcr draws the triangle with a fragment function that reads a two-plane YCbCr texture (YCBCR8_420_2P, 500) over a '420f'
+ * IOSurface at the fragment's own pixel (tools/metal/air/tri_ycbcr.ll), the planes one luma code and chroma 128, which reads as that
+ * code's gray, and judges the inside of the triangle at each step (ycbcr_check below): drawn twice with the planes as they are, then
+ * after the processor wrote them under the surface's lock, then after a render pass cleared an R8Unorm texture over the luma plane in a
+ * command buffer of its own, then in the same command buffer as the draw. metal2vulkan converts the planes again only where the
+ * surface's seed changed or its own commands wrote them (tools/metal/m2v/0011); each step must read the codes the planes hold then, and
+ * says how long its command buffer took from commit to completion (with --size 2048 the conversion is most of it).
  */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -328,6 +336,165 @@ judge(const unsigned char *pixels, unsigned n, const double clear[3], unsigned *
 		}
 	}
 	return bad_in + bad_out;
+}
+
+/* ---------------------------------------------------------------------------------------------------------- the YCbCr check (--ycbcr) */
+
+/* a '420f' surface of n x n (n a multiple of 32): plane 0 the luma codes, n bytes a row; plane 1 the Cb and Cr pairs, n bytes a row */
+static IOSurfaceRef
+make_420f(unsigned n)
+{
+	NSDictionary *luma = @{ (id)kIOSurfacePlaneWidth: @(n), (id)kIOSurfacePlaneHeight: @(n), (id)kIOSurfacePlaneBytesPerElement: @1,
+		(id)kIOSurfacePlaneBytesPerRow: @(n), (id)kIOSurfacePlaneOffset: @0, (id)kIOSurfacePlaneSize: @(n * n) };
+	NSDictionary *chroma = @{ (id)kIOSurfacePlaneWidth: @(n / 2), (id)kIOSurfacePlaneHeight: @(n / 2),
+		(id)kIOSurfacePlaneBytesPerElement: @2, (id)kIOSurfacePlaneBytesPerRow: @(n), (id)kIOSurfacePlaneOffset: @(n * n),
+		(id)kIOSurfacePlaneSize: @(n * n / 2) };
+	NSDictionary *props = @{ (id)kIOSurfaceWidth: @(n), (id)kIOSurfaceHeight: @(n), (id)kIOSurfacePixelFormat: @((unsigned)'420f'),
+		(id)kIOSurfaceAllocSize: @(n * n * 3 / 2), (id)kIOSurfacePlaneInfo: @[ luma, chroma ] };
+	return IOSurfaceCreate((__bridge CFDictionaryRef)props);
+}
+
+/* the planes written by the processor, under the surface's lock for writing (which changes its seed): luma `code`, chroma 128 */
+static void
+fill_420f(IOSurfaceRef ios, unsigned char code)
+{
+	IOSurfaceLock(ios, 0, NULL);
+	memset(IOSurfaceGetBaseAddressOfPlane(ios, 0), code, IOSurfaceGetBytesPerRowOfPlane(ios, 0) * IOSurfaceGetHeightOfPlane(ios, 0));
+	memset(IOSurfaceGetBaseAddressOfPlane(ios, 1), 128, IOSurfaceGetBytesPerRowOfPlane(ios, 1) * IOSurfaceGetHeightOfPlane(ios, 1));
+	IOSurfaceUnlock(ios, 0, NULL);
+}
+
+/*
+ * The draw's command buffer: with `clear_luma` >= 0, first a render pass that clears `luma` (an R8Unorm texture over plane 0) to that
+ * code, then the triangle reading `yuv` into `target`; committed and waited for. Then the inside of the triangle judged: gray `want`
+ * within 2. False, saying why, if it is not.
+ */
+static bool
+ycbcr_step(const char *what, id<MTLCommandQueue> queue, id<MTLRenderPipelineState> pipeline, id<MTLTexture> target,
+    id<MTLTexture> yuv, id<MTLTexture> luma, int clear_luma, unsigned char want, unsigned n)
+{
+	id<MTLCommandBuffer> cb = [queue commandBuffer];
+	if (clear_luma >= 0) {
+		MTLRenderPassDescriptor *lp = [MTLRenderPassDescriptor renderPassDescriptor];
+		lp.colorAttachments[0].texture = luma;
+		lp.colorAttachments[0].loadAction = MTLLoadActionClear;
+		lp.colorAttachments[0].storeAction = MTLStoreActionStore;
+		lp.colorAttachments[0].clearColor = MTLClearColorMake(clear_luma / 255.0, 0, 0, 1);
+		[[cb renderCommandEncoderWithDescriptor:lp] endEncoding];
+	}
+	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+	rp.colorAttachments[0].texture = target;
+	rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+	rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+	rp.colorAttachments[0].clearColor = MTLClearColorMake(clear_rgb[0], clear_rgb[1], clear_rgb[2], 1);
+	id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+	[enc setRenderPipelineState:pipeline];
+	[enc setFragmentTexture:yuv atIndex:0];
+	[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	[enc endEncoding];
+	CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+	[cb commit];
+	[cb waitUntilCompleted];
+	double ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000;
+	if (cb.status != MTLCommandBufferStatusCompleted) {
+		printf("FAIL  %s: command buffer status %ld%s%s\n", what, (long)cb.status, cb.error ? ": " : "",
+		    cb.error ? cb.error.description.UTF8String : "");
+		return false;
+	}
+	unsigned char *pixels = calloc(n, (size_t)n * 4);
+	[target getBytes:pixels bytesPerRow:(size_t)n * 4 fromRegion:MTLRegionMake2D(0, 0, n, n) mipmapLevel:0];
+	unsigned inside = 0, wrong = 0;
+	for (unsigned y = 0; y < n; y++) {
+		for (unsigned x = 0; x < n; x++) {
+			double w[3];
+			barycentric(x, y, n, w);
+			double margin = 2.5 / n;
+			if (w[0] <= margin || w[1] <= margin || w[2] <= margin) {
+				continue;
+			}
+			const unsigned char *p = pixels + ((size_t)y * n + x) * 4;
+			inside++;
+			bool ok = abs(p[0] - want) <= 2 && abs(p[1] - want) <= 2 && abs(p[2] - want) <= 2;
+			if (!ok && wrong++ < 3) {
+				printf("      (%u,%u): BGRA %u %u %u %u, want gray %u\n", x, y, p[0], p[1], p[2], p[3], want);
+			}
+		}
+	}
+	free(pixels);
+	bool pass = inside > 0 && wrong == 0;
+	printf("%s %s: gray %u read, %u pixels inside judged, %u wrong; %.1f ms from commit to completion\n", pass ? "ok   " : "FAIL ", what,
+	    want, inside, wrong, ms);
+	return pass;
+}
+
+static bool
+ycbcr_check(id<MTLDevice> device, const char *metallib, unsigned n)
+{
+	NSError *error = nil;
+	n &= ~31u;
+	id<MTLLibrary> library = [device newLibraryWithURL:[NSURL fileURLWithPath:@(metallib)] error:&error];
+	if (library == nil) {
+		printf("metal_tri: FAIL: newLibraryWithURL: %s: %s\n", metallib, error.description.UTF8String);
+		return false;
+	}
+	MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+	pd.vertexFunction = [library newFunctionWithName:@"tri_vertex"];
+	pd.fragmentFunction = [library newFunctionWithName:@"tri_ycbcr"];
+	pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	if (pd.vertexFunction == nil || pd.fragmentFunction == nil) {
+		printf("metal_tri: FAIL: tri_vertex or tri_ycbcr is not in the library\n");
+		return false;
+	}
+	id<MTLRenderPipelineState> pipeline = [device newRenderPipelineStateWithDescriptor:pd error:&error];
+	if (pipeline == nil) {
+		printf("metal_tri: FAIL: newRenderPipelineStateWithDescriptor: %s\n", error.description.UTF8String);
+		return false;
+	}
+	printf("ok    render pipeline reading a texture\n");
+	IOSurfaceRef ios = make_420f(n);
+	if (ios == NULL || IOSurfaceGetPlaneCount(ios) != 2) {
+		printf("metal_tri: FAIL: no '420f' surface of %ux%u\n", n, n);
+		return false;
+	}
+	/* YCBCR8_420_2P (500): no name in the public SDK */
+	MTLTextureDescriptor *yd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:(MTLPixelFormat)500 width:n height:n
+	    mipmapped:NO];
+	yd.usage = MTLTextureUsageShaderRead;
+	MTLTextureDescriptor *ld = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm width:n height:n
+	    mipmapped:NO];
+	ld.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	id<MTLTexture> yuv = [device newTextureWithDescriptor:yd iosurface:ios plane:0];
+	id<MTLTexture> luma = [device newTextureWithDescriptor:ld iosurface:ios plane:0];
+	id<MTLTexture> target = make_target(device, n, NULL);
+	if (yuv == nil || luma == nil || target == nil) {
+		printf("metal_tri: FAIL: the textures (YCbCr %s, luma %s, target %s)\n", yuv ? "made" : "refused", luma ? "made" : "refused",
+		    target ? "made" : "refused");
+		CFRelease(ios);
+		return false;
+	}
+	id<MTLCommandQueue> queue = [device newCommandQueue];
+	bool pass = true;
+	fill_420f(ios, 0x40);
+	pass &= ycbcr_step("the planes as the processor wrote them", queue, pipeline, target, yuv, luma, -1, 0x40, n);
+	pass &= ycbcr_step("again, the planes unchanged", queue, pipeline, target, yuv, luma, -1, 0x40, n);
+	fill_420f(ios, 0xc0);
+	pass &= ycbcr_step("after the processor wrote them again (locked)", queue, pipeline, target, yuv, luma, -1, 0xc0, n);
+	pass &= ycbcr_step("again, unchanged", queue, pipeline, target, yuv, luma, -1, 0xc0, n);
+	/* the GPU writes the luma plane: in a command buffer before the draw's, then in the draw's own */
+	id<MTLCommandBuffer> cb = [queue commandBuffer];
+	MTLRenderPassDescriptor *lp = [MTLRenderPassDescriptor renderPassDescriptor];
+	lp.colorAttachments[0].texture = luma;
+	lp.colorAttachments[0].loadAction = MTLLoadActionClear;
+	lp.colorAttachments[0].storeAction = MTLStoreActionStore;
+	lp.colorAttachments[0].clearColor = MTLClearColorMake(0x20 / 255.0, 0, 0, 1);
+	[[cb renderCommandEncoderWithDescriptor:lp] endEncoding];
+	[cb commit];
+	[cb waitUntilCompleted];
+	pass &= ycbcr_step("after a render pass cleared the luma plane", queue, pipeline, target, yuv, luma, -1, 0x20, n);
+	pass &= ycbcr_step("after one cleared it in the same command buffer", queue, pipeline, target, yuv, luma, 0x60, 0x60, n);
+	pass &= ycbcr_step("again, unchanged", queue, pipeline, target, yuv, luma, -1, 0x60, n);
+	CFRelease(ios);
+	return pass;
 }
 
 /* ---------------------------------------------------------------------------------------------------------- the BGR10_XR check (--xr) */
@@ -829,6 +996,7 @@ main(int argc, char *argv[])
 		const char *xr = NULL;
 		bool fetch = false;
 		unsigned row_bytes = 0, frames = 0;
+		bool ycbcr = false;
 		for (int i = 1; i < argc; i++) {
 			if (strcmp(argv[i], "--bundle") == 0 && i + 1 < argc) {
 				bundle_path = argv[++i];
@@ -852,9 +1020,11 @@ main(int argc, char *argv[])
 				row_bytes = (unsigned)atoi(argv[++i]);
 			} else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
 				frames = (unsigned)atoi(argv[++i]);
+			} else if (strcmp(argv[i], "--ycbcr") == 0) {
+				ycbcr = true;
 			} else {
 				fprintf(stderr, "usage: metal_tri [--bundle DIR] [--metallib FILE] [--size N] [--out FILE.ppm] [--surface] "
-				    "[--register] [--hold SECONDS] [--xr none|over|add] [--fetch] [--row-bytes B] [--frames K]\n");
+				    "[--register] [--hold SECONDS] [--xr none|over|add] [--fetch] [--row-bytes B] [--frames K] [--ycbcr]\n");
 				return 2;
 			}
 		}
@@ -871,6 +1041,11 @@ main(int argc, char *argv[])
 		}
 		if (xr != NULL) {
 			bool pass = xr_check(device, metallib, n, xr, surface);
+			printf("metal_tri: %s\n", pass ? "PASS" : "FAIL");
+			return pass ? 0 : 1;
+		}
+		if (ycbcr) {
+			bool pass = ycbcr_check(device, metallib, n);
 			printf("metal_tri: %s\n", pass ? "PASS" : "FAIL");
 			return pass ? 0 : 1;
 		}

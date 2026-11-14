@@ -586,8 +586,9 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 			${LLVM_AS:-llvm-as} -o obj/tri_vertex.bc ../tools/metal/air/tri_vertex.ll
 			${LLVM_AS:-llvm-as} -o obj/tri_fragment.bc ../tools/metal/air/tri_fragment.ll
 			${LLVM_AS:-llvm-as} -o obj/tri_fetch.bc ../tools/metal/air/tri_fetch.ll
+			${LLVM_AS:-llvm-as} -o obj/tri_ycbcr.bc ../tools/metal/air/tri_ycbcr.ll
 			python3 ../tools/metal/mkmetallib.py obj/metal_tri.metallib tri_vertex:vertex:obj/tri_vertex.bc \
-				tri_fragment:fragment:obj/tri_fragment.bc tri_fetch:fragment:obj/tri_fetch.bc
+				tri_fragment:fragment:obj/tri_fragment.bc tri_fetch:fragment:obj/tri_fetch.bc tri_ycbcr:fragment:obj/tri_ycbcr.bc
 			echo "build.sh: HakiosMetal is Metal on Vulkan (libmetal2vulkan.dylib, $(cat $V/built-from))"
 		elif [ "${METAL_PLUGIN:-}" = ca ]; then
 			# METAL_PLUGIN=ca: the plug-in that serves CoreAnimation's window server (src/HakiosMetalCA.m, vcvkk's with
