@@ -541,6 +541,23 @@ static void tellHostSurface(IOSurfaceRef surface,void *base,size_t bytes) {
  });
  if(tell)tell(base,bytes,IOSurfaceGetID(surface));
 }
+// The runtime watches each imported surface (nmb_buffer_watch_surface; metal2vulkan's surface_watch.rs): a two-plane YCbCr texture over
+// it converts its planes again only where the surface's seed changed (the window server's wallpaper was converted at every frame, 9.4 ms
+// of the GPU's 16), and its GPU writes are announced once queued. The driver announces them to the kernel as a device's write
+// (tools/mesa/hakios-drm: hakios_drm_surface_written; the seed changes, the lines the kernel cleaned stay clean); where it cannot (an
+// older driver, or a surface the driver copied), a lock and unlock for writing changes the seed, as a processor's write.
+static uint32_t surfaceSeed(void *context) {return IOSurfaceGetSeed((IOSurfaceRef)context);}
+static void surfaceWritten(void *context) {
+ static int (*written)(uint32_t);
+ static std::once_flag once;
+ std::call_once(once,[]{
+  if(void *driver=gLoaderPath.empty()?nullptr:dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD))
+   written=(int (*)(uint32_t))dlsym(driver,"hakios_drm_surface_written");
+ });
+ IOSurfaceRef surface=(IOSurfaceRef)context;
+ if(written && written(IOSurfaceGetID(surface))==0)return;
+ if(IOSurfaceLock(surface,0,nullptr)==0)IOSurfaceUnlock(surface,0,nullptr);
+}
 static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
  struct Key {uint64_t identity,address,bytes;};
  const Key value={IOSurfaceGetID(surface),(uintptr_t)base,bytes};
@@ -553,6 +570,8 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
  tellHostSurface(surface,base,bytes);
  NmbBuffer *handle=nmb_buffer_new_no_copy_releasing(gDevice,base,bytes,MTLResourceStorageModeShared,releaseSurface,(void *)CFRetain(surface));
  if(!handle){CFRelease(surface);NBLOG(@"native-metal: surface import refused: %@",lastError());return nil;}
+ // (the import holds the surface until its release runs, after the last buffer and command buffer over it: the watch's context)
+ nmb_buffer_watch_surface(handle,surfaceSeed,surfaceWritten,(void *)surface);
  gSurfaceImportsMade++;buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;
  if(key) {
   // Bound metadata without retaining old frames. Evicting an association is
@@ -617,7 +636,11 @@ NB_RESOURCE_SPI
  const uint64_t region[6]={r.origin.x,r.origin.y,r.origin.z,r.size.width,r.size.height,r.size.depth};
  const uint64_t length=(r.size.depth>1?image*(r.size.depth-1):0)+row*r.size.height;
  const uint64_t began=nowUs();
+ // A texture over a surface writes the surface's pixels: locked for writing around it, as IOSurface asks of a processor's writer, so
+ // its seed changes (readers that keep what they made of the pixels, the runtime's converted textures among them, make it again).
+ const bool locked=_surface && IOSurfaceLock(_surface,0,nullptr)==0;
  const bool done=nmb_texture_replace(_handle,region,level,slice,bytes,row,image,length);
+ if(locked)IOSurfaceUnlock(_surface,0,nullptr);
  if(!done)NBLOG(@"native-metal: replaceRegion refused: %@",lastError());
  if(length>=kBigLoad) {
   const uint64_t took=nowUs()-began;
