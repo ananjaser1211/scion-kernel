@@ -29,9 +29,15 @@
  * Metal and the program hold is then the device itself, and the message that opened it is sent again. When the device cannot be
  * opened, every such message is answered with nil or zero, and the log says why once.
  *
+ * The window server (backboardd) is the exception: it opens the device in -initWithAcceleratorPort:, since CoreAnimation uses it within
+ * a second anyway, and answers nil there when it cannot be opened. Metal adds no device for a nil answer (its discovery tests the
+ * object before MTLAddDevice), so MTLCreateSystemDefaultDevice() is nil and CoreAnimation takes its OpenGL ES path, as on an image
+ * without Metal. Opened at first use instead, a device that fails is found only after CoreAnimation has chosen Metal, and every
+ * answer of nil after that ends the window server.
+ *
  * Who is shown the device (src/hakios_metal_shown.c): metal=1 metal_test only, metal=2 applications and app extensions, metal=3 all but
- * backboardd, metal=4 all; and HakiosMetal.clients (beside the bundle, or /private/var/db). A process that is not shown it gets no class,
- * and Metal no device.
+ * backboardd, metal=4 all; backboardd at metal=2 or 3 when the driver is PanVK (camtl=0 or "-backboardd" keeps it on OpenGL ES); and
+ * HakiosMetal.clients (beside the bundle, or /private/var/db). A process that is not shown it gets no class, and Metal no device.
  *
  * What it says goes to the console, to /private/var/tmp/HakiosMetal.log (up to 4 MiB) and to NSLog, one line each, with the process.
  */
@@ -290,6 +296,11 @@ deviceProtocolHas(SEL selector)
 - (void)initFeatureQueries {}
 - (void)initGPUFamilySupport {}
 - (void)initWorkarounds {}
+/*
+ * Not Metal's: whether this device was opened for the window server in -initWithAcceleratorPort:, which userland/src/inject.c asks in
+ * backboardd before CoreAnimation takes the device (without camtl=, it takes out any device that does not answer YES).
+ */
+- (BOOL)hakiosOpenedForWindowServer {return gState == OPEN && hakios_metal_is_window_server();}
 
 /* every forwarded message: the device is opened here (or was already), and the message is sent again by forwardInvocation: */
 - (id)forwardingTargetForSelector:(SEL)selector
@@ -361,7 +372,8 @@ initWithAcceleratorPort(id self, SEL selector, unsigned port)
 	}
 	pthread_mutex_lock(&gLock);
 	if (gDevice != nil) {
-		made = [gDevice retain];
+		/* the window server's device that could not be opened stays no device */
+		made = gState == FAILED && hakios_metal_is_window_server() ? nil : [gDevice retain];
 		pthread_mutex_unlock(&gLock);
 		return made;
 	}
@@ -369,6 +381,18 @@ initWithAcceleratorPort(id self, SEL selector, unsigned port)
 	if (made != nil) {
 		gDevice = [made retain];
 		IORegistryEntryGetRegistryEntryID(port, &gRegistryID);
+	}
+	if (made != nil && hakios_metal_is_window_server()) {
+		/* opened now, and no device if it cannot be (the head of this file); the object stays in gDevice, never released */
+		say("a device for the accelerator port %u; opened now, for the window server", port);
+		openDevice(selector);
+		if (gState != OPEN) {
+			say("no device for the window server: CoreAnimation draws with OpenGL ES");
+			[made release];
+			made = nil;
+		}
+		pthread_mutex_unlock(&gLock);
+		return made;
 	}
 	pthread_mutex_unlock(&gLock);
 	if (made != nil) {

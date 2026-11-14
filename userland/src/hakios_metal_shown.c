@@ -4,8 +4,17 @@
  *   metal=1  only the program metal_test (userland/src/metal_test.m): the safe level, for seeing what Metal does with the device
  *   metal=2  applications and app extensions: a process whose executable is in a .app or .appex bundle (SpringBoard, PosterBoard
  *            and its wallpaper extensions, Maps, the user's programs), and no daemon
- *   metal=3  every process but backboardd (metal=2 until 14 November 2026)
+ *   metal=3  every process but backboardd (metal=2 until 14 November 2026), which has its rule below
  *   metal=4  every process, backboardd too, to find out what the window server asks (metal=3 until then)
+ *
+ * The window server, backboardd. At metal=2 or 3 it is shown the device by default when the device is Metal on PanVK (the METAL=vk
+ * build whose HakiosMetal.icd names libvulkan_panfrost, hakios_metal_vk_driver()): there CoreAnimation draws with Metal, and the
+ * plug-in opens the device as soon as the window server makes it, so that a device that cannot be opened is no device and
+ * CoreAnimation takes its OpenGL ES path (src/metalvk/HakiosMetalVK.mm). Boot-arg camtl=0, or a line "-backboardd" in either
+ * clients file, keeps the window server on OpenGL ES; the first needs a boot, the second only the window server's next start.
+ * With any other driver or build it is shown the device only at metal=4 or when a clients file names it, as before.
+ * userland/src/inject.c agrees: it takes the device out of backboardd again with camtl=0, and also with no camtl= when the device
+ * is not one the METAL=vk plug-in opened for the window server; camtl=1 leaves any device there.
  *
  * Why not simply everyone. CoreAnimation's window server tries Metal FIRST and goes to its OpenGL ES path (which works on this port)
  * only when no Metal device exists; with ours it takes Metal and stops on "metallib_url != nil": its own shader library,
@@ -14,8 +23,8 @@
  * is started again. A device that is shown to a process that cannot use it costs that process, so it is shown to as few as the
  * experiment needs.
  *
- * (The Galaxy S9's image has QuartzCore's default.metallib now, sysimage/select-system.py KEEP_METALLIB; the window server stays on
- * OpenGL ES there by the choice of userland/src/inject.c, which takes the device out of backboardd unless boot-arg camtl=1.) The METAL=vk
+ * (The Galaxy S9's image has QuartzCore's default.metallib now, sysimage/select-system.py KEEP_METALLIB, and the window server
+ * draws with Metal there by the rule above.) The METAL=vk
  * build shows a device that opens the GPU only at its first real use (src/metalvk/HakiosMetalVK.mm), so a process that is shown it
  * and never uses it pays almost nothing.
  *
@@ -58,7 +67,64 @@ hakios_metal_beside_bundle(const char *name, char *path, unsigned long size)
 	return access(path, R_OK) == 0;
 }
 
-#define CLIENTS_KEPT    "/private/var/db/HakiosMetal.clients"
+#define DEFAULT_VK_ICD  "/redwood/lib/libhakios.vk.dylib"
+
+void
+hakios_metal_vk_driver(char *path, unsigned long size, void (*say)(const char *line))
+{
+	const char *environment = getenv("HAKIOS_VK_ICD");
+	char file[1024], line[1200];
+	FILE *f;
+
+	if (environment != NULL && environment[0] != '\0') {
+		strlcpy(path, environment, size);
+		return;
+	}
+	if (hakios_metal_beside_bundle("HakiosMetal.icd", file, sizeof(file)) && (f = fopen(file, "r")) != NULL) {
+		int named = fgets(path, (int)size, f) != NULL;
+
+		fclose(f);
+		path[strcspn(path, " \t\r\n#")] = '\0';
+		if (named && path[0] == '/') {
+			return;
+		}
+		if (say != NULL) {
+			snprintf(line, sizeof(line), "%s names no driver (an absolute path on its first line): the default", file);
+			say(line);
+		}
+	}
+	strlcpy(path, DEFAULT_VK_ICD, size);
+}
+
+int
+hakios_metal_vk_driver_is_panvk(const char *path)
+{
+	const char *base = strrchr(path, '/');
+
+	return strncmp(base != NULL ? base + 1 : path, "libvulkan_panfrost", 18) == 0;
+}
+
+int
+hakios_metal_is_window_server(void)
+{
+	const char *name = getprogname();
+
+	return name != NULL && strcmp(name, "backboardd") == 0;
+}
+
+/* boot-arg camtl: 0 or 1 as given, -1 if it is not on the line */
+static int
+camtl(const char *args)
+{
+	const char *at = strstr(args, "camtl=");
+
+	while (at != NULL && at != args && at[-1] != ' ') {
+		at = strstr(at + 6, "camtl=");
+	}
+	return at == NULL ? -1 : atoi(at + 6) != 0;
+}
+
+#define CLIENTS_KEPT   "/private/var/db/HakiosMetal.clients"
 
 /* what the clients file at PATH says of NAME: 1 shown ("NAME" or "*"), -1 kept from it ("-NAME"), 0 nothing */
 static int
@@ -134,9 +200,29 @@ hakios_metal_shown(void (*say)(const char *line))
 		}
 		return 0;
 	}
-	if (level >= 4 || (level == 3 && strcmp(name, "backboardd") != 0) || (level == 2 && isApplication()) ||
+	int windowServer = hakios_metal_is_window_server();
+	if (windowServer && camtl(args) == 0) {
+		if (say != NULL) {
+			say("backboardd is not shown the device: camtl=0 keeps the window server on OpenGL ES");
+		}
+		return 0;
+	}
+	if (level >= 4 || (level == 3 && !windowServer) || (level == 2 && isApplication()) ||
 	    (level == 1 && strcmp(name, "metal_test") == 0)) {
 		return 1;
+	}
+	if (windowServer && level >= 2 && named == 0) {
+		char driver[1024];
+
+		hakios_metal_vk_driver(driver, sizeof(driver), say);
+		if (hakios_metal_vk_driver_is_panvk(driver)) {
+			snprintf(line, sizeof(line), "backboardd is shown the device: the window server draws with Metal on %s by default "
+			    "(camtl=0, or -backboardd in %s, keeps it on OpenGL ES)", driver, CLIENTS_KEPT);
+			if (say != NULL) {
+				say(line);
+			}
+			return 1;
+		}
 	}
 	if (named > 0) {
 		snprintf(line, sizeof(line), "%s is shown the device: %s names it", name, where);

@@ -6,6 +6,7 @@
  * The Vulkan driver is an installable client driver (ICD) opened by its path, there being no Vulkan loader on iOS (tools/metal/bridge/icd.rs):
  *   1. the environment's HAKIOS_VK_ICD, if set;
  *   2. else the first line of HakiosMetal.icd beside the bundle (in the directory that holds HakiosMetal.bundle);
+ *      (hakios_metal_vk_driver() in src/hakios_metal_shown.c, which also decides by it whether the window server is shown the device)
  *   3. else /redwood/lib/libhakios.vk.dylib: gfxstream's guest Vulkan driver for the Pixel (AVF), being built on gpu/gfxstream-vulkan.
  *      On the Galaxy S9 the driver is PanVK (METAL_ICD=/redwood/lib/libvulkan_panfrost.dylib, tools/mk-panvk.sh): it gives the
  *      Mali-G72 (v6) Vulkan 1.0 unless told otherwise, which hakios_metal_vk_open() does for that driver only (docs/metal.md).
@@ -25,8 +26,6 @@
 #include "NativeBridgeMetalFrontend.h"
 #include "bridge/NativeMetalObjects.h"
 #include "../hakios_metal_shown.h"
-
-#define DEFAULT_ICD "/redwood/lib/libhakios.vk.dylib"
 
 /*
  * Shader priming's progress, which the frontend's telemetry reads (AdrenoMetal's plug-in defines these in PrimeShaders.h, its warming of
@@ -74,31 +73,6 @@ missing(const char *cls, const char *selector)
 	sayf("asked and not implemented: %s", name.UTF8String);
 }
 
-/* the Vulkan driver's path, by the order above */
-static void
-driverPath(char *path, size_t size)
-{
-	const char *environment = getenv("HAKIOS_VK_ICD");
-	char file[1024];
-	FILE *f;
-
-	if (environment != NULL && environment[0] != '\0') {
-		strlcpy(path, environment, size);
-		return;
-	}
-	if (hakios_metal_beside_bundle("HakiosMetal.icd", file, sizeof(file)) && (f = fopen(file, "r")) != NULL) {
-		bool named = fgets(path, (int)size, f) != NULL;
-
-		fclose(f);
-		path[strcspn(path, " \t\r\n#")] = '\0';
-		if (named && path[0] == '/') {
-			return;
-		}
-		sayf("%s names no driver (an absolute path on its first line): the default", file);
-	}
-	strlcpy(path, DEFAULT_ICD, size);
-}
-
 /*
  * A writable directory for the translated shaders (the runtime will not open a device without one): the user's cache directory, its temp
  * directory, then /tmp and /private/var/tmp, each with m2v appended; the first that can be written.
@@ -142,7 +116,7 @@ hakios_metal_vk_open(id device, uint64_t registryID, void (*logger)(const char *
 
 	say = logger;
 	native_bridge_metal_log_hook = logger;
-	driverPath(driver, sizeof(driver));
+	hakios_metal_vk_driver(driver, sizeof(driver), logger);
 	if (access(driver, R_OK) != 0) {
 		snprintf(why, size, "no Vulkan driver at %s (HAKIOS_VK_ICD or HakiosMetal.icd name another)", driver);
 		return false;
@@ -156,7 +130,7 @@ hakios_metal_vk_open(id device, uint64_t registryID, void (*logger)(const char *
 	 * found the render server and every client compressing unless told not to). Asked of every process the device is opened in.
 	 */
 	CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
-	if (strcmp(getprogname(), "backboardd") == 0) {
+	if (hakios_metal_is_window_server()) {
 		setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
 		CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
 	}
@@ -167,8 +141,7 @@ hakios_metal_vk_open(id device, uint64_t registryID, void (*logger)(const char *
 	 * MESA_VK_VERSION_OVERRIDE raises the number (docs/metal.md). Set only for that driver, only in a process the device is opened in,
 	 * and never over a value the environment already has.
 	 */
-	const char *base = strrchr(driver, '/');
-	if (strncmp(base != NULL ? base + 1 : driver, "libvulkan_panfrost", 18) == 0) {
+	if (hakios_metal_vk_driver_is_panvk(driver)) {
 		setenv("PAN_I_WANT_A_BROKEN_VULKAN_DRIVER", "1", 0);
 		setenv("MESA_VK_VERSION_OVERRIDE", "1.2", 0);
 	}
