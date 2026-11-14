@@ -7,7 +7,7 @@
  * render pass, read back, on metal2vulkan's runtime over PanVK on the Mali-G72.
  *
  *   metal_tri [--bundle DIR] [--metallib FILE] [--size N] [--out FILE.ppm] [--surface] [--register] [--hold SECONDS]
- *             [--xr none|over|add] [--fetch] [--row-bytes B] [--frames K] [--ycbcr]
+ *             [--xr none|over|add] [--fetch] [--row-bytes B] [--frames K] [--ycbcr] [--texel-buffer OFFSET [--a8] [--blit] [--render]]
  *
  * The device: MTLCreateSystemDefaultDevice() first, Metal's own discovery (the kernel names the plug-in with boot-arg metal=N). When it
  * answers nil, the plug-in at --bundle (default /redwood/lib/HakiosMetal.bundle) is loaded and its class made the way Metal makes it,
@@ -51,6 +51,11 @@
  * command buffer of its own, then in the same command buffer as the draw. metal2vulkan converts the planes again only where the
  * surface's seed changed or its own commands wrote them (tools/metal/m2v/0011); each step must read the codes the planes hold then, and
  * says how long its command buffer took from commit to completion (with --size 2048 the conversion is most of it).
+ *
+ * --texel-buffer OFFSET draws the triangle with tri_ycbcr reading an RGBA8Unorm texture (--a8: A8Unorm) made over a no-copy buffer at
+ * OFFSET bytes with rows --row-bytes apart, as CoreAnimation's text and icon textures are, and judges every pixel against its texel
+ * (texel_buffer_check below); with --blit the GPU writes the texels first, a blit from a buffer, and the memory is checked before the
+ * draw reads them; with --render (RGBA8) the triangle is rendered into that texture instead, and judged in the buffer's memory.
  */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -791,6 +796,215 @@ fetch_check(id<MTLDevice> device, const char *metallib, unsigned n, bool surface
 	return pass;
 }
 
+/* -------------------------------------------------------------------------------------- a texture over a no-copy buffer (--texel-buffer) */
+
+/* the texels of --texel-buffer: every byte a function of its texel and channel, so that a wrong offset or row pitch shows */
+static unsigned char
+texel_byte(unsigned x, unsigned y, unsigned c)
+{
+	return (unsigned char)(c == 0 ? x * 5 + y * 3 : c == 1 ? x ^ (y * 7) : c == 2 ? x * 11 + y * 13 + 1 : 255 - ((x + 2 * y) & 127));
+}
+
+/*
+ * The triangle drawn by tri_ycbcr (a fragment function that reads its texture at its own pixel) from an n x n RGBA8Unorm texture, or with
+ * --a8 an A8Unorm one, made over a no-copy buffer (newBufferWithBytesNoCopy: of page-aligned memory) at OFFSET bytes into it with rows
+ * ROW_BYTES apart: what CoreAnimation's text and icon textures are in the window server (docs/metal.md, phases 8 and 9: offsets of 32 to
+ * 16000 bytes, rows of 224, 288 or 720 bytes, which are not multiples of 64). Every other byte of the memory holds 0x5a. Inside the
+ * triangle every pixel must be its texel exactly (an A8 texture reads as 0, 0, 0, a); outside, the clear colour. Then the memory's other
+ * bytes are checked unchanged. Whether the runtime read the buffer's own pages or a shadow image of the texture it copies before each
+ * use is what the device's image requirements decide: the runtime's shadow.log says so (metal2vulkan-degrade-shadowed-texture), and
+ * --frames K says what a draw costs.
+ */
+static bool
+texel_buffer_check(id<MTLDevice> device, const char *metallib, unsigned n, unsigned offset, unsigned row_bytes, bool a8, unsigned frames,
+    bool blit, bool render_to)
+{
+	unsigned bpp = a8 ? 1 : 4;
+	if (row_bytes == 0) {
+		row_bytes = n * bpp;
+	}
+	if (row_bytes < n * bpp) {
+		printf("metal_tri: FAIL: rows of %u bytes hold fewer than %u texels\n", row_bytes, n);
+		return false;
+	}
+	NSError *error = nil;
+	id<MTLLibrary> library = [device newLibraryWithURL:[NSURL fileURLWithPath:@(metallib)] error:&error];
+	if (library == nil) {
+		printf("metal_tri: FAIL: newLibraryWithURL: %s: %s\n", metallib, error.description.UTF8String);
+		return false;
+	}
+	MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+	pd.vertexFunction = [library newFunctionWithName:@"tri_vertex"];
+	pd.fragmentFunction = [library newFunctionWithName:@"tri_ycbcr"];
+	pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	id<MTLRenderPipelineState> pipeline = pd.vertexFunction && pd.fragmentFunction ?
+	    [device newRenderPipelineStateWithDescriptor:pd error:&error] : nil;
+	if (pipeline == nil) {
+		printf("metal_tri: FAIL: no pipeline of tri_vertex and tri_ycbcr: %s\n", error ? error.description.UTF8String : "not in the library");
+		return false;
+	}
+	size_t page = (size_t)getpagesize(), used = offset + (size_t)row_bytes * n, size = (used + page - 1) / page * page;
+	unsigned char *memory = NULL;
+	if (posix_memalign((void **)&memory, page, size) != 0) {
+		printf("metal_tri: FAIL: no %zu bytes of memory\n", size);
+		return false;
+	}
+	memset(memory, 0x5a, size);
+	for (unsigned y = 0; y < n && !blit; y++) {
+		for (unsigned x = 0; x < n; x++) {
+			for (unsigned c = 0; c < bpp; c++) {
+				memory[offset + (size_t)y * row_bytes + x * bpp + c] = texel_byte(x, y, a8 ? 3 : c);
+			}
+		}
+	}
+	id<MTLBuffer> buffer = [device newBufferWithBytesNoCopy:memory length:size options:MTLResourceStorageModeShared deallocator:nil];
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:a8 ? MTLPixelFormatA8Unorm : MTLPixelFormatRGBA8Unorm
+	    width:n height:n mipmapped:NO];
+	td.usage = MTLTextureUsageShaderRead | (render_to ? MTLTextureUsageRenderTarget : 0);
+	td.storageMode = MTLStorageModeShared;
+	id<MTLTexture> texture = buffer ? [buffer newTextureWithDescriptor:td offset:offset bytesPerRow:row_bytes] : nil;
+	id<MTLTexture> target = make_target(device, n, NULL);
+	if (texture == nil || target == nil) {
+		printf("metal_tri: FAIL: no %s texture over the no-copy buffer at offset %u with rows of %u bytes\n", a8 ? "A8Unorm" : "RGBA8Unorm",
+		    offset, row_bytes);
+		free(memory);
+		return false;
+	}
+	printf("ok    %ux%u %s texture over a no-copy buffer of %zu bytes at offset %u, rows %u bytes apart\n", n, n,
+	    a8 ? "A8Unorm" : "RGBA8Unorm", size, offset, row_bytes);
+	id<MTLCommandQueue> queue = [device newCommandQueue];
+	if (render_to && !a8) {
+		/* --render: the triangle rendered into the texture itself, and the memory read by the processor */
+		MTLRenderPipelineDescriptor *rd = [MTLRenderPipelineDescriptor new];
+		rd.vertexFunction = pd.vertexFunction;
+		rd.fragmentFunction = [library newFunctionWithName:@"tri_fragment"];
+		rd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+		id<MTLRenderPipelineState> drawn = rd.fragmentFunction ? [device newRenderPipelineStateWithDescriptor:rd error:&error] : nil;
+		if (drawn == nil || !render(queue, drawn, texture, clear_rgb, true)) {
+			printf("FAIL  no render pass into the texture over the buffer\n");
+			free(memory);
+			return false;
+		}
+		unsigned char *bgra = calloc(n, (size_t)n * 4);
+		for (unsigned y = 0; y < n; y++) {
+			for (unsigned x = 0; x < n; x++) {
+				const unsigned char *t = memory + offset + (size_t)y * row_bytes + x * 4;
+				unsigned char *q = bgra + ((size_t)y * n + x) * 4;
+				q[0] = t[2], q[1] = t[1], q[2] = t[0], q[3] = t[3];
+			}
+		}
+		unsigned in_px, out_px, wrong_px = judge(bgra, n, clear_rgb, &in_px, &out_px, true);
+		size_t stray = 0;
+		for (size_t i = 0; i < size; i++) {
+			bool texel = i >= offset && i < used && (i - offset) % row_bytes < (size_t)n * 4;
+			stray += !texel && memory[i] != 0x5a;
+		}
+		free(bgra);
+		printf("%s render pass into the texture over the buffer: %u inside and %u outside judged in its memory, %u wrong; %zu bytes "
+		    "outside the texels changed\n", wrong_px == 0 && stray == 0 && in_px > 0 ? "ok   " : "FAIL ", in_px, out_px, wrong_px, stray);
+		free(memory);
+		return wrong_px == 0 && stray == 0 && in_px > 0;
+	}
+	if (blit) {
+		/* --blit: the texels written by the GPU, a blit from a buffer of their bytes, and then the memory read by the processor */
+		id<MTLBuffer> source = [device newBufferWithLength:(NSUInteger)n * n * bpp options:MTLResourceStorageModeShared];
+		unsigned char *bytes = source.contents;
+		for (unsigned y = 0; y < n; y++) {
+			for (unsigned x = 0; x < n; x++) {
+				for (unsigned c = 0; c < bpp; c++) {
+					bytes[((size_t)y * n + x) * bpp + c] = texel_byte(x, y, a8 ? 3 : c);
+				}
+			}
+		}
+		id<MTLCommandBuffer> cb = [queue commandBuffer];
+		id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
+		[be copyFromBuffer:source sourceOffset:0 sourceBytesPerRow:(NSUInteger)n * bpp sourceBytesPerImage:(NSUInteger)n * n * bpp
+		    sourceSize:MTLSizeMake(n, n, 1) toTexture:texture destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+		[be endEncoding];
+		[cb commit];
+		[cb waitUntilCompleted];
+		size_t wrong_texels = 0;
+		for (unsigned y = 0; y < n; y++) {
+			for (unsigned x = 0; x < n; x++) {
+				for (unsigned c = 0; c < bpp; c++) {
+					wrong_texels += memory[offset + (size_t)y * row_bytes + x * bpp + c] != texel_byte(x, y, a8 ? 3 : c);
+				}
+			}
+		}
+		printf("%s blit from a buffer into the texture: status %ld, %zu of %u texel bytes in the memory wrong\n",
+		    cb.status == MTLCommandBufferStatusCompleted && wrong_texels == 0 ? "ok   " : "FAIL ", (long)cb.status, wrong_texels, n * n * bpp);
+		if (cb.status != MTLCommandBufferStatusCompleted || wrong_texels != 0) {
+			free(memory);
+			return false;
+		}
+	}
+	double total = 0;
+	for (unsigned f = 0; f <= frames; f++) {
+		MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+		rp.colorAttachments[0].texture = target;
+		rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+		rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+		rp.colorAttachments[0].clearColor = MTLClearColorMake(clear_rgb[0], clear_rgb[1], clear_rgb[2], 1);
+		id<MTLCommandBuffer> cb = [queue commandBuffer];
+		id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+		[enc setRenderPipelineState:pipeline];
+		[enc setFragmentTexture:texture atIndex:0];
+		[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+		[enc endEncoding];
+		CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+		[cb commit];
+		[cb waitUntilCompleted];
+		if (cb.status != MTLCommandBufferStatusCompleted) {
+			printf("FAIL  render pass: status %ld%s%s\n", (long)cb.status, cb.error ? ": " : "", cb.error ? cb.error.description.UTF8String : "");
+			free(memory);
+			return false;
+		}
+		total += f != 0 ? CFAbsoluteTimeGetCurrent() - t0 : 0;
+	}
+	if (frames != 0) {
+		printf("ok    %u more frames: %.2f ms each from commit to completion on average\n", frames, total * 1000 / frames);
+	}
+	unsigned char *pixels = calloc(n, (size_t)n * 4);
+	[target getBytes:pixels bytesPerRow:(size_t)n * 4 fromRegion:MTLRegionMake2D(0, 0, n, n) mipmapLevel:0];
+	unsigned char want_clear[3] = { (unsigned char)lround(clear_rgb[2] * 255), (unsigned char)lround(clear_rgb[1] * 255),
+		(unsigned char)lround(clear_rgb[0] * 255) };   /* B G R */
+	unsigned inside = 0, outside = 0, bad_in = 0, bad_out = 0;
+	for (unsigned y = 0; y < n; y++) {
+		for (unsigned x = 0; x < n; x++) {
+			const unsigned char *p = pixels + ((size_t)y * n + x) * 4;
+			double w[3], margin = 2.5 / n;
+			barycentric(x, y, n, w);
+			if (w[0] > margin && w[1] > margin && w[2] > margin) {
+				unsigned char want[4] = { a8 ? 0 : texel_byte(x, y, 2), a8 ? 0 : texel_byte(x, y, 1), a8 ? 0 : texel_byte(x, y, 0),
+					texel_byte(x, y, 3) };   /* B G R A */
+				inside++;
+				if (memcmp(p, want, 4) != 0 && bad_in++ < 4) {
+					printf("      inside (%u,%u): BGRA %u %u %u %u, want the texel's %u %u %u %u\n", x, y, p[0], p[1], p[2], p[3], want[0],
+					    want[1], want[2], want[3]);
+				}
+			} else if (w[0] < -margin || w[1] < -margin || w[2] < -margin) {
+				outside++;
+				if ((p[0] != want_clear[0] || p[1] != want_clear[1] || p[2] != want_clear[2]) && bad_out++ < 4) {
+					printf("      outside (%u,%u): BGRA %u %u %u %u, want the clear colour\n", x, y, p[0], p[1], p[2], p[3]);
+				}
+			}
+		}
+	}
+	size_t changed = 0;
+	for (size_t i = 0; i < size; i++) {
+		bool texel = i >= offset && i < used && (i - offset) % row_bytes < (size_t)n * bpp;
+		changed += !texel && memory[i] != 0x5a;
+	}
+	bool pass = inside > 0 && bad_in == 0 && bad_out == 0 && changed == 0;
+	printf("%s texel-buffer triangle: %ux%u read with getBytes:, %u inside and %u outside judged, %u wrong; %zu bytes of the memory "
+	    "outside the texels changed\n", pass ? "ok   " : "FAIL ", n, n, inside, outside, bad_in + bad_out, changed);
+	free(pixels);
+	texture = nil;
+	buffer = nil;
+	free(memory);
+	return pass;
+}
+
 /* ------------------------------------------------------------------------------------------------------------------ the application */
 
 /*
@@ -996,7 +1210,8 @@ main(int argc, char *argv[])
 		const char *xr = NULL;
 		bool fetch = false;
 		unsigned row_bytes = 0, frames = 0;
-		bool ycbcr = false;
+		bool ycbcr = false, a8 = false, blit = false, render_to = false;
+		int texel_offset = -1;
 		for (int i = 1; i < argc; i++) {
 			if (strcmp(argv[i], "--bundle") == 0 && i + 1 < argc) {
 				bundle_path = argv[++i];
@@ -1022,16 +1237,25 @@ main(int argc, char *argv[])
 				frames = (unsigned)atoi(argv[++i]);
 			} else if (strcmp(argv[i], "--ycbcr") == 0) {
 				ycbcr = true;
+			} else if (strcmp(argv[i], "--texel-buffer") == 0 && i + 1 < argc) {
+				texel_offset = atoi(argv[++i]);
+			} else if (strcmp(argv[i], "--a8") == 0) {
+				a8 = true;
+			} else if (strcmp(argv[i], "--blit") == 0) {
+				blit = true;
+			} else if (strcmp(argv[i], "--render") == 0) {
+				render_to = true;
 			} else {
 				fprintf(stderr, "usage: metal_tri [--bundle DIR] [--metallib FILE] [--size N] [--out FILE.ppm] [--surface] "
-				    "[--register] [--hold SECONDS] [--xr none|over|add] [--fetch] [--row-bytes B] [--frames K] [--ycbcr]\n");
+				    "[--register] [--hold SECONDS] [--xr none|over|add] [--fetch] [--row-bytes B] [--frames K] [--ycbcr] "
+				    "[--texel-buffer OFFSET [--a8] [--blit] [--render]]\n");
 				return 2;
 			}
 		}
 		if (n < 16 || n > 4096) {
 			n = 256;
 		}
-		if (row_bytes != 0 && (row_bytes < n * 4 || row_bytes % 16 != 0)) {
+		if (texel_offset < 0 && row_bytes != 0 && (row_bytes < n * 4 || row_bytes % 16 != 0)) {
 			fprintf(stderr, "metal_tri: --row-bytes %u: at least %u and a multiple of 16\n", row_bytes, n * 4);
 			return 2;
 		}
@@ -1041,6 +1265,11 @@ main(int argc, char *argv[])
 		}
 		if (xr != NULL) {
 			bool pass = xr_check(device, metallib, n, xr, surface);
+			printf("metal_tri: %s\n", pass ? "PASS" : "FAIL");
+			return pass ? 0 : 1;
+		}
+		if (texel_offset >= 0) {
+			bool pass = texel_buffer_check(device, metallib, n, (unsigned)texel_offset, row_bytes, a8, frames, blit, render_to);
 			printf("metal_tri: %s\n", pass ? "PASS" : "FAIL");
 			return pass ? 0 : 1;
 		}
