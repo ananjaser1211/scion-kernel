@@ -529,8 +529,8 @@ NB_RESOURCE_SPI
 // caller-owned no-copy buffers do not enter this cache.
 static NSMapTable<NSValue *,NBBuffer *> *gSurfaceImports;
 static std::mutex gSurfaceImportLock;
-// The driver imports a host pointer only as an IOSurface's memory, which its kernel makes a buffer of by the surface's ID (PanVK on
-// HakiosMali: tools/mesa/panvk/panvk-host-surfaces.patch; Turnip on HakiosGPU likewise): the surface mapped at base is told to it
+// The driver imports an IOSurface's memory as the buffer its kernel makes of it by the surface's ID, not as other host pages (PanVK on
+// HakiosMali: tools/mesa/panvk/panvk-host-memory.patch; Turnip on HakiosGPU likewise): the surface mapped at base is told to it
 // (tools/mesa/hakios-drm: hakios_drm_host_surface) before the runtime imports the pages. A driver without the call copies instead.
 static void tellHostSurface(IOSurfaceRef surface,void *base,size_t bytes) {
  static void (*tell)(const void *,uint64_t,uint32_t);

@@ -7,7 +7,7 @@ Licence:   GPL-2.0-or-later OR LGPL-3.0-or-later, metal2vulkan's (its LICENSE); 
            terms. Nothing of it is in Scion's MIT or APSL files.
 Author:    the HakiOS authors (Scion), 14 November 2026.
 
-Why. PanVK on the Galaxy S9's Mali now imports a no-copy buffer's host pages (tools/mesa/panvk/panvk-host-surfaces.patch,
+Why. PanVK on the Galaxy S9's Mali now imports a no-copy buffer's host pages (tools/mesa/panvk/panvk-host-memory.patch,
 HakiosMali's request 0x7b), where metal2vulkan used to copy them in and out at every commit (0002). The window server on
 Metal made 137 such buffers (build 55) and spent 78 ms a commit copying them in and 48 ms comparing them out. The pages are
 the process's own cached memory, and the Mali does not see the processors' caches, so PanVK imports them into a memory
