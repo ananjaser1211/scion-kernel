@@ -503,7 +503,7 @@ my_function_uniform(void *context, unsigned index, size_t components, size_t cou
 	orig_function_uniform(context, index, components, count, values);
 }
 
-/* ---- backboardd: the window server stays on OpenGL ES ------------------------------------------ */
+/* ---- backboardd: the window server on Metal or on OpenGL ES ------------------------------------- */
 
 /*
  * With the Metal properties on the accelerator service (boot-arg metal=1) MTLCreateSystemDefaultDevice()
@@ -536,9 +536,19 @@ my_function_uniform(void *context, unsigned index, size_t components, size_t cou
  * already paying. The device is retained and never released on purpose: what our driver's -dealloc
  * would do to a GPU this same process is drawing on through Mesa is not measured.
  *
- * Boot-arg camtl=1 leaves the device where it is, for the boot that means to put CoreAnimation on the
- * Metal road deliberately -- which needs QuartzCore's default.metallib in the image first, or this
- * same assertion comes back.
+ * That was every boot until the Metal-on-Vulkan plug-in could serve the window server. Now the device
+ * stays where it is in two cases, and is taken out in every other:
+ *
+ *   camtl=1   any device, for the boot that means to put CoreAnimation on the Metal road deliberately
+ *             (which needs QuartzCore's default.metallib in the image, or the assertion above comes back);
+ *   no camtl= a device the METAL=vk plug-in opened for the window server, which answers YES to
+ *             -hakiosOpenedForWindowServer (src/metalvk/HakiosMetalVK.mm): that plug-in shows backboardd
+ *             the device by default when its driver is PanVK (src/hakios_metal_shown.c) and opens it at
+ *             once, so a device that is here is one that works, and CoreAnimation draws with Metal.
+ *
+ * With camtl=0 there is none: the window server keeps OpenGL ES (the plug-in does not show it the device
+ * either). A line "-backboardd" in /private/var/db/HakiosMetal.clients does the same from the window
+ * server's next start, without a boot (the plug-in reads it).
  */
 #define MTL_DEVICE_ARRAY        0x1e1efe9a0UL   /* Metal's static NSMutableArray *_deviceArray */
 #define CA_DETECT_DISPLAYS      0x1884da264UL   /* -[CAWindowServer _detectDisplays] */
@@ -546,6 +556,7 @@ my_function_uniform(void *context, unsigned index, size_t components, size_t cou
 extern id objc_retain(id object);
 
 static void (*orig_detect_displays)(id server, SEL selector);
+static int metal_by_default;    /* no camtl= on the line: the plug-in's device for the window server is kept */
 
 static void
 keep_metal_from_core_animation(void)
@@ -564,6 +575,18 @@ keep_metal_from_core_animation(void)
 	if ((device = create()) == NULL) {
 		say("hakios: metal: no device in this process; CoreAnimation keeps OpenGL ES by itself\n");
 		return;
+	}
+	if (metal_by_default) {
+		SEL opened = sel_registerName("hakiosOpenedForWindowServer");
+
+		if (((BOOL (*)(id, SEL, SEL))objc_msgSend)(device, sel_registerName("respondsToSelector:"), opened) &&
+		    ((BOOL (*)(id, SEL))objc_msgSend)(device, opened)) {
+			say("hakios: metal: the window server draws with Metal (%s, opened by the plug-in; camtl=0, or "
+			    "-backboardd in /private/var/db/HakiosMetal.clients, keeps OpenGL ES)\n", object_getClassName(device));
+			return;
+		}
+		say("hakios: metal: %s was not opened for the window server by the Metal-on-Vulkan plug-in: "
+		    "taken out (camtl=1 would leave it)\n", object_getClassName(device));
 	}
 	if ((array = *slot) == NULL) {
 		say("hakios: metal: a device, but nothing at %#lx; the device list is NOT emptied\n",
@@ -602,19 +625,30 @@ my_detect_displays(id server, SEL selector)
 }
 
 static void
-window_server_keeps_opengl_es(void)
+window_server_chooses_its_renderer(void)
 {
 	char arguments[1024] = "";
 	size_t size = sizeof(arguments) - 1;
+	const char *camtl = NULL;
 	Class cls;
 	Method method;
 	IMP original;
 
-	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 && strstr(arguments, "camtl=1") != NULL) {
+	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
+		/* the word camtl=, not the end of another argument's name */
+		const char *at = strstr(arguments, "camtl=");
+
+		while (at != NULL && at != arguments && at[-1] != ' ') {
+			at = strstr(at + 6, "camtl=");
+		}
+		camtl = at != NULL ? at + 6 : NULL;
+	}
+	if (camtl != NULL && atoi(camtl) != 0) {
 		say("hakios: camtl=1: CoreAnimation may have the Metal device (it needs "
 		    "QuartzCore.framework/default.metallib in the image)\n");
 		return;
 	}
+	metal_by_default = camtl == NULL;
 	cls = objc_getClass("CAWindowServer");
 	method = cls ? class_getInstanceMethod(cls, sel_registerName("_detectDisplays")) : NULL;
 	original = method ? method_getImplementation(method) : NULL;
@@ -630,7 +664,7 @@ window_server_keeps_opengl_es(void)
 static void
 window_server_fixes(void)
 {
-	window_server_keeps_opengl_es();
+	window_server_chooses_its_renderer();
 	orig_is_ready = replace_virtual("is_ready", VSLOT(VT_APPLE_CLCD_DISPLAY, 0xb0), 0x1882f0908UL, my_is_ready);
 	orig_ignore_update_p = replace_virtual("ignore_update_p", VSLOT(VT_APPLE_CLCD_DISPLAY, 0x138), 0x1882e0c90UL,
 	    my_ignore_update_p);
