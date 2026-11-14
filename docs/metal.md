@@ -938,3 +938,22 @@ Then:
   every frame's GPU time gone, fewer chains a frame.
 - No "client ... job hung" lines but AegirPoster's.
 - Video (`mfc_zc`) and the wallpaper still drawn right.
+
+### On the phone, build 60 (kernel with xnu 457143df6f1f, userland at 200c03d)
+
+- `metal_tri` and `metal_tri --ycbcr --size 2048` pass. Unchanged planes take 2.4 ms from commit to completion
+  against 33 ms when converted. One step still converts when it need not: "again, unchanged" after a pass cleared
+  the luma plane in the same command buffer (33 ms; the values are right).
+- backboardd on Metal draws the home screen correctly. Six swipes:
+
+| | GLES (build 58) | Metal (build 59) | Metal (build 60) |
+|---|---|---|---|
+| backboardd CPU, swipes | 6–69% | 18–86% | 6–80% |
+| CPU idle after | ~20% | 18–31% | 26–32% |
+| RSS | 105–113 MB | 74–76 MB | 77–78 MB |
+| commit to completion | ~9 ms | ~20 ms | 12.9 ms (commits 101–1000) |
+| GPU busy, idle (kernel, per 5 s) | 1% | 11–15% | 1% |
+| GPU busy, swipes | 18–23% | 28–57% | 21–37% |
+
+The idle conversion jobs are gone. A frame's GPU time is now within twice GLES's, which is Phase 7's condition
+for making Metal the window server's default. Idle CPU stays about 8 points above GLES.
