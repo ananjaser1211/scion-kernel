@@ -18,11 +18,11 @@ arm64):
     it and when the display or a WAIT_BO waits for it. A surface whose pixels do not start at its first page, or that is
     smaller than the import, is refused.
   - Other whole pages of the process's own are wired by HakiosMali as a buffer (its request 0x7b, hakios_drm_user_memory,
-    pan_kmod_bo_import_user), if the process may write them, in a second memory type, HOST_VISIBLE | HOST_CACHED and not
-    coherent: the Mali does not see the processors' caches, so vkFlushMappedMemoryRanges and
-    vkInvalidateMappedMemoryRanges have the kernel clean and invalidate the lines of such memory (HakiosMali's request
-    0x7a, hakios_drm_sync), which metal2vulkan calls around a command buffer's use of it (0001, 0008). Memory allocated in
-    that type without an import is the first type's.
+    pan_kmod_bo_import_user), in a second memory type, HOST_VISIBLE | HOST_CACHED and not coherent (pages the process may
+    only read, for the GPU to read only: a job that writes one faults): the Mali does not see the processors' caches, so
+    vkFlushMappedMemoryRanges and vkInvalidateMappedMemoryRanges have the kernel clean and invalidate the lines of such
+    memory (HakiosMali's request 0x7a, hakios_drm_sync), which metal2vulkan calls around a command buffer's use of it
+    (0001, 0008). Memory allocated in that type without an import is the first type's.
   - Only where the kernel has request 0x7a (asked once, of no buffer: ENOENT, not ENOSYS). The process cannot keep the
     lines itself at any useful speed: iOS's sys_dcache_flush() is a DSB alone, and its own DC CIVAC traps with the Exynos
     M3s up (xnu patch 1511), at about 0.67 us a line, which is slower than metal2vulkan's copy. On a kernel without the
@@ -33,8 +33,7 @@ arm64):
   - Buffers and images take either type; external buffer properties and linear 2D images are importable from host
     allocations, never exported.
   - vkMapMemory of imported memory is the caller's pointer, and is never unmapped here.
-Anything refused (VK_ERROR_INVALID_EXTERNAL_HANDLE: pages the process may only read, among them) metal2vulkan copies, as
-before.
+Anything refused (VK_ERROR_INVALID_EXTERNAL_HANDLE) metal2vulkan copies, as before.
 
 --- a/src/panfrost/vulkan/panvk_physical_device.c
 +++ b/src/panfrost/vulkan/panvk_physical_device.c
@@ -230,7 +229,7 @@ before.
     if (fd_info) {
        assert(
           fd_info->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT ||
-@@ -88,6 +162,46 @@
+@@ -88,6 +162,47 @@
           result = panvk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
           goto err_destroy_mem;
        }
@@ -247,7 +246,8 @@ before.
 +       * Any other pages, in the cached type, where the kernel keeps their
 +       * lines (vkFlushMappedMemoryRanges and vkInvalidateMappedMemoryRanges
 +       * ask it to: panvk_memory_host_sync): HakiosMali wires them as a buffer
-+       * (pan_kmod_bo_import_user), if the process may write them. */
++       * (pan_kmod_bo_import_user); pages the process may only read, for
++       * the GPU to read only. */
 +      uint32_t surface = hakios_drm_host_surface_at(
 +         host_info->pHostPointer, pAllocateInfo->allocationSize);
 +      struct hakios_drm_surface described = {.surface = surface};
@@ -277,7 +277,7 @@ before.
     } else {
        mem->bo = pan_kmod_bo_alloc(device->kmod.dev,
                                    can_be_exported ? NULL : device->kmod.vm,
-@@ -283,6 +397,11 @@
+@@ -283,6 +398,11 @@
  panvk_FlushMappedMemoryRanges(VkDevice _device, uint32_t memoryRangeCount,
                                const VkMappedMemoryRange *pMemoryRanges)
  {
@@ -289,7 +289,7 @@ before.
     return VK_SUCCESS;
  }
  
-@@ -290,6 +409,11 @@
+@@ -290,6 +410,11 @@
  panvk_InvalidateMappedMemoryRanges(VkDevice _device, uint32_t memoryRangeCount,
                                     const VkMappedMemoryRange *pMemoryRanges)
  {
@@ -301,7 +301,7 @@ before.
     return VK_SUCCESS;
  }
  
-@@ -326,6 +450,32 @@
+@@ -326,6 +451,32 @@
     return VK_SUCCESS;
  }
  
