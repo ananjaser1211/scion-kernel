@@ -67,9 +67,11 @@ SKIP_EXT = ('.weights', '.weights_nonane', '.metallib', '.mov', '.pcm', '.scnz',
 #     mediaserverd aborts in -[_MTLDevice newLibraryWithURL:error:] -- twenty-eight times in one boot.
 # Unconditional, and that does NOT put the phone's interface through our driver: a file being present is
 # not the switch. Whether Apple's code gets a Metal device at all is decided per process by the device
-# array that userland/src/inject.c empties in backboardd (boot-arg camtl=1 leaves it) and
-# userland/src/inject_media.c empties in mediaserverd (mediamtl=1 leaves it), and both default to "no
-# device". So a default boot behaves exactly as it does today and these two files merely sit in the image
+# array that userland/src/inject.c empties in backboardd (boot-arg camtl=1 leaves it; since Phase 9 of
+# docs/metal.md it also leaves the device the METAL=vk plug-in opened for the window server on PanVK,
+# and camtl=0 empties it again) and userland/src/inject_media.c empties in mediaserverd (mediamtl=1
+# leaves it), which defaults to "no device". So a default boot without that plug-in behaves as before
+# and these two files merely sit in the image
 # -- 1,4 MB of an image that lives in RAM -- which is what makes the camtl=1 / mediamtl=1 experiment
 # possible without a second rebuild of system.apfs. The cost is paid once, at build time: a system.apfs
 # rebuild and a 77-second upload.
