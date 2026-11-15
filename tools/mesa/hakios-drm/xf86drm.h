@@ -129,6 +129,14 @@ int hakios_drm_surface_written(uint32_t surface);
  * off here where the kernel does not take it (its parameter 0x7900).
  */
 #define HAKIOS_DRM_BO_WRITTEN   (1u << 31)
+/*
+ * Not libdrm's: a handle of a submission's bo_handles that a job chain may only read may carry this bit (PanVK names every
+ * IOSurface it imported so, tools/mesa/panvk/panvk-sampled-surfaces.patch): the kernel cleans what a processor wrote into
+ * the surface before the job, as for any surface named, and keeps the buffer until the job is done, but does not have
+ * the display wait for the job to show the surface. Taken off here where the kernel does not take it (its parameter
+ * 0x7901): the handle is then named as any other.
+ */
+#define HAKIOS_DRM_BO_SAMPLED   (1u << 30)
 
 #ifdef __cplusplus
 }

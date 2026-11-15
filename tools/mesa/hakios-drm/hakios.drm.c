@@ -44,6 +44,7 @@
 #define HAKIOS_MALI_SYNC       0x7a            /* HakiosMali's own: a range of a buffer's lines cleaned and invalidated */
 #define HAKIOS_MALI_WRITTEN    0x79            /* HakiosMali's own: a surface's pixels written by work this process submitted */
 #define HAKIOS_MALI_PARAM_WRITTEN 0x7900       /* HakiosMali's parameter: 1 where bo_handles may carry HAKIOS_DRM_BO_WRITTEN */
+#define HAKIOS_MALI_PARAM_SAMPLED 0x7901       /* ... and 1 where they may carry HAKIOS_DRM_BO_SAMPLED */
 
 /* The kernel's services, by the names of the Linux drivers they stand in for. */
 static const struct service {
@@ -563,20 +564,34 @@ static uint64_t *pan_syncobj(uint32_t handle);
  * stand for jobs given before this one, which the queue has run by the time this one begins.
  */
 /*
- * Whether the kernel takes HAKIOS_DRM_BO_WRITTEN on a submission's handles (asked once): one that does not would find
- * no buffer of such a handle, so the bit is taken off for it.
+ * Whether the kernel takes HAKIOS_DRM_BO_WRITTEN on a submission's handles, and HAKIOS_DRM_BO_SAMPLED (asked once each): one
+ * that does not would find no buffer of such a handle, so the bit is taken off for it.
  */
+static bool
+handle_bit_taken(uint64_t parameter, int *taken)
+{
+	if (*taken < 0) {
+		struct drm_panfrost_get_param param = { .param = parameter };
+
+		*taken = call(DRM_COMMAND_BASE + DRM_PANFROST_GET_PARAM, &param, sizeof(param)) == 0 && param.value == 1;
+	}
+	return *taken;
+}
+
 static bool
 written_handles(void)
 {
 	static int taken = -1;
 
-	if (taken < 0) {
-		struct drm_panfrost_get_param param = { .param = HAKIOS_MALI_PARAM_WRITTEN };
+	return handle_bit_taken(HAKIOS_MALI_PARAM_WRITTEN, &taken);
+}
 
-		taken = call(DRM_COMMAND_BASE + DRM_PANFROST_GET_PARAM, &param, sizeof(param)) == 0 && param.value == 1;
-	}
-	return taken;
+static bool
+sampled_handles(void)
+{
+	static int taken = -1;
+
+	return handle_bit_taken(HAKIOS_MALI_PARAM_SAMPLED, &taken);
 }
 
 static int
@@ -587,13 +602,18 @@ submit(struct drm_panfrost_submit *request)
 	int error;
 
 	for (uint32_t i = 0; i < request->bo_handle_count; i++) {
-		if ((given[i] & HAKIOS_DRM_BO_WRITTEN) && !written_handles()) {
+		uint32_t untaken = ((given[i] & HAKIOS_DRM_BO_WRITTEN) && !written_handles() ? HAKIOS_DRM_BO_WRITTEN : 0) |
+		    ((given[i] & HAKIOS_DRM_BO_SAMPLED) && !sampled_handles() ? HAKIOS_DRM_BO_SAMPLED : 0);
+
+		if (untaken != 0) {
+			uint32_t strip = (written_handles() ? 0 : HAKIOS_DRM_BO_WRITTEN) | (sampled_handles() ? 0 : HAKIOS_DRM_BO_SAMPLED);
+
 			plain = malloc(request->bo_handle_count * sizeof(*plain));
 			if (plain == NULL) {
 				return ENOMEM;
 			}
 			for (uint32_t k = 0; k < request->bo_handle_count; k++) {
-				plain[k] = given[k] & ~HAKIOS_DRM_BO_WRITTEN;
+				plain[k] = given[k] & ~strip;
 			}
 			request->bo_handles = (uintptr_t)plain;
 			break;
