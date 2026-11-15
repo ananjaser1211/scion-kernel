@@ -2345,6 +2345,35 @@ static void installAnswers(Class cls) {
  }
 }
 
+// Scion: _MTLDevice's own -limits answers a struct of the base class's (_limits), which the target's -initLimits fills from an Apple
+// GPU's profile and this device leaves empty (initLimits). PhotosUICore sizes the images it redraws for Metal by its maxTextureWidth2D and
+// maxTextureHeight2D (PXGMetalCompatibleImageByRedrawingCGImage) and threw at 0 ("!PXPixelSizeAreaIsZero(roundedSize)"). Each field named
+// as one of the counts the runtime answers (installAnswers) takes that answer, maxBufferLength the device's; the others stay 0. A layout
+// this does not know (a field of another type) leaves the rest alone.
+static void fillBaseLimits(id object) {
+ Ivar ivar=class_getInstanceVariable(object_getClass(object),"_limits");
+ const char *type=ivar?ivar_getTypeEncoding(ivar):nullptr;
+ const char *p=type&&type[0]=='{'?strchr(type,'='):nullptr;
+ if(!p)return;
+ uint8_t *base=(uint8_t *)(__bridge void *)object+ivar_getOffset(ivar);
+ size_t offset=0;unsigned filled=0;
+ for(p++;*p=='"';) {
+  const char *end=strchr(p+1,'"');
+  if(!end||(end[1]!='I'&&end[1]!='Q'&&end[1]!='f'))break;
+  const std::string name(p+1,end-p-1);const char kind=end[1];const size_t size=kind=='Q'?8:4;
+  p=end+2;offset=(offset+size-1)&~(size-1);
+  uint64_t value=0;bool known=false;
+  if(name=="maxBufferLength"){value=nmb_device_max_buffer_length(gDevice);known=value!=0;}
+  else if(kind!='f'){auto it=gAnswers.find(sel_registerName(name.c_str()));if(it!=gAnswers.end()){value=it->second;known=true;}}
+  if(known){
+   if(size==8)*(uint64_t *)(base+offset)=value;else *(uint32_t *)(base+offset)=(uint32_t)std::min<uint64_t>(value,UINT32_MAX);
+   filled++;
+  }
+  offset+=size;
+ }
+ NBLOG(@"native-metal: %u of _MTLDevice's limits filled from the runtime's answers",filled);
+}
+
 // Scion: the runtime's device, opened once per process (the first half of what native_bridge_metal_open did).
 static bool openRuntimeDevice(const char *loader,const char *cache,uint64_t registryID,void (*missing)(const char *,const char *)) {
  if(gDevice)return true;
@@ -2392,6 +2421,7 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  if(Protocol *spi=objc_getProtocol("MTLDeviceSPI"))class_addProtocol(cls,spi);
  objc_registerClassPair(cls);
  gDeviceObject=[cls new];
+ fillBaseLimits(gDeviceObject);
  return gDeviceObject;
 }
 
@@ -2404,6 +2434,7 @@ extern "C" bool native_bridge_metal_adopt(id object,const char *loader,const cha
  if(!object || !openRuntimeDevice(loader,cache,registryID,missing))return false;
  installDeviceMethods(object_getClass(object));
  gDeviceObject=object;
+ fillBaseLimits(object);
  watchDrawablePresents();
  return true;
 }
