@@ -1778,3 +1778,37 @@ configuration or status errors, and window 5 blending by its pixels' alpha from 
 - Home screen, continuous swiping: 57 frames a second, one layer, 9 us in the driver.
 - The USB console screenshot reads the top layer only, so a detached layer's frames are checked
   on the panel itself.
+
+## The zoom that opens an application, looked at again (16 November 2026, on build 67)
+
+**The band of white blocks belongs to the USB console's screenshot, not the panel.** The console's `shot` took the address
+of the buffer VGF0 scans out when it was asked for, then read the pixels from that address as they went out, after the log
+queued before them: 0.1 s or more later. With fb_zc that buffer is one of backboardd's two surfaces, and with fb_swapwait=1
+(on here, with fb_zc_hold 3) the window server draws its next frame into it as soon as the flip after it is taken. A shot
+taken during an animation therefore showed the top of one frame, the bottom of an earlier one and, between them, a
+full-width band of the GPU's tiles part-way through a later frame. A shot of the lock screen fading out showed the same
+band, so the opening animation is not what causes it. Fixed in scion-kernel (`drivers/usb/hakios.dwc3.c`, `shot_freeze()`):
+the pixels are copied once, when the shot is asked for, and sent from that copy (as a camshot is sent). If the copy cannot be
+allocated (`Z_NOWAIT`), the shot is read as before and its line says "(read as it went out)". Not built yet. Earlier shots of
+animations, `w3-*` and `w4-*`, are unreliable between frames.
+
+**The black zoom is not the OpenGL ES bridge's copy of a 420f surface.** A test build of `libhakios.gl.dylib` logged every
+planar `-texImageIOSurface` call and every draw that sampled one. It was not committed. backboardd ran it for one restart:
+the library was put into `DYLD_INSERT_LIBRARIES` through `kern.exec_inject` ahead of `libhakios.dylib`, with a `dlopen`
+interpose so that `inject.c`'s `dlopen` of `/redwood/lib/libhakios.gl.dylib` returned the inserted copy, and its stderr went
+to a file. Afterwards `exec_inject` was set back to its saved value and backboardd was restarted. Results:
+- The 420f surfaces that do reach the bridge (the posters' 1105x1160 and 1380x1812) are copied without a GL error. Their
+  planes hold data, CoreAnimation asks for even sizes (1104x1160 R8, 552x580 RG8), and its YCbCr programs (`ycbcr_matrix0`
+  BT.601 full range, `ycbcr_bias0`) draw them with linear filtering and no mipmaps.
+- During a cold launch of Photos or Settings, no 1125x2313 planar surface is ever handed to `-texImageIOSurface`. No
+  compressed upload, `glTexImage2D` or refused call stands in for it either.
+- A traced frame of the zoom: CoreAnimation draws the zoom window into an offscreen 1127x2315 target, filled only with a
+  full-size opaque black quad (its solid-colour program), and then composites that target, scaled, as the window. No
+  textured draw for the snapshot is ever issued, so the snapshot layer has no contents the window server can draw.
+- `IOSurfaceLookup` from another process found no 1125x2313 420f surface while Photos opened (only global surfaces can be
+  looked up that way). The JPEG launch images are in `Library/SplashBoard/Snapshots/com.apple.mobileslideshow/...`.
+
+What is left to find is on the client side, or in CoreAnimation's choice of what to send: either SpringBoard never sets the
+snapshot image (the zoom view keeps only its black background), or the IOSurface-backed CGImage is dropped when it is
+encoded for the server. The next step is a probe in SpringBoard (the zoom view's `-setContents:` and the image it gets).
+`eagl.c` is not the cause.
