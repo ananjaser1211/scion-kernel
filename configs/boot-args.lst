@@ -204,6 +204,7 @@ fb_hz	k
 fb_intf	k
 fb_measure	k
 fb_native	k
+fb_planes	k
 fb_pri	k
 fb_psr	k
 fb_queue	k
@@ -462,6 +463,17 @@ scsnd.addr	k
 scsnd.size	k
 security	k
 serial	l
+shannon	k
+shannon_again	k
+shannon_base	k
+shannon_blsize	k
+shannon_nv	k
+shannon_peek	k
+shannon_regs	k
+shannon_sysrev	k
+shannon_toc	k
+shannon_udl_irq	k
+shannon_zero	k
 shub	k
 shub_acc_cal	k
 shub_acc_pos	k

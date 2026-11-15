@@ -144,7 +144,7 @@ CAM_SENSOR	arg	cam_sensor	Cameras	k	hakios.camera.c
 CAM_SETTLE	arg	cam_settle	Cameras	k	hakios.camera.c	
 CAM_SHUTTER	arg	cam_shutter	Cameras	k	hakios.camera.c	
 CAM_VBLANK	arg	cam_vblank	Cameras	k	hakios.camera.c	
-CAMTL	arg	camtl	User space	u	inject.c	
+CAMTL	arg	camtl	User space	u	hakios_metal_shown.c,inject.c	
 CC_FADE	arg	cc_fade	User space	u	inject_sb.c	
 COHTEST	arg	cohtest	User space	k	hakios.exynos_m3.c	is the big cluster in the same coherency domain as the A55s once it is started? (off by default)
 COHTEST_DELAY	arg	cohtest_delay	User space	k	hakios.exynos_m3.c	
@@ -191,6 +191,7 @@ FB_HZ	arg	fb_hz	GPU and display	k	MiniIOMobileFramebuffer.cpp
 FB_INTF	arg	fb_intf	GPU and display	k	MiniIOMobileFramebuffer.cpp	the registers of the display interface the panel is on, for a port
 FB_MEASURE	arg	fb_measure	GPU and display	k	MiniIOMobileFramebuffer.cpp	how often the panel is really refreshed
 FB_NATIVE	arg	fb_native	GPU and display	k	MiniIOMobileFramebuffer.cpp	the iPhone's 1125 x 2436 on every panel, as before (the picture stretched to the panel's shape)
+FB_PLANES	arg	fb_planes	CPU, memory and boot	k	(patch)	
 FB_PRI	arg	fb_pri	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 FB_PSR	arg	fb_psr	User space	k	hakios.exynos_dpu.c	
 FB_QUEUE	arg	fb_queue	GPU and display	k	MiniIOMobileFramebuffer.cpp	
@@ -318,7 +319,7 @@ MAX98512_GAIN	arg	max98512_gain	Audio and battery	k	hakios.max98512.c	the bottom
 MC_CE	arg	mc_ce	User space	k	mc_ce.c	
 MD0	arg	md0	User space	k	1101-virtio-disk-as-md0.patch	
 MEMBENCH	arg	membench	CPU, memory and boot	k	hakios.cpufreq.c	
-METAL	arg	metal	GPU and display	ku	MiniIOMobileFramebuffer.cpp,hakios_metal_shown.c,inject_sb.c	say where Metal's device is (docs/metal-plan.md, step 1)
+METAL	arg	metal	GPU and display	ku	MiniIOMobileFramebuffer.cpp,inject_sb.c	say where Metal's device is (docs/metal-plan.md, step 1)
 METAL_ALL	arg	metal_all	User space	u	HakiosMetalCA.m	
 METAL_DEFER	arg	metal_defer	User space	u	HakiosMetalCA.m	this queue's command buffers recorded by a thread of hakios-metal's own (deferred recording), so that the window server's render thread does not wait
 METAL_DUMP	arg	metal_dump	User space	u	HakiosMetalCA.m	
@@ -436,6 +437,17 @@ SCSND_ADDR	arg	scsnd.addr	User space	k	hakios.scsnd.c
 SCSND_SIZE	arg	scsnd.size	User space	k	hakios.scsnd.c	
 SECURITY	arg	security	Security stand-ins	k	kern_minimac.c	
 SERIAL	arg	serial	Loader	l	loader.c	
+SHANNON	arg	shannon	User space	k	hakios.shannon.c	read only: CP_CTRL_NS/_S through the read SMC, the four PMU words Samsung's exynos_print_cp_status reads
+SHANNON_AGAIN	arg	shannon_again	User space	k	hakios.shannon.c	
+SHANNON_BASE	hex	shannon_base	User space	k	hakios.shannon.c	
+SHANNON_BLSIZE	arg	shannon_blsize	User space	k	hakios.shannon.c	
+SHANNON_NV	arg	shannon_nv	User space	k	hakios.shannon.c	
+SHANNON_PEEK	arg	shannon_peek	User space	k	hakios.shannon.c	
+SHANNON_REGS	arg	shannon_regs	User space	k	hakios.shannon.c	
+SHANNON_SYSREV	arg	shannon_sysrev	User space	k	hakios.shannon.c	
+SHANNON_TOC	arg	shannon_toc	User space	k	hakios.shannon.c	
+SHANNON_UDL_IRQ	arg	shannon_udl_irq	User space	k	hakios.shannon.c	
+SHANNON_ZERO	arg	shannon_zero	User space	k	hakios.shannon.c	
 SHUB	arg	shub	Sensors	k	hakios.ssp.c	
 SHUB_ACC_CAL	arg	shub_acc_cal	Sensors	k	hakios.ssp.c	the accelerometer's factory offsets, sent to the hub before the sensors go on, as Samsung does
 SHUB_ACC_POS	arg	shub_acc_pos	Sensors	k	hakios.ssp.c	the accelerometer's (and gyroscope's) position in the formation of step 5
