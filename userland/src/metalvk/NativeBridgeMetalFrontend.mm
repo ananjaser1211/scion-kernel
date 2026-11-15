@@ -12,6 +12,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <IOSurface/IOSurfaceRef.h>
+#import <objc/message.h>
 #import <objc/runtime.h>
 #include <algorithm>
 #include <atomic>
@@ -427,6 +428,8 @@ static void journal(const std::string &line) {
 // ---- resources ----
 // The wait takes a strong snapshot of already-committed buffers; new commits require the
 // caller's usual resource synchronization. Storage dependency checks are in the runtime.
+static std::atomic<uint64_t> gSourceLibraries,gSourceLibraryUs;   // libraries from MSL source, and the front end's time
+static std::atomic<bool> gSaidSourceLibrary;
 static NSMutableSet *gInFlight;
 static void waitForResource(id resource);
 // Resource SPI the runtime has no state for: no protected content (Metal's default options), and no owner transfer
@@ -2110,6 +2113,38 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  NmbLibrary *handle=nmb_library_new(gDevice,bytes,size,false);(void)mapped;gTimeLibrary.add(libraryBegan);
  if(!handle)return failWith<id<MTLLibrary>>(error,@"library",nil);
  NBLibrary *library=[NBLibrary new];library.handle=handle;if(error)*error=nil;return (id<MTLLibrary>)library;
+}
+// MSL source: Apple's own front end compiles it to AIR, as on Apple's GPUs. _MTLDevice's -newLibraryWithSource:options:error: hands the
+// text to MTLCompilerService, which makes the library's AIR without any GPU of Apple's (the GPU's own code is made at pipeline
+// creation, which this device does itself); its _MTLLibrary is then read back as a metallib (-libraryDataContents) and made this
+// device's library, so that its functions are this runtime's. MoltenVK compiles every shader this way (SPIR-V to MSL to here).
+- (id<MTLLibrary>)newLibraryWithSource:(NSString *)source options:(MTLCompileOptions *)options error:(NSError **)error {
+ typedef id (*SourceIMP)(id,SEL,NSString *,MTLCompileOptions *,NSError **);
+ const SourceIMP apple=(SourceIMP)class_getMethodImplementation(objc_getClass("_MTLDevice"),@selector(newLibraryWithSource:options:error:));
+ if(!apple || !source){if(error)*error=nbError(@"no MSL front end");return nil;}
+ const uint64_t began=nowUs();
+ NSError *compileError=nil;
+ id compiled=apple(self,@selector(newLibraryWithSource:options:error:),source,options,&compileError);
+ if(!compiled){if(error)*error=compileError?:nbError(@"MSL front end: no library");return nil;}
+ if(![compiled respondsToSelector:@selector(libraryDataContents)]){if(error)*error=nbError(@"MSL front end: the library has no contents");return nil;}
+ id contents=((id (*)(id,SEL))objc_msgSend)(compiled,@selector(libraryDataContents));
+ if(![contents isKindOfClass:[NSData class]]){if(error)*error=nbError(@"MSL front end: the library's contents are not a metallib");return nil;}
+ gSourceLibraries++;gSourceLibraryUs+=nowUs()-began;
+ if(firstTime(gSaidSourceLibrary))
+  NBSAY(@"native-metal: the first library from MSL source: %lu characters to %lu bytes of metallib by Apple's front end in %llu ms",
+   (unsigned long)source.length,(unsigned long)[(NSData *)contents length],(unsigned long long)((nowUs()-began)/1000));
+ NSData *bytes=(NSData *)contents;
+ const uint64_t libraryBegan=nowUs();
+ NmbLibrary *handle=nmb_library_new(gDevice,bytes.bytes,bytes.length,false);gTimeLibrary.add(libraryBegan);
+ if(!handle)return failWith<id<MTLLibrary>>(error,@"library from MSL source",nil);
+ NBLibrary *library=[NBLibrary new];library.handle=handle;if(error)*error=nil;return (id<MTLLibrary>)library;
+}
+- (void)newLibraryWithSource:(NSString *)source options:(MTLCompileOptions *)options completionHandler:(MTLNewLibraryCompletionHandler)handler {
+ if(!handler)return;
+ dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{
+  NSError *error=nil;id<MTLLibrary> library=[(id<MTLDevice>)self newLibraryWithSource:source options:options error:&error];
+  handler(library,error);
+ });
 }
 - (id<MTLLibrary>)newLibraryWithFile:(NSString *)path error:(NSError **)error {
  NSData *bytes=path?[NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:error]:nil;if(!bytes)return nil;
