@@ -104,7 +104,11 @@ KEEP_METALLIB = ('System/Library/Frameworks/QuartzCore.framework/default.metalli
                  # five MPS libraries (neural network, NDArray, matrix, ray intersector, functions)
                  # are another 47 MB and nothing in this port has asked for them yet.
                  'System/Library/Frameworks/MetalPerformanceShaders.framework/Frameworks/MPSCore.framework/default.metallib',
-                 'System/Library/Frameworks/MetalPerformanceShaders.framework/Frameworks/MPSImage.framework/default.metallib')
+                 'System/Library/Frameworks/MetalPerformanceShaders.framework/Frameworks/MPSImage.framework/default.metallib',
+                 # VectorKit's map shaders (2.4 MB of AIR, 309 functions): Maps, MapKit in every application, the
+                 # Camera's and Weather's maps. Its iphoneos.pipelinelib holds only Apple GPU binaries (an empty
+                 # functions file), so without this library VectorKit draws nothing here (docs/metal.md, "Apple apps").
+                 'System/Library/PrivateFrameworks/VectorKit.framework/default.metallib')
 # ... and three machine-learning models ARE wanted, because searchd aborts without them. Spotlight's ranking
 # (SpotlightServices -[... loadCannedModelWithType:error:] -> initSpecificModel:error:) builds its model's
 # path with [[NSBundle bundleForClass:] pathForResource:NAME ofType:@"mlmodelc"] and hands the answer to
