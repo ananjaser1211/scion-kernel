@@ -320,6 +320,10 @@ bool nmb_buffer_make_aliasable(const NmbBuffer *);
 bool nmb_buffer_is_aliasable(const NmbBuffer *);
 bool nmb_texture_make_aliasable(const NmbTexture *);
 bool nmb_texture_is_aliasable(const NmbTexture *);
+/* functionConstantsDictionary: the count, then each (in name order): name, MTLDataType, [[function_constant(N)]] index, required */
+uint32_t nmb_function_constant_count(const NmbFunction *);
+bool nmb_function_constant_at(const NmbFunction *, uint32_t index, char *name, size_t size, uint64_t *type, uint64_t *constant_index,
+                              bool *required);
 #ifdef __cplusplus
 }
 #endif

@@ -2551,3 +2551,35 @@ pub extern "C" fn nmb_texture_make_aliasable(texture: *const NmbTexture) -> bool
 pub extern "C" fn nmb_texture_is_aliasable(texture: *const NmbTexture) -> bool {
     guard(false, || Ok(get(texture)?.0.is_aliasable()))
 }
+
+/// Scion: `functionConstantsDictionary`: how many function constants the function declares (none for a function made with constant
+/// values, as Metal answers).
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_function_constant_count(function: *const NmbFunction) -> u32 {
+    guard(0, || Ok(get(function)?.0.function_constants_dictionary().map_err(e("function constants"))?.len() as u32))
+}
+
+/// Scion: the `index`th of them, in name order: its name into `name` (`size` bytes, cut and terminated), its `MTLDataType`, its
+/// `[[function_constant(N)]]` index and whether it is required.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_function_constant_at(function: *const NmbFunction, index: u32, name: *mut c_char, size: usize, data_type: *mut u64,
+                                           constant_index: *mut u64, required: *mut bool) -> bool {
+    guard(false, || {
+        let constants = get(function)?.0.function_constants_dictionary().map_err(e("function constants"))?;
+        let constant = constants.values().nth(index as usize).ok_or("no such function constant")?;
+        copy_out(constant.name(), name, size);
+        // SAFETY: the header's out words, each null or writable.
+        unsafe {
+            if let Some(t) = data_type.as_mut() {
+                *t = constant.data_type().as_raw() as u64;
+            }
+            if let Some(i) = constant_index.as_mut() {
+                *i = constant.index() as u64;
+            }
+            if let Some(r) = required.as_mut() {
+                *r = constant.is_required();
+            }
+        }
+        Ok(true)
+    })
+}
