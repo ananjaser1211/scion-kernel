@@ -1231,3 +1231,84 @@ launcher.
 
 **Next walls.** The CAMetalLayer present path (1); PanVK's buffer list for sampled host surfaces (2); RetroArch's stall after its
 first commit; Photos' exception in `PXGCreateContext`; the Camera prompt's map (VectorKit, as Maps).
+
+### On build 62 (userland at 278f9a0, kernel as build 60): where the frames went, and the next fixes
+
+The image's own runtime behaves as the test launcher's did: MAME4iOS runs Gridlee at 50 frames a second and the game area is black
+with bands; PPSSPP's menu is black.
+
+**The frames were never lost on the way to the window server.** A test library (`DYLD_INSERT_LIBRARIES` through a test launcher, not
+committed) logged each `CAMetalDrawable`'s calls: every drawable is presented (`-present`, status 1), the render server takes it
+(`didComposite`) and gives it back (status 3, `didPresentAtTime:` 0) within 5 to 10 ms. QuartzCore detaches an opaque CAMetalLayer from
+its own picture and hands its drawable to the display as a layer of its own (the kernel's log: "surfaces in layers 0x3 now: 459 4",
+MAME's drawable below the window server's framebuffer; PPSSPP the same, full screen). The window server's framebuffer is then at alpha
+0 exactly over the detached layer and 255 everywhere else (a tool reading the surface: 947 532 pixels clear, MAME's 1124x843, none
+between). MiniIOMobileFramebuffer drew each layer by copying its pixels, alpha ignored, so the upper layer painted the lower one black;
+the bands were the panel scanned out between the two copies. Neither the plug-in nor metal2vulkan was involved, which is why the GLES
+compositor showed the same; `IOSurfaceIsInUse` 0 and no import by the window server are what a detached layer looks like. (Drawables
+of Apple's AGX driver carry an `IOSurfaceSharedEvent`; `-[IOSurfaceSharedEvent init]` answers nil on this kernel, MiniIOSurface has no
+selector 36, but QuartzCore never asked for one here, so it is not on this path.)
+
+- **Fixed in the kernel** (xnu fork `939a69a2862e`, `MiniIOMobileFramebuffer.cpp`): a layer above others is drawn over what the layers
+  below it drew in the frame, by its premultiplied alpha (an opaque pixel is written, a clear one over a lower layer is skipped, the
+  rest mixed with what is under them), over black where no lower layer drew; the bottom layer is copied as before. A layer above
+  others is drawn pixel by pixel even when unscaled. The kernel builds (`make kernel`).
+- Checked against the live surfaces without the new kernel: a test tool (not committed) runs the same `over()` on the two layers of
+  the current swap. MAME4iOS's Gridlee and PPSSPP's Vulkan menu come out whole, with the window server's status bar and home indicator
+  over them. That is a simulation of the panel, not a screenshot of it.
+- What it costs is what two layers cost already: MAME4iOS in play, 37 swaps a second at 10.4 ms each in the driver (processors
+  copying both layers), the GPU 25 to 30% busy (MAME's commit to completion 5.2 ms, commits 19 ms apart). Scanning out the detached
+  layer with the DPU's own windows would take that copy away.
+
+**PanVK's buffer list (wall 2).** `tools/mesa/panvk/panvk-sampled-surfaces.patch`: the device keeps the IOSurfaces it imported as
+memory, and each JM batch names those its own list does not with `HAKIOS_DRM_BO_SAMPLED` (hakios-drm). HakiosMali's
+`kMaliSubmitSampled` cleans such a surface's lines before the job by its seed, as for any named surface, and keeps the buffer until the
+job is done, but does not set `maliSeq`, so the display does not wait for a job that only reads a surface. hakios-drm takes the bit
+off for a kernel without parameter 0x7901, and the surfaces are then named as any other buffer. A test (`samp_test`, not committed: a
+64x64 'BGRA' surface written by the processor under the lock, copied by the GPU through PanVK's meta copy, which samples it): with the
+image's PanVK 30 of 30 runs read stale texels; with the new PanVK on build 60's kernel (the bit taken off) 0 of 30. `metal_tri` and its
+`--surface`, `--fetch`, `--ycbcr`, `--texel-buffer` (16, 6912 `--a8`, 256 `--blit`, 64 `--render`) and `--surface --size 1125
+--row-bytes 4608 --frames 30` pass with it.
+
+**RetroArch's stall (wall 3).** Its main thread waits in MoltenVK's `MVKMetalCompiler::compile` for the handler of
+`-newComputePipelineStateWithDescriptor:options:completionHandler:` (a spindump, symbolicated against RetroArch's MoltenVK). The
+frontend had no such method, so the plug-in's class sent it to `_MTLDevice`'s own, which never calls the handler (a test: not called
+in 5 s). The frontend now makes the pipeline and calls the handler, as its other asynchronous forms do, and `MTLLibrary`'s
+`-newFunctionWithDescriptor:completionHandler:` too; the test passes with the new plug-in (by `DYLD_LIBRARY_PATH`), and the pipeline
+dispatches right.
+
+**Photos (wall 3).** `PXGMetalCompatibleImageByRedrawingCGImage` sizes an image to fit `-[MTLDevice limits]`' `maxTextureWidth2D` and
+`maxTextureHeight2D` (offsets 132 and 136 of `_MTLDevice`'s `_limits`). The plug-in leaves `-initLimits` empty, so they were 0 and
+`PXGCreateContext` threw. The frontend now fills each field of the base class's `_limits` that is named as a count the runtime
+answers (28 of them; `maxBufferLength` from the device), reading the field names from the instance variable's type encoding; nothing
+the runtime did not measure is claimed. With the new plug-in `limits` answers 16384 by 16384. Photos is on the system volume and
+takes no test plug-in, so it waits for an image.
+
+**Camera.** The location prompt's map is VectorKit's, as Maps: it needs VectorKit's metallib, which the image does not have. Not looked
+at further.
+
+**Found on the way.**
+- `kill -9` of the stalled RetroArch (traced by launchd, sleeping, not stopped) left it stuck in exit: `ps` and `killall` hang on it,
+  `launchctl list` still names it, and its launch screen stayed in front until SpringBoard was restarted (`sbreload`, which brought the
+  home screen back and let other applications start). It stays until the next boot, and RetroArch cannot be started again before then.
+- A test dylib overwritten in place is not loaded again (its old signature is cached); `ldid -S` on the phone after copying fixes it.
+
+| | build 62 now | with this section's changes |
+|---|---|---|
+| MAME4iOS | game runs at 50 fps, area black with bands | the frame on the panel (simulated from the live layers; needs the kernel) |
+| PPSSPP (Vulkan) | menu runs, screen black | the menu on the panel (simulated; needs the kernel) |
+| RetroArch | stalls at its first compute pipeline | the handler called (test tool, new plug-in); not run again in RetroArch (stuck process until the boot) |
+| Photos | throws in `PXGCreateContext` | `limits` 16384x16384 (test tool); Photos itself needs the image |
+| a CPU-written surface the GPU samples | stale in 30 of 30 runs | 0 of 30 (new PanVK on today's kernel) |
+| Camera's prompt map | black | unchanged (VectorKit's metallib) |
+
+**Needs an image:**
+- *Kernel*: the xnu fork at `939a69a2862e` (`profiles/ios-16.5.conf`) and `drivers/gpu/mali` (kMaliSubmitSampled).
+- *Userland* (`METAL=vk`, as build 62): PanVK with `panvk-sampled-surfaces.patch` and the new hakios-drm (`tools/mk-panvk.sh`
+  re-extracts Mesa: the patch list changed), Mesa's OpenGL ES with the new hakios-drm, the plug-in with the new frontend.
+
+Then: MAME4iOS (a free ROM), PPSSPP (Vulkan) and RetroArch's menu on the panel, screenshots, fps and the kernel's GPU busy line; Photos
+opens.
+
+**Next walls.** Two-layer frames cost the processors about 10 ms a swap: the DPU's own windows (or the window server keeping detached
+layers in its own picture) would take that away. Then RetroArch past its first pipelines, and whatever Photos asks next.
