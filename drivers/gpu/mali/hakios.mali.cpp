@@ -143,6 +143,15 @@ struct mali_written {
  */
 #define kMaliSubmitWritten      (1u << 31)
 #define kMaliParamWrittenHandles 0x7900u
+/*
+ * A handle with kMaliSubmitSampled set names a buffer the job chain may only read (PanVK names every IOSurface it imported
+ * so: tools/mesa/panvk/panvk-sampled-surfaces.patch): a surface's lines are cleaned before the job by its seed, as for
+ * any buffer named, and the buffer is kept until the job is done, but the display does not wait for the job to show the
+ * surface (maliSeq is a writer's). Parameter kMaliParamSampledHandles (1) says the kernel takes the bit.
+ */
+#define kMaliSubmitSampled      (1u << 30)
+#define kMaliParamSampledHandles 0x7901u
+#define kMaliSubmitFlags        (kMaliSubmitWritten | kMaliSubmitSampled)
 
 /* kHakiosMaliWait: job `seq` (what kPanfrostSubmit gave back in `jc`) done within timeout_ns, or kIOReturnTimeout */
 struct mali_wait {
@@ -770,7 +779,7 @@ HakiosMaliUserClient::submit(struct drm_panfrost_submit * request)
 		for (; i < count && cleaned < 16; i++) {
 			uint32_t seed = 0;
 
-			b = buffer(handles[i] & ~kMaliSubmitWritten);
+			b = buffer(handles[i] & ~kMaliSubmitFlags);
 			if (b != NULL && b->surface != NULL && (MiniIOSurfaceLines(b->surface, &seed) || gMaliFlush == 2) &&
 			    (clean[cleaned] = MiniIOSurfaceCopy(b->surface->sid)) != NULL) {
 				seeds[cleaned++] = seed;
@@ -791,12 +800,12 @@ HakiosMaliUserClient::submit(struct drm_panfrost_submit * request)
 		IOLockLock(gMaliLock);
 	}
 	for (uint32_t i = 0; i < count; i++) {
-		b = buffer(handles[i] & ~kMaliSubmitWritten);
+		b = buffer(handles[i] & ~kMaliSubmitFlags);
 		if (b == NULL) {
 			continue;
 		}
 		b->last_seq = seq;
-		if (b->surface != NULL) {
+		if (b->surface != NULL && !(handles[i] & kMaliSubmitSampled)) {
 			b->surface->maliSeq = seq;      /* (HakiosMaliDrawn) */
 			if ((handles[i] & kMaliSubmitWritten) && wrote < 16 && (written[wrote] = MiniIOSurfaceCopy(b->surface->sid)) != NULL) {
 				wrote++;
@@ -986,6 +995,8 @@ HakiosMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
 	case kPanfrostGetParam:
 		if (r.param.param == kMaliParamWrittenHandles) {
 			r.param.value = 1;              /* (submit(): kMaliSubmitWritten) */
+		} else if (r.param.param == kMaliParamSampledHandles) {
+			r.param.value = 1;              /* (submit(): kMaliSubmitSampled) */
 		} else if (!hakios_mali_parameter(r.param.param, &r.param.value)) {
 			ret = kIOReturnBadArgument;
 		}
