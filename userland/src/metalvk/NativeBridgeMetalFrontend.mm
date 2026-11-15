@@ -336,20 +336,22 @@ static void noteDrawablePresent(id drawable,const char *how) {
    object_getClassName(drawable),(unsigned long)texture.width,(unsigned long)texture.height,(unsigned long)texture.pixelFormat);
  }
 }
-// A drawable presented by itself is shown once the GPU has written it, as through a command buffer (presentDrawable:, which converts
-// in its completed handler): an extended-range one is made what its surface says it is first (drawable_xr_to_surface), after the
-// work that writes it. The Astronomy wallpaper (AegirPoster) presents its BGR10_XR_sRGB drawable so, and the compositor showed the
-// XR words as BGRA bytes: black, with a blue patch (docs/metal.md, phase 5).
-static void drawableXrBeforePresent(id drawable);   // (after waitForResource, below)
+// A drawable presented by itself is shown once the GPU has written it, as through a command buffer (presentDrawable:, in its completed
+// handler): Metal's present waits for the work scheduled for the drawable, and here nothing between the GPU and the compositor does,
+// so the compositor took the surface while the GPU still drew it. MoltenVK presents so, from the command buffer's scheduled handler
+// (PPSSPP's menu showed bands of its frame over black). An extended-range one is then made what its surface says it is
+// (drawable_xr_to_surface): the Astronomy wallpaper (AegirPoster) presents its BGR10_XR_sRGB drawable so, and the compositor showed
+// the XR words as BGRA bytes: black, with a blue patch (docs/metal.md, phase 5).
+static void drawableBeforePresent(id drawable);   // (after waitForResource, below)
 static void drawablePresent(id self_,SEL cmd) {
- noteDrawablePresent(self_,"-present");drawableXrBeforePresent(self_);((void(*)(id,SEL))gDrawablePresent)(self_,cmd);
+ noteDrawablePresent(self_,"-present");drawableBeforePresent(self_);((void(*)(id,SEL))gDrawablePresent)(self_,cmd);
 }
 static void drawablePresentAtTime(id self_,SEL cmd,CFTimeInterval t) {
- noteDrawablePresent(self_,"-presentAtTime:");drawableXrBeforePresent(self_);
+ noteDrawablePresent(self_,"-presentAtTime:");drawableBeforePresent(self_);
  ((void(*)(id,SEL,CFTimeInterval))gDrawablePresentAtTime)(self_,cmd,t);
 }
 static void drawablePresentAfter(id self_,SEL cmd,CFTimeInterval t) {
- noteDrawablePresent(self_,"-presentAfterMinimumDuration:");drawableXrBeforePresent(self_);
+ noteDrawablePresent(self_,"-presentAfterMinimumDuration:");drawableBeforePresent(self_);
  ((void(*)(id,SEL,CFTimeInterval))gDrawablePresentAfter)(self_,cmd,t);
 }
 static void watchDrawablePresents() {
@@ -998,13 +1000,13 @@ static void waitForResource(id resource) {
  }
  gTimeResourceWait.add(began);
 }
-static void drawableXrBeforePresent(id drawable) {
+static void drawableBeforePresent(id drawable) {
  if(tPresentingForBuffer || ![drawable respondsToSelector:@selector(texture)])return;
  id texture=[(id<CAMetalDrawable>)drawable texture];
  if(![texture isKindOfClass:[NBTexture class]])return;
+ waitForResource(texture);
  const MTLPixelFormat format=[(id<MTLTexture>)texture pixelFormat];
  if(format!=MTLPixelFormatBGR10_XR && format!=MTLPixelFormatBGR10_XR_sRGB)return;
- waitForResource(texture);
  drawable_xr_to_surface((id<MTLDrawable>)drawable);
 }
 // The barrier scope of a list of resources: their kinds.
