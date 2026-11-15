@@ -360,15 +360,18 @@ static void watchDrawablePresents() {
  if((m=class_getInstanceMethod(cls,@selector(presentAfterMinimumDuration:))))gDrawablePresentAfter=method_setImplementation(m,(IMP)drawablePresentAfter);
 }
 // A command buffer's present of DRAWABLE, once the GPU is done: counted and said the first time.
-static void presentForBuffer(id<MTLDrawable> drawable,bool timed,CFTimeInterval time) {
+enum PresentWhen {PresentNow,PresentAtTime,PresentAfterMinimumDuration};
+static void presentForBuffer(id<MTLDrawable> drawable,PresentWhen when,CFTimeInterval time) {
  gBufferPresents++;
  if(firstTime(gSaidBufferPresent)) {
   id<MTLTexture> texture=[(id)drawable respondsToSelector:@selector(texture)]?[(id<CAMetalDrawable>)drawable texture]:nil;
   NBSAY(@"native-metal: the first drawable presented through a command buffer (presentDrawable:%s): a %s, texture %lux%lu MTLPixelFormat %lu",
-   timed?"atTime:":"",object_getClassName(drawable),(unsigned long)texture.width,(unsigned long)texture.height,(unsigned long)texture.pixelFormat);
+   when==PresentAtTime?"atTime:":when==PresentAfterMinimumDuration?"afterMinimumDuration:":"",object_getClassName(drawable),(unsigned long)texture.width,(unsigned long)texture.height,(unsigned long)texture.pixelFormat);
  }
  tPresentingForBuffer=true;
- if(timed)[drawable presentAtTime:time];else [drawable present];
+ if(when==PresentAtTime)[drawable presentAtTime:time];
+ else if(when==PresentAfterMinimumDuration)[drawable presentAfterMinimumDuration:time];
+ else [drawable present];
  tPresentingForBuffer=false;
 }
 // The pixel formats textures were asked for (first eight distinct), with how many were refused: native_bridge_metal_formats.
@@ -431,7 +434,6 @@ static void waitForResource(id resource);
 #define NB_RESOURCE_SPI \
 - (uint64_t)protectionOptions {return 0;} \
 - (id<MTLHeap>)heap {return _parentHeap;} \
-- (BOOL)isAliasable {return NO;} \
 - (int)setOwnerWithIdentity:(unsigned)identity {(void)identity;return 46; /* KERN_NOT_SUPPORTED */} \
 - (void)waitUntilComplete {waitForResource(self);}
 @interface NBBuffer : NBObject
@@ -440,6 +442,11 @@ static void waitForResource(id resource);
 @property(nonatomic) void *wrapped;
 @property(nonatomic,strong) id<MTLHeap> parentHeap;   // the heap that made the buffer, nil otherwise
 @property(nonatomic) NSUInteger heapOffset;
+@end
+@interface NBHeap : NBObject
+@property(nonatomic) NmbHeap *handle;
+@property(nonatomic) MTLResourceOptions options;
+@property(nonatomic) MTLHeapType heapType;
 @end
 @interface NBTexture : NBObject
 @property(nonatomic) NmbTexture *handle;
@@ -513,6 +520,11 @@ static void releaseSurface(void *context,void *,uint64_t) {gSurfaceImportsReleas
 - (MTLCPUCacheMode)cpuCacheMode {return (MTLCPUCacheMode)((_options&MTLResourceCPUCacheModeMask)>>MTLResourceCPUCacheModeShift);}
 - (MTLHazardTrackingMode)hazardTrackingMode {return (MTLHazardTrackingMode)((_options&MTLResourceHazardTrackingModeMask)>>MTLResourceHazardTrackingModeShift);}
 - (void)didModifyRange:(NSRange)range {(void)range;}
+- (BOOL)isAliasable {return nmb_buffer_is_aliasable(_handle);}
+- (void)makeAliasable {if(!nmb_buffer_make_aliasable(_handle))NBLOG(@"native-metal: buffer makeAliasable refused: %@",lastError());}
+// Debug markers name ranges for GPU tools; they change nothing the GPU computes.
+- (void)addDebugMarker:(NSString *)marker range:(NSRange)range {(void)marker;(void)range;}
+- (void)removeAllDebugMarkers {}
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state {
  const uint64_t answer=nmb_buffer_set_purgeable_state(_handle,state);
  if(!answer)NBLOG(@"native-metal: buffer setPurgeableState refused: %@",lastError());
@@ -585,9 +597,15 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
  }
  return buffer;
 }
+// The bridge's swizzle word: 0 for each channel from itself, else MTLTextureSwizzleChannels' four bytes, red lowest.
+static uint64_t swizzleWord(MTLTextureSwizzleChannels c) {
+ if(c.red==MTLTextureSwizzleRed && c.green==MTLTextureSwizzleGreen && c.blue==MTLTextureSwizzleBlue && c.alpha==MTLTextureSwizzleAlpha)return 0;
+ return (uint64_t)c.red|(uint64_t)c.green<<8|(uint64_t)c.blue<<16|(uint64_t)c.alpha<<24;
+}
 static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out) {
  if(!d)return false;
- *out={(uint64_t)d.textureType,(uint64_t)d.pixelFormat,d.width,d.height,d.depth,d.mipmapLevelCount,d.sampleCount,d.arrayLength,(uint64_t)d.usage,(uint64_t)d.resourceOptions};
+ *out={(uint64_t)d.textureType,(uint64_t)d.pixelFormat,d.width,d.height,d.depth,d.mipmapLevelCount,d.sampleCount,d.arrayLength,(uint64_t)d.usage,(uint64_t)d.resourceOptions,
+       swizzleWord(d.swizzle)};
  return true;
 }
 @implementation NBTexture
@@ -612,6 +630,23 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
 - (NSUInteger)bufferBytesPerRow {return _rowBytes;}
 - (id<MTLTexture>)parentTexture {return _parent;}
 - (NSUInteger)rotation {return 0;}
+- (MTLTextureSwizzleChannels)swizzle {
+ const uint64_t w=_descriptor.swizzle;
+ if(!w)return MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed,MTLTextureSwizzleGreen,MTLTextureSwizzleBlue,MTLTextureSwizzleAlpha);
+ return MTLTextureSwizzleChannelsMake((MTLTextureSwizzle)(w&0xff),(MTLTextureSwizzle)(w>>8&0xff),(MTLTextureSwizzle)(w>>16&0xff),(MTLTextureSwizzle)(w>>24&0xff));
+}
+// No sparse, shareable or lossy textures are made here: Metal's answers for a texture that is none of them.
+- (BOOL)isSparse {return NO;}
+- (BOOL)isAliasable {return nmb_texture_is_aliasable(_handle);}
+- (void)makeAliasable {if(!nmb_texture_make_aliasable(_handle))NBLOG(@"native-metal: texture makeAliasable refused: %@",lastError());}
+- (BOOL)isShareable {return NO;}
+- (NSUInteger)firstMipmapInTail {return 0;}
+- (NSUInteger)tailSizeInBytes {return 0;}
+- (MTLTextureCompressionType)compressionType {return MTLTextureCompressionTypeLossless;}
+- (BOOL)allowGPUOptimizedContents {return YES;}
+- (MTLHazardTrackingMode)hazardTrackingMode {
+ return (MTLHazardTrackingMode)((_descriptor.options&MTLResourceHazardTrackingModeMask)>>MTLResourceHazardTrackingModeShift);
+}
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state {
  const uint64_t answer=nmb_texture_set_purgeable_state(_handle,state);
  if(!answer)NBLOG(@"native-metal: texture setPurgeableState refused: %@",lastError());
@@ -631,6 +666,11 @@ NB_RESOURCE_SPI
 - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format textureType:(MTLTextureType)type levels:(NSRange)levels slices:(NSRange)slices {
  const uint64_t l[2]={levels.location,levels.length},s[2]={slices.location,slices.length};
  return [self view:nmb_texture_new_view(_handle,format,type,l,s,false)];
+}
+- (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format textureType:(MTLTextureType)type levels:(NSRange)levels slices:(NSRange)slices
+                                         swizzle:(MTLTextureSwizzleChannels)swizzle {
+ const uint64_t l[2]={levels.location,levels.length},s[2]={slices.location,slices.length};
+ return [self view:nmb_texture_new_view_swizzle(_handle,format,type,l,s,swizzleWord(swizzle))];
 }
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image {
  const uint64_t region[6]={r.origin.x,r.origin.y,r.origin.z,r.size.width,r.size.height,r.size.depth};
@@ -964,6 +1004,15 @@ static void drawableXrBeforePresent(id drawable) {
  waitForResource(texture);
  drawable_xr_to_surface((id<MTLDrawable>)drawable);
 }
+// The barrier scope of a list of resources: their kinds.
+static MTLBarrierScope barrierScopeOf(const id<MTLResource> __unsafe_unretained resources[],NSUInteger count) {
+ MTLBarrierScope scope=0;
+ for(NSUInteger k=0;k<count;k++) {
+  if([(id)resources[k] isKindOfClass:[NBBuffer class]])scope|=MTLBarrierScopeBuffers;
+  else if(resources[k])scope|=MTLBarrierScopeTextures;
+ }
+ return scope;
+}
 @implementation NBEncoder
 - (void)dealloc {if(_handle)nmb_encoder_discard(_handle);}
 - (bool)check:(bool)ok what:(const char *)what {
@@ -1004,6 +1053,31 @@ static void drawableXrBeforePresent(id drawable) {
  NmbFence *handle=[(NBFence *)fence handle];
  [self check:update?nmb_encoder_update_fence(_handle,handle,stages):nmb_encoder_wait_fence(_handle,handle,stages) what:update?"updateFence":"waitForFence"];
 }
+- (void)sampler:(id<MTLSamplerState>)sampler min:(float)lo max:(float)hi index:(NSUInteger)index stage:(uint32_t)stage {
+ if(sampler && ![(id)sampler isKindOfClass:[NBSampler class]]){[_commandBuffer refuse:@"foreign sampler"];return;}
+ [self check:nmb_encoder_set_sampler_lod(_handle,stage,sampler?[(NBSampler *)sampler handle]:nullptr,lo,hi,(uint32_t)index) what:"setSamplerState:lodMinClamp:lodMaxClamp:"];
+}
+// A buffer of this frontend, kept alive by the command buffer; anything else fails the command buffer.
+- (bool)buffers:(id<MTLBuffer>)buffer {
+ if(![(id)buffer isKindOfClass:[NBBuffer class]]){[_commandBuffer refuse:@"missing or foreign buffer"];return false;}
+ [_commandBuffer.resourceOwners addObject:buffer];return true;
+}
+// useResource:/useHeap: of a resource or a heap (one of them nil); stages for a render encoder.
+- (void)use:(id<MTLResource>)resource heap:(id<MTLHeap>)heap usage:(MTLResourceUsage)usage stages:(MTLRenderStages)stages {
+ NmbBuffer *b=nullptr;NmbTexture *t=nullptr;NmbHeap *h=nullptr;
+ if(heap) {
+  if(![(id)heap isKindOfClass:[NBHeap class]]){[_commandBuffer refuse:@"foreign heap"];return;}
+  h=[(NBHeap *)heap handle];[_commandBuffer.resourceOwners addObject:heap];
+ } else if([(id)resource isKindOfClass:[NBBuffer class]]) {
+  b=[(NBBuffer *)resource handle];[_commandBuffer.resourceOwners addObject:resource];
+ } else if([(id)resource isKindOfClass:[NBTexture class]]) {
+  t=[(NBTexture *)resource handle];[_commandBuffer.resourceOwners addObject:resource];
+  if([(NBTexture *)resource surface])[_commandBuffer.surfaces addObject:resource];
+ } else {
+  [_commandBuffer refuse:@"missing or foreign resource to use"];return;
+ }
+ [self check:nmb_encoder_use(_handle,b,t,h,usage,stages) what:"useResource"];
+}
 - (void)updateFence:(id<MTLFence>)fence {[self fence:fence stages:0 update:true];}
 - (void)waitForFence:(id<MTLFence>)fence {[self fence:fence stages:0 update:false];}
 - (void)offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {
@@ -1040,8 +1114,30 @@ static void drawableXrBeforePresent(id drawable) {
 }
 - (void)dispatchThreads:(MTLSize)t threadsPerThreadgroup:(MTLSize)g {[self dispatch:t group:g threads:true];}
 - (void)dispatchThreadgroups:(MTLSize)t threadsPerThreadgroup:(MTLSize)g {[self dispatch:t group:g threads:false];}
-- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u {(void)r;(void)u;}
-- (void)memoryBarrierWithScope:(MTLBarrierScope)s {(void)s;}
+- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u {[self use:r heap:nil usage:u stages:0];}
+- (void)useResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)n usage:(MTLResourceUsage)u {
+ for(NSUInteger k=0;k<n;k++)[self use:r[k] heap:nil usage:u stages:0];
+}
+- (void)useHeap:(id<MTLHeap>)h {[self use:nil heap:h usage:MTLResourceUsageRead stages:0];}
+- (void)useHeaps:(const id<MTLHeap> __unsafe_unretained [])h count:(NSUInteger)n {for(NSUInteger k=0;k<n;k++)[self useHeap:h[k]];}
+- (void)memoryBarrierWithScope:(MTLBarrierScope)s {[self check:nmb_encoder_memory_barrier(self.handle,s,0,0) what:"memoryBarrierWithScope"];}
+// The runtime orders every write of the listed kinds: the resources' kinds are the scope.
+- (void)memoryBarrierWithResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)n {
+ [self memoryBarrierWithScope:barrierScopeOf(r,n)];
+}
+- (void)setSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s withRange:(NSRange)r {
+ for(NSUInteger k=0;k<r.length;k++)[self sampler:s[k] index:r.location+k stage:0];
+}
+- (void)setSamplerState:(id<MTLSamplerState>)s lodMinClamp:(float)lo lodMaxClamp:(float)hi atIndex:(NSUInteger)i {[self sampler:s min:lo max:hi index:i stage:0];}
+- (void)setSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s lodMinClamps:(const float [])lo lodMaxClamps:(const float [])hi withRange:(NSRange)r {
+ for(NSUInteger k=0;k<r.length;k++)[self sampler:s[k] min:lo[k] max:hi[k] index:r.location+k stage:0];
+}
+- (void)dispatchThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)b indirectBufferOffset:(NSUInteger)o threadsPerThreadgroup:(MTLSize)g {
+ if(![self buffers:b])return;
+ gDispatches++;self.commandBuffer->encodedWork.dispatches++;
+ const uint64_t group[3]={g.width,g.height,g.depth};
+ [self check:nmb_compute_dispatch_indirect(self.handle,[(NBBuffer *)b handle],o,group) what:"dispatchThreadgroupsWithIndirectBuffer"];
+}
 @end
 
 @interface NBRenderEncoder : NBEncoder
@@ -1140,7 +1236,71 @@ static void drawableXrBeforePresent(id drawable) {
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)b indexBufferOffset:(NSUInteger)o {
  [self drawIndexedPrimitives:t indexCount:n indexType:k indexBuffer:b indexBufferOffset:o instanceCount:1 baseVertex:0 baseInstance:0];
 }
-- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u stages:(MTLRenderStages)s {(void)r;(void)u;(void)s;}
+- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u stages:(MTLRenderStages)s {[self use:r heap:nil usage:u stages:s];}
+- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u {[self use:r heap:nil usage:u stages:MTLRenderStageVertex|MTLRenderStageFragment];}
+- (void)useResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)n usage:(MTLResourceUsage)u stages:(MTLRenderStages)s {
+ for(NSUInteger k=0;k<n;k++)[self use:r[k] heap:nil usage:u stages:s];
+}
+- (void)useResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)n usage:(MTLResourceUsage)u {
+ [self useResources:r count:n usage:u stages:MTLRenderStageVertex|MTLRenderStageFragment];
+}
+- (void)useHeap:(id<MTLHeap>)h stages:(MTLRenderStages)s {[self use:nil heap:h usage:MTLResourceUsageRead stages:s];}
+- (void)useHeap:(id<MTLHeap>)h {[self useHeap:h stages:MTLRenderStageVertex|MTLRenderStageFragment];}
+- (void)useHeaps:(const id<MTLHeap> __unsafe_unretained [])h count:(NSUInteger)n stages:(MTLRenderStages)s {for(NSUInteger k=0;k<n;k++)[self useHeap:h[k] stages:s];}
+- (void)useHeaps:(const id<MTLHeap> __unsafe_unretained [])h count:(NSUInteger)n {[self useHeaps:h count:n stages:MTLRenderStageVertex|MTLRenderStageFragment];}
+- (void)memoryBarrierWithScope:(MTLBarrierScope)scope afterStages:(MTLRenderStages)after beforeStages:(MTLRenderStages)before {
+ [self check:nmb_encoder_memory_barrier(self.handle,scope,after,before) what:"memoryBarrierWithScope:afterStages:beforeStages:"];
+}
+- (void)memoryBarrierWithResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)n afterStages:(MTLRenderStages)after
+                      beforeStages:(MTLRenderStages)before {
+ [self memoryBarrierWithScope:barrierScopeOf(r,n) afterStages:after beforeStages:before];
+}
+- (void)setVertexTextures:(const id<MTLTexture> __unsafe_unretained [])t withRange:(NSRange)r {
+ for(NSUInteger k=0;k<r.length;k++)[self texture:t[k] index:r.location+k stage:1];
+}
+- (void)setVertexSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s withRange:(NSRange)r {
+ for(NSUInteger k=0;k<r.length;k++)[self sampler:s[k] index:r.location+k stage:1];
+}
+- (void)setFragmentSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s withRange:(NSRange)r {
+ for(NSUInteger k=0;k<r.length;k++)[self sampler:s[k] index:r.location+k stage:2];
+}
+- (void)setVertexSamplerState:(id<MTLSamplerState>)s lodMinClamp:(float)lo lodMaxClamp:(float)hi atIndex:(NSUInteger)i {[self sampler:s min:lo max:hi index:i stage:1];}
+- (void)setFragmentSamplerState:(id<MTLSamplerState>)s lodMinClamp:(float)lo lodMaxClamp:(float)hi atIndex:(NSUInteger)i {[self sampler:s min:lo max:hi index:i stage:2];}
+- (void)setVertexSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s lodMinClamps:(const float [])lo lodMaxClamps:(const float [])hi withRange:(NSRange)r {
+ for(NSUInteger k=0;k<r.length;k++)[self sampler:s[k] min:lo[k] max:hi[k] index:r.location+k stage:1];
+}
+- (void)setFragmentSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s lodMinClamps:(const float [])lo lodMaxClamps:(const float [])hi withRange:(NSRange)r {
+ for(NSUInteger k=0;k<r.length;k++)[self sampler:s[k] min:lo[k] max:hi[k] index:r.location+k stage:2];
+}
+- (void)setViewports:(const MTLViewport [])v count:(NSUInteger)n {
+ std::vector<double> values;values.reserve(n*6);
+ for(NSUInteger k=0;k<n;k++){values.push_back(v[k].originX);values.push_back(v[k].originY);values.push_back(v[k].width);values.push_back(v[k].height);values.push_back(v[k].znear);values.push_back(v[k].zfar);}
+ [self check:nmb_render_set_viewports(self.handle,values.data(),n) what:"setViewports:count:"];
+}
+- (void)setScissorRects:(const MTLScissorRect [])r count:(NSUInteger)n {
+ std::vector<uint64_t> values;values.reserve(n*4);
+ for(NSUInteger k=0;k<n;k++){values.push_back(r[k].x);values.push_back(r[k].y);values.push_back(r[k].width);values.push_back(r[k].height);}
+ [self check:nmb_render_set_scissors(self.handle,values.data(),n) what:"setScissorRects:count:"];
+}
+// Store actions the pass descriptor left MTLStoreActionUnknown, stated before the encoder ends (MoltenVK's way).
+- (void)setColorStoreAction:(MTLStoreAction)a atIndex:(NSUInteger)i {[self check:nmb_render_set_store_action(self.handle,0,(uint32_t)i,a) what:"setColorStoreAction"];}
+- (void)setDepthStoreAction:(MTLStoreAction)a {[self check:nmb_render_set_store_action(self.handle,1,0,a) what:"setDepthStoreAction"];}
+- (void)setStencilStoreAction:(MTLStoreAction)a {[self check:nmb_render_set_store_action(self.handle,2,0,a) what:"setStencilStoreAction"];}
+// MTLStoreActionOptionNone changes nothing; custom sample positions are not offered (programmable sample positions answer no).
+- (void)setColorStoreActionOptions:(MTLStoreActionOptions)o atIndex:(NSUInteger)i {(void)i;if(o)[self.commandBuffer refuse:@"store action options"];}
+- (void)setDepthStoreActionOptions:(MTLStoreActionOptions)o {if(o)[self.commandBuffer refuse:@"store action options"];}
+- (void)setStencilStoreActionOptions:(MTLStoreActionOptions)o {if(o)[self.commandBuffer refuse:@"store action options"];}
+- (void)drawPrimitives:(MTLPrimitiveType)t indirectBuffer:(id<MTLBuffer>)b indirectBufferOffset:(NSUInteger)o {
+ if(![self buffers:b])return;
+ gDraws++;self.commandBuffer->encodedWork.draws++;
+ [self check:nmb_render_draw_indirect(self.handle,t,[(NBBuffer *)b handle],o) what:"drawPrimitives:indirectBuffer:"];
+}
+- (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)ib indexBufferOffset:(NSUInteger)io
+               indirectBuffer:(id<MTLBuffer>)b indirectBufferOffset:(NSUInteger)o {
+ if(![self buffers:ib] || ![self buffers:b])return;
+ gDraws++;self.commandBuffer->encodedWork.draws++;
+ [self check:nmb_render_draw_indexed_indirect(self.handle,t,k,[(NBBuffer *)ib handle],io,[(NBBuffer *)b handle],o) what:"drawIndexedPrimitives:indirectBuffer:"];
+}
 - (void)updateFence:(id<MTLFence>)fence afterStages:(MTLRenderStages)stages {[self fence:fence stages:stages update:true];}
 - (void)waitForFence:(id<MTLFence>)fence beforeStages:(MTLRenderStages)stages {[self fence:fence stages:stages update:false];}
 @end
@@ -1201,6 +1361,39 @@ static void drawableXrBeforePresent(id drawable) {
  const uint64_t a[3]={so.x,so.y,so.z},size[3]={z.width,z.height,z.depth};
  [self check:nmb_blit_texture_to_buffer(self.handle,[(NBTexture *)s handle],slice,level,a,size,[(NBBuffer *)d handle],o,row,image) what:"copyFromTexture:toBuffer:"];
 }
+- (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)o sourceBytesPerRow:(NSUInteger)row sourceBytesPerImage:(NSUInteger)image
+            sourceSize:(MTLSize)z toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level
+     destinationOrigin:(MTLOrigin)dO options:(MTLBlitOption)options {
+ if(![self buffers:NB_OBJECTS(s) count:1] || ![self textures:NB_OBJECTS(d) count:1])return;
+ const uint64_t size[3]={z.width,z.height,z.depth},b[3]={dO.x,dO.y,dO.z};
+ [self check:nmb_blit_buffer_to_texture_options(self.handle,[(NBBuffer *)s handle],o,row,image,size,[(NBTexture *)d handle],slice,level,b,options)
+        what:"copyFromBuffer:toTexture:options:"];
+}
+- (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)slice sourceLevel:(NSUInteger)level sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
+               toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)o destinationBytesPerRow:(NSUInteger)row destinationBytesPerImage:(NSUInteger)image
+                options:(MTLBlitOption)options {
+ if(![self textures:NB_OBJECTS(s) count:1] || ![self buffers:NB_OBJECTS(d) count:1])return;
+ const uint64_t a[3]={so.x,so.y,so.z},size[3]={z.width,z.height,z.depth};
+ [self check:nmb_blit_texture_to_buffer_options(self.handle,[(NBTexture *)s handle],slice,level,a,size,[(NBBuffer *)d handle],o,row,image,options)
+        what:"copyFromTexture:toBuffer:options:"];
+}
+// Whole levels of whole slices, as copyFromTexture:toTexture: copies them.
+- (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl toTexture:(id<MTLTexture>)d
+       destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl sliceCount:(NSUInteger)slices levelCount:(NSUInteger)levels {
+ if(![self textures:NB_OBJECTS(s,d) count:2])return;
+ for(NSUInteger slice=0;slice<slices;slice++)for(NSUInteger level=0;level<levels;level++) {
+  const NSUInteger l=sl+level;
+  MTLSize size=MTLSizeMake(MAX(s.width>>l,(NSUInteger)1),MAX(s.height>>l,(NSUInteger)1),
+                           s.textureType==MTLTextureType3D?MAX(s.depth>>l,(NSUInteger)1):1);
+  [self copyFromTexture:s sourceSlice:ss+slice sourceLevel:l sourceOrigin:MTLOriginMake(0,0,0) sourceSize:size toTexture:d
+       destinationSlice:ds+slice destinationLevel:dl+level destinationOrigin:MTLOriginMake(0,0,0)];
+ }
+}
+// Hints about the layout of a texture's contents: this runtime keeps one layout, so the contents are as they were.
+- (void)optimizeContentsForGPUAccess:(id<MTLTexture>)t {(void)t;}
+- (void)optimizeContentsForGPUAccess:(id<MTLTexture>)t slice:(NSUInteger)s level:(NSUInteger)l {(void)t;(void)s;(void)l;}
+- (void)optimizeContentsForCPUAccess:(id<MTLTexture>)t {(void)t;}
+- (void)optimizeContentsForCPUAccess:(id<MTLTexture>)t slice:(NSUInteger)s level:(NSUInteger)l {(void)t;(void)s;(void)l;}
 - (void)generateMipmapsForTexture:(id<MTLTexture>)t {
  if(![self textures:NB_OBJECTS(t) count:1])return;
  [self check:nmb_blit_generate_mipmaps(self.handle,[(NBTexture *)t handle]) what:"generateMipmapsForTexture"];
@@ -1229,6 +1422,9 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs);
 - (void)dealloc {nmb_command_buffer_release(_handle);}
 - (id<MTLCommandQueue>)commandQueue {return (id<MTLCommandQueue>)_queue;}
 - (BOOL)retainedReferences {return YES;}
+// No shader logging and no encoder execution status are kept: Metal's answers where neither was asked for.
+- (MTLCommandBufferErrorOption)errorOptions {return MTLCommandBufferErrorOptionNone;}
+- (id<MTLLogContainer>)logs {return (id<MTLLogContainer>)@[];}
 // Protected content is not supported (the runtime's AppleOnlyCall::SetProtectionOptions takes Metal's default only): any other option fails
 // the command buffer.
 - (uint64_t)protectionOptions {return 0;}
@@ -1271,6 +1467,15 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs);
 - (id<MTLComputeCommandEncoder>)computeCommandEncoderWithDispatchType:(MTLDispatchType)type {
  if(type!=MTLDispatchTypeSerial){[self refuse:@"concurrent compute dispatch"];return nil;}
  return [self computeCommandEncoder];
+}
+// Encoder descriptors: their only content here would be counter sample buffers, which this device does not offer (counterSets is empty).
+- (id<MTLBlitCommandEncoder>)blitCommandEncoderWithDescriptor:(MTLBlitPassDescriptor *)d {
+ for(NSUInteger i=0;i<4;i++)if(d.sampleBufferAttachments[i].sampleBuffer){[self refuse:@"counter sample buffers"];break;}
+ return [self blitCommandEncoder];
+}
+- (id<MTLComputeCommandEncoder>)computeCommandEncoderWithDescriptor:(MTLComputePassDescriptor *)d {
+ for(NSUInteger i=0;i<4;i++)if(d.sampleBufferAttachments[i].sampleBuffer){[self refuse:@"counter sample buffers"];break;}
+ return [self computeCommandEncoderWithDispatchType:d.dispatchType];
 }
 - (id<MTLBlitCommandEncoder>)blitCommandEncoder {
  gBlits++;encodedWork.blits++;
@@ -1315,10 +1520,13 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs);
 // A drawable (RenderBox's CAMetalLayer path) is presented once the GPU has written it: this runtime's scheduling comes before completion.
 // An extended-range drawable is made what its surface says it is first (drawable_xr_to_surface).
 - (void)presentDrawable:(id<MTLDrawable>)drawable {
- [self addCompletedHandler:^(id<MTLCommandBuffer>){drawable_xr_to_surface(drawable);presentForBuffer(drawable,false,0);}];
+ [self addCompletedHandler:^(id<MTLCommandBuffer>){drawable_xr_to_surface(drawable);presentForBuffer(drawable,PresentNow,0);}];
 }
 - (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)time {
- [self addCompletedHandler:^(id<MTLCommandBuffer>){drawable_xr_to_surface(drawable);presentForBuffer(drawable,true,time);}];
+ [self addCompletedHandler:^(id<MTLCommandBuffer>){drawable_xr_to_surface(drawable);presentForBuffer(drawable,PresentAtTime,time);}];
+}
+- (void)presentDrawable:(id<MTLDrawable>)drawable afterMinimumDuration:(CFTimeInterval)duration {
+ [self addCompletedHandler:^(id<MTLCommandBuffer>){drawable_xr_to_surface(drawable);presentForBuffer(drawable,PresentAfterMinimumDuration,duration);}];
 }
 - (void)enqueue {}
 - (void)event:(id<MTLEvent>)event value:(uint64_t)value signal:(bool)signal {
@@ -1483,6 +1691,7 @@ static void completed(void *context) {
 
 @implementation NBQueue
 - (void)dealloc {nmb_queue_release(_handle);}
+- (void)insertDebugCaptureBoundary {}   // GPU capture tools only
 - (id<MTLCommandBuffer>)commandBuffer {
  NmbCommandBuffer *handle=nmb_command_buffer_new(_handle);
  if(!handle){NBLOG(@"native-metal: commandBuffer refused: %@",lastError());return nil;}
@@ -1637,11 +1846,6 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
 // ---- heaps ----
 // Metal heaps over the runtime's: an automatic heap places each resource, a placement heap takes an offset. Resources made from one keep it
 // alive (their `heap`); a heap's resources share its storage mode, CPU cache mode and (here) hazard tracking mode.
-@interface NBHeap : NBObject
-@property(nonatomic) NmbHeap *handle;
-@property(nonatomic) MTLResourceOptions options;
-@property(nonatomic) MTLHeapType heapType;
-@end
 @implementation NBHeap
 - (void)dealloc {nmb_heap_release(_handle);}
 - (NSUInteger)size {return nmb_heap_size(_handle);}
@@ -1797,6 +2001,17 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 - (id<MTLEvent>)newEvent {
  NmbEvent *handle=nmb_event_new(gDevice,false);if(!handle)return nil;
  NBEvent *event=[NBEvent new];event.handle=handle;return (id<MTLEvent>)event;
+}
+- (MTLSizeAndAlign)heapTextureSizeAndAlignWithDescriptor:(MTLTextureDescriptor *)d {
+ NmbTextureDescriptor descriptor;uint64_t out[2]={0,0};
+ if(!textureDescriptor(d,&descriptor) || !nmb_device_heap_texture_size_and_align(gDevice,&descriptor,out))
+  NBLOG(@"native-metal: heapTextureSizeAndAlignWithDescriptor: refused: %@",lastError());
+ return (MTLSizeAndAlign){(NSUInteger)out[0],(NSUInteger)out[1]};
+}
+- (MTLSizeAndAlign)heapBufferSizeAndAlignWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
+ uint64_t out[2]={0,0};
+ if(!nmb_device_heap_buffer_size_and_align(gDevice,length,options,out))NBLOG(@"native-metal: heapBufferSizeAndAlignWithLength: refused: %@",lastError());
+ return (MTLSizeAndAlign){(NSUInteger)out[0],(NSUInteger)out[1]};
 }
 - (id<MTLSharedEvent>)newSharedEvent {
  NmbEvent *handle=nmb_event_new(gDevice,true);if(!handle)return nil;
