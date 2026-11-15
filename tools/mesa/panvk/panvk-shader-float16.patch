@@ -1,0 +1,38 @@
+panvk: shaderFloat16 on Bifrost (v6, v7)
+
+Applied by tools/mk-panvk.sh only, after tools/mesa/*.patch and the panvk patches before it, to Mesa 25.0.7 (Mesa's own licence,
+MIT, applies to the lines it changes). Written for Scion.
+
+Why. Metal's shaders compute in half; CoreAnimation's window server does most of its compositing so. PanVK 25.0 offers no
+shaderFloat16, so metal2vulkan kept Metal's half exact in 32-bit floats: after every half operation an fquantize2f16, a compare with
+zero and a rescale by 2^24 for the denormals, and halves loaded from buffers were unpacked with integer arithmetic. The window server's
+fragment shaders came to 436 instructions and 12.2 cycles a pixel on average (91 of them, BIFROST_MESA_DEBUG=shaderdb), its
+simplest textured quads to 150 instructions; a fragment job of the home screen took 3.3 ms, about 20 ms of the GPU a frame while
+swiping, against OpenGL ES's 4 ms for the same screen.
+
+What. Bifrost does 16-bit float arithmetic natively (OpenGL ES's mediump runs on it in panfrost), and the compiler takes back to 32
+bits what it has no 16-bit form of (bi_lower_bit_size). panvk_physical_device.c: shaderFloat16 on v6 and v7; the 16-bit float
+controls it already states (denormals preserved or flushed, both roundings) are the hardware's. Valhall and later are unchanged
+(not tried here).
+
+Checked on the phone (Mali-G72, PanVK by HAKIOS_VK_ICD): metal2vulkan then emits native halves (no fquantize2f16 left in the window
+server's shaders); its fragment shaders 306 instructions and 9.1 cycles a pixel on average (103 of them); fragment jobs of the
+swipes 2.0 to 2.3 ms, the GPU 9 to 14 ms a frame; the home screen, widgets and dock drawn as before. metal_tri plain, --fetch
+(256, 1024, over an IOSurface), --surface, --ycbcr, --xr over/add, --texel-buffer 16, 6912 --a8, 256 --blit, 64 --render and
+--surface --size 1125 --row-bytes 4608 --frames 30 pass.
+
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -346,7 +346,11 @@
+       .storagePushConstant8 = false,
+       .shaderBufferInt64Atomics = false,
+       .shaderSharedInt64Atomics = false,
+-      .shaderFloat16 = false,
++      /* Scion: Bifrost (v6, v7) does 16-bit float arithmetic natively, as OpenGL ES's mediump does on it
++       * (bi_lower_bit_size takes back to 32 bits what it has no 16-bit form of). Without the feature,
++       * metal2vulkan emulated Metal's half exactly in 32-bit floats (fquantize2f16 and a denormal
++       * rescale after every operation). */
++      .shaderFloat16 = arch <= 7,
+       .shaderInt8 = true,
+ 
+       .descriptorIndexing = false,
