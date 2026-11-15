@@ -1395,3 +1395,112 @@ again. Photos and Maps went to the frontend's work in parallel.
 **Needs an image:** the kernel (xnu `bf3119040de5`, `make kernel`) for the two-layer tiles; PanVK with
 `panvk-tile-input-attachments.patch` and `panvk-shader-float16.patch` (`tools/mk-panvk.sh ios` re-extracts Mesa: the patch list
 changed) for the window server's frame rate.
+
+## Apple apps (15 November 2026, on build 63)
+
+Apple's own Metal applications: Maps first, then Photos, the Camera's location prompt and Weather's map. Build 63, `metal=2`, the
+window server on Metal. Locations are never written here: the map in every test below is a fixed public place that a test
+program chose, not the phone's.
+
+### Maps: VectorKit's shaders are in the IPSW, and the image left them out
+
+The earlier conclusion ("Maps (VectorKit): the honest route", phase 1) was that 20F66 ships VectorKit's map shaders only as Apple GPU
+binaries, so a Simulator runtime's `default.metallib` would be needed. **That was wrong.** It was read from `sysimage/rootfs`, which
+holds only what `sysimage/select-system.py` chose. The full listing of the root filesystem (`sysimage/rootfs.slt`, `7z l -slt
+rootfs.dmg`) has the library:
+
+| File in 20F66's root filesystem | Size | What it is |
+|---|---|---|
+| `VectorKit.framework/default.metallib` | 2 466 580 bytes | `MTLB` 1.2, **AIR**: 309 functions (141 vertex, 166 fragment, 2 kernel): `DaVinci::ground_*`, ribbons, glyphs, icons, buildings, flyover, globe, traffic and the rest |
+| `VectorKit.framework/iphoneos.pipelinelib/functions` | 0 bytes | empty |
+| `VectorKit.framework/iphoneos.pipelinelib/pipelines.g{5,9,10..15}{p,g}` | about 1.6 MB each | `LPPM` archives of 345 `MH_OBJECT` Mach-Os each, CPU type `0x01000013` (Apple GPU), sections `__vertex`, `__fragment`, `__compute`, `__text`: AGX machine code, no AIR and no bitcode |
+| `VectorKit.framework/iphoneos.pipelinelib/pipelines.desc` | 502 020 bytes | the pipelines, by `default_<function>_<constants hash>`, naming `default.metallib` |
+| `VectorKit.framework/metal_libraries/AlloyCommonLibrary.metallib` | 46 569 bytes | AIR, 13 clear and text functions (in the image) |
+
+The library was left out by the 2 MiB rule (`MAX_METALLIB`). The dyld cache holds no other copy (no `MTLB` container and no MSL
+source in VectorKit's text). The pipeline archives would be useless anyway, so the AIR library is the only route, and it is the
+user's own image, not a file to supply from elsewhere.
+
+**How VectorKit asks for its shaders** (20F66's cache, offsets in VectorKit):
+
+- `+0xfc0c8`: `-newPipelineLibraryWithFilePath:error:` on `iphoneos.pipelinelib` in the bundle `com.apple.VectorKit`. It is optional:
+  a nil answer is kept as no pipeline library.
+- `+0x121b70`: `-newDefaultLibraryWithBundle:error:` (besides `-newLibraryWithData:` and `-newLibraryWithSource:` paths it does not take
+  here). On failure it logs "Compiler error for library from bundle '%s': %@".
+- `+0x92eee4`: `-[MTLLibrary newFunctionWithName:constantValues:pipelineLibrary:error:]` for every map shader, with the pipeline
+  library it got, or nil; then `-setPipelineLibrary:` on the pipeline descriptor.
+
+On build 63 Maps opens the device and logs "Compiler error for library from bundle 'StandardLibrary': the bundle has no
+default.metallib", then "Failed to create library for function 'GridShader' with constants:0", and draws nothing.
+
+Other libraries over 2 MiB that the image leaves out, for later (nothing has asked for them yet): Espresso's (29 MB), MPS neural
+network and NDArray (25 and 22 MB), AvatarKit (16 MB), `NRFV3.bundle` (4.2 MB), CoreImage's `ci_filters_stitchable.metallib`
+(4.2 MB), CoreRE (3.6 MB), `MTLBVHBuilder.metallib` (3.6 MB), MPSMatrix (3.2 MB), VFX (3.2 MB), HDRProcessing (2.3 MB), VideoToolbox
+(2.2 MB) and SceneKit (2.2 MB). WeatherMaps' two libraries are under the limit and in the image.
+
+### What was missing, and is now there
+
+| Commit | What | Found by |
+|---|---|---|
+| `43a77e1` | `sysimage/select-system.py` keeps `VectorKit.framework/default.metallib` (`KEEP_METALLIB`) | the listing above |
+| `2296ec6` | the frontend answers `-newFunctionWithName:constantValues:pipelineLibrary:error:` on its libraries: the function is specialized from the library's AIR, the pipeline library (never opened on this device) ignored; nil constants give the plain function | MapKit threw `unrecognized selector` at its first shader |
+| `179f38f` | a render pass's resolve textures reach the runtime: `NmbRenderPassDescriptor` gains each attachment's resolve texture, level, slice and depth plane (appended, all zero for a pass without resolves) and the bridge sets metal2vulkan's own `resolve_*` fields. The frontend and `libmetal2vulkan.dylib` must be built together | VectorKit draws the map four times multisampled (every map pipeline `samples=4`) and resolves into its drawable: 500 to 900 draws a frame, and every pixel of the drawable read back 0 at present |
+| `c43f9a4` | `tools/mesa/panvk/panvk-masked-rt-fpk.patch`: a draw whose write mask leaves a render target alone does not allow forward pixel kill (JM) | the fault reported by MaliMetal (`0008-panvk-masked-rt-not-written.patch`); our own fix. Not seen to change VectorKit's map; it removes a way for stencil and depth masks to leave tiles at the clear colour |
+
+**How it was tried without an image.** Maps is on the system volume and takes no test plug-in, so a test application (not committed)
+stood in for it: an `MKMapView`, its executable re-run with `DYLD_LIBRARY_PATH` naming the test frontend and runtime (and
+`HAKIOS_VK_ICD` a test PanVK), and VectorKit's `NSBundle` lookup of `default.metallib` answered with a copy of the image's own library
+on the phone's data volume. With the three changes:
+
+- every map pipeline is made (`pipelines.log`, `ok=1`; no refusal), MapKit's specializations included;
+- the map draws: streets, parks, water, labels, icons, the Apple Maps logo and the legal label, right in colour and position, as on an
+  iPhone (seen full screen, where the window server hands the drawable to the display as a layer of its own);
+- with PanVK built from the image's patch set plus `panvk-masked-rt-fpk.patch`, the map is the same.
+
+### The next wall: an application's GPU-drawn layer that the window server composites shows black
+
+The map is right when its CAMetalLayer is detached (full screen: the display blends it under the window server's frame, kernel log
+"surfaces in layers 0x3"). When the window server has to composite the layer itself (the same `MKMapView` inset in its window,
+"layers 0x2"), the layer is opaque black, frame after frame. Measured with the test application:
+
+| present of the drawable | composited map |
+|---|---|
+| as the frontend does it (after the GPU work that writes the drawable is complete, `waitForResource`) | black |
+| the same, waiting for every command buffer in flight | black |
+| the same, then 8 ms or 1.5 ms later | right (1.5 ms: right in one run of two) |
+| the same, with a lock and unlock for writing first (the surface's seed changes as at a processor's write; HakiosMali then cleans its lines before the window server's next job that names it) | right |
+
+The drawable's own pixels are right at present (read back by the processor in the application), and its seed changes at every
+present (the GPU write is announced, `hakios_drm_surface_written`). MetalTriXR's composited layer is right because the frontend
+converts its extended-range pixels on the processor at present. So something between the application's completed job and the window
+server's sampling job is not ordered: a delay or a processor-write announcement hides it, waiting longer in the application does not.
+This is the most likely cause of the black grid in Photos (its library view is a CAMetalLayer the window server composites, 36
+pipelines all made, no refusal) and it will hide the Camera prompt's and Weather's maps as well. It sits on the kernel and compositor
+side (HakiosMali's job completion and surface maintenance, MiniIOSurface, CoreAnimation's compositing dependencies: every CAMetalLayer
+logs "IOSurfaceSharedEventAddEventListener failed: e00002c7", as MiniIOSurface has no shared events), so it is left to that work; a
+delay or a forced processor-write announcement in the frontend would only hide it.
+
+**PanVK with the newer patches.** Built from `star2-bringup` at `22b4385` (with `panvk-tile-input-attachments.patch` and
+`panvk-shader-float16.patch`), the map's water is dark and speckled and its rail lines black. Without `panvk-shader-float16.patch` it
+is the same; with the image's patch set plus `panvk-masked-rt-fpk.patch` only, it is right. So `panvk-tile-input-attachments.patch`
+changes what VectorKit's map draws, and needs a look before it is in an image.
+
+### Photos, the Camera, Weather
+
+- **Photos** opens past "What's New" to the library, whose grid is black (above). Its 36 pipelines (`vertex_main`/`fragment_main`,
+  one sample) are all made; `newTextureLayoutWithDescriptor:isHeapOrBufferBacked:` (not implemented) was asked 4 times in one session.
+  Opening an image and editing were not reached while the grid is black.
+- **The Camera's location prompt** and **Weather's map** are VectorKit's: they need the image with VectorKit's library, and then the
+  compositing wall above.
+- **Weather** itself opens and draws its gradient; it shows no data on this phone.
+
+### Needs an image
+
+- `sysimage/unpack.sh` again (select-system.py changed, so it lists and extracts again), so that the root filesystem has
+  `VectorKit.framework/default.metallib`.
+- `libmetal2vulkan.dylib` with the new bridge (`tools/metal/mk-metal2vulkan.sh ios`) and the `METAL=vk` plug-in built with it (the
+  render pass descriptor grew: both together).
+- PanVK with `panvk-masked-rt-fpk.patch` (`tools/mk-panvk.sh` extracts again: the patch list changed).
+
+Then Maps' map should draw where its layer is detached (Maps' main view is full screen), and the composited cases wait for the wall
+above.
