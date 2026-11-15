@@ -384,6 +384,8 @@ static struct {
 	uintptr_t base;
 	bool rgb;                       /* base is w x h RGB888 as it goes out (a camshot), not the panel's BGRA */
 	uint64_t start;
+	uint8_t *copy;                  /* a shot's pixels as they were when it was asked for (shot_freeze()), or NULL */
+	size_t copy_size;
 } shot;
 static uint64_t n_shots;
 
@@ -835,16 +837,55 @@ shot_fill(void)
 	out[1] = 'N';
 	out[2] = 'D';
 	out[3] = '\n';
-	shot.phase = SHOT_OFF;
-	n_shots++;
 	{
+		const char *what = shot.copy != NULL ? "shot" : shot.rgb ? "camshot" : "shot (read as it went out)";
 		uint64_t ns;
 
+		if (shot.copy != NULL) {
+			kfree_data(shot.copy, shot.copy_size);
+			shot.copy = NULL;
+		}
+		shot.phase = SHOT_OFF;
+		n_shots++;
 		absolutetime_to_nanoseconds(mach_absolute_time() - shot.start, &ns);
-		con("usb: %s %llu sent: %ux%u, %u bytes of pixels in %llu ms\n", shot.rgb ? "camshot" : "shot", n_shots, shot.w,
-		    shot.h, shot.sent, ns / NSEC_PER_MSEC);
+		con("usb: %s %llu sent: %ux%u, %u bytes of pixels in %llu ms\n", what, n_shots, shot.w, shot.h, shot.sent,
+		    ns / NSEC_PER_MSEC);
 	}
 	return 4;
+}
+
+/*
+ * A shot's pixels taken now, into memory of its own, and sent from there (as a camshot's are). Read while they went out,
+ * after the log before them, the pixels were those of a surface the window server may already be drawing its next frame
+ * into: with fb_zc the buffer VGF0 scans out is one of backboardd's two surfaces, drawn into again as soon as the flip
+ * after it is taken (fb_swapwait), and 0.1 s of sending spans several. The shot then showed a band of the GPU's tiles of
+ * a later frame across the whole width over the earlier one (the "band of white blocks" of the zoom that opens an
+ * application, docs/metal.md): the shot's, not the panel's. Without the memory the pixels are read as they go out.
+ */
+static void
+shot_freeze(void)
+{
+	size_t size = (size_t)shot.w * shot.h * 3;
+	uint8_t *copy = kalloc_data(size, Z_NOWAIT);
+
+	if (copy == NULL) {
+		return;
+	}
+	for (uint32_t y = 0, at = 0; y < shot.h; y++) {
+		const volatile uint32_t *row = (const volatile uint32_t *)(shot.base + (size_t)(y * shot.n + shot.n / 2) * shot.rowbytes);
+
+		for (uint32_t x = 0; x < shot.w; x++, at += 3) {
+			uint32_t px = row[x * shot.n + shot.n / 2];      /* B G R A in memory */
+
+			copy[at] = (uint8_t)(px >> 16);
+			copy[at + 1] = (uint8_t)(px >> 8);
+			copy[at + 2] = (uint8_t)px;
+		}
+	}
+	shot.copy = copy;
+	shot.copy_size = size;
+	shot.base = (uintptr_t)copy;
+	shot.rgb = true;
 }
 
 /* the console's "shot [N]": the panel's picture, every Nth pixel, queued behind what the log has already said */
@@ -884,6 +925,10 @@ shot_begin(const char *arg)
 		con("usb: shot failed: one is on its way already\n");
 		return;
 	}
+	if (shot.copy != NULL) {                /* (a shot the link dropped on its way) */
+		kfree_data(shot.copy, shot.copy_size);
+		shot.copy = NULL;
+	}
 	shot.rgb = false;
 	shot.n = n;
 	shot.w = width / n;
@@ -891,6 +936,7 @@ shot_begin(const char *arg)
 	shot.rowbytes = rowbytes;
 	shot.base = base;
 	shot.sent = 0;
+	shot_freeze();
 	if (scanned != 0) {
 		con("usb: shot: %s buffer %u (%ux%u, %u bytes a row), every %uth pixel: %ux%u RGB, %u bytes, after this line\n",
 		    scanned == 2 ? "fb_dpp: VGF0's" : "fb_flip: the shown", index, width, height, rowbytes, n, shot.w, shot.h,
@@ -918,6 +964,10 @@ hakios_usb_picture(uintptr_t rgb, uint32_t width, uint32_t height, const char *w
 	}
 	if (!os_atomic_cmpxchg(&shot.phase, SHOT_OFF, SHOT_PREP, acq_rel)) {
 		return -1;
+	}
+	if (shot.copy != NULL) {
+		kfree_data(shot.copy, shot.copy_size);
+		shot.copy = NULL;
 	}
 	shot.rgb = true;
 	shot.n = 1;
