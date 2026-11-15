@@ -1812,3 +1812,27 @@ What is left to find is on the client side, or in CoreAnimation's choice of what
 snapshot image (the zoom view keeps only its black background), or the IOSurface-backed CGImage is dropped when it is
 encoded for the server. The next step is a probe in SpringBoard (the zoom view's `-setContents:` and the image it gets).
 `eagl.c` is not the cause.
+
+## Where this stands (16 November 2026, after build 67)
+
+On the phone (build 67, kernel cde185b; the S9+ defaults of scion-star2lte 00fb90c):
+
+| | |
+|---|---|
+| Window server | OpenGL ES (camtl=0; camtl=1 for Metal), home screen 56-59 frames a second while swiping |
+| Applications | Metal on PanVK and metal2vulkan; MAME4iOS 60, PPSSPP through MoltenVK, Maps and Photos drawn |
+| GPU clock | up to the APM's 598 MHz while frames are shown, 260 idle, 455 at most from 85 C |
+| Two layers | the display's own windows (fb_planes; fb_planes=0 for the CPU blend), 0.2-0.8 ms in the driver |
+| Resprings | every backboardd/SpringBoard exit in the build 66 and 67 logs was a test's killall; none by itself |
+
+Open, in order:
+
+1. Maps' GPU time, 15-66 ms a frame (9-23 frames a second panning): VectorKit through metal2vulkan
+   and PanVK. Measure per pipeline (shaderdb), then the translation's costs as 0012 did for the
+   filter; then frames in flight. An unfinished sRGB probe and bridge policy line from the last
+   attempt are in a stash of the metal-work worktree, untested.
+2. The black window while an application zooms open: its 420f launch snapshot never reaches the
+   window server (not eagl.c); whether SpringBoard sets it or CoreAnimation drops it is next.
+3. The kernel's `shot` fix (4d43752) is committed and not yet on the phone.
+4. Weather has no data: WeatherKit needs a FairPlay (Mescal) signature from Apple hardware
+   (AMSFairPlayGetHardwareInfo -42184, "Mescal Failed"). Not something to work around.
