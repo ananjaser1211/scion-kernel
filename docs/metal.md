@@ -1623,3 +1623,16 @@ frames a second on Metal, and VectorKit's water and rail lines are right with th
 2. A non-opaque `CAMetalLayer` with `presentsWithTransaction` and display sync off: the window server's transposed framebuffer (above).
 3. Idle and partial frames: a pass that loads everything could have its fragment job's extent cut to what its draws touch, once
    transient attachments are not written back (the test patch above).
+
+### On the phone, build 65
+
+Kernel with xnu 7e2114893101 (a layer a swap does not name keeps what it
+showed) and PanVK with the corrected tile-input-attachments patch; the
+plug-in and metal2vulkan as in build 64.
+
+- Maps: the map view is drawn, and stays drawn while the map is panned
+  and the UI around it changes. Panning runs at about 6 frames a second
+  (about 57 ms of GPU a frame): the next wall for Maps.
+- Photos: the grid shows its pictures.
+- MAME4iOS (Gridlee): 58 frames a second, drawn correctly.
+- Home screen, continuous swiping: 20 frames a second (GLES 43-45).
