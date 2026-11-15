@@ -1636,3 +1636,36 @@ plug-in and metal2vulkan as in build 64.
 - Photos: the grid shows its pictures.
 - MAME4iOS (Gridlee): 58 frames a second, drawn correctly.
 - Home screen, continuous swiping: 20 frames a second (GLES 43-45).
+
+## Where this stands (end of the build 65 work)
+
+Working on the phone with build 65: the window server on Metal by default
+(GLES as the fallback), MAME4iOS at 58 frames a second, PPSSPP through
+MoltenVK, Maps' map view and Photos' grid drawn and kept on screen
+(xnu 7e2114893101). Open: speed. The home screen while swiping is at
+20 frames a second on Metal against 43-45 on GLES (about 23 ms of GPU a
+frame against 7), and Maps pans at about 6.
+
+### Against MaliMetal, the working Mali-G610 stack
+
+github.com/Ken-u/MaliMetal (RK3588, Mali-G610 CSF, iPadOS 17) has the same
+shape as ours: PanVK for arm64-apple-ios, a libdrm stand-in on an IOKit
+user client, metal2vulkan (the same pinned revision 720ef1ce) behind a
+backboardd Metal plug-in. It reports about 50 frames a second while
+scrolling the home screen, and only with these, which ours does not do yet:
+
+1. Zero-copy scanout fenced on the GPU: the swap goes to the display when
+   the command buffer is scheduled, and the display waits on the GPU's
+   fence, so CPU, GPU and refresh overlap. Ours runs them one after the
+   other (render thread, then GPU, then the swap wait), and
+   MiniIOMobileFramebuffer still copies and blends layers on the CPU.
+2. The GPU clock fixed high (750 MHz there). Ours is left to DVFS.
+3. The YCbCr pass on the device's own filter.
+4. The big cores numbered first, so the render server's threads land on them.
+
+Its eleven Mesa patches (on Mesa 26.1-devel) overlap ours: host-pointer
+import, external buffers and images, rasterization-order access, masked
+render targets that are not written, forward pixel kill past an unwritten
+attachment. Its numbers come from a Valhall CSF GPU, a much stronger part
+than the 9810's Bifrost G72, so 1 and 2 are where to start here; the
+shader cost per frame (above) is ours to cut on top of them.
