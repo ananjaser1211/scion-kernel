@@ -1,0 +1,26 @@
+panvk: a draw that writes no colour to a render target does not kill the pixels under it (JM: Bifrost and Midgard)
+
+Applied by tools/mk-panvk.sh only, after tools/mesa/*.patch and the other tools/mesa/panvk patches, to Mesa 25.0.7 (Mesa's own
+licence, MIT, applies to the lines it changes). Written for Scion. The fault was first found in
+github.com/Ken-u/MaliMetal (mesa-patches/0008-panvk-masked-rt-not-written.patch, MIT); this fix is our own.
+  - jm/panvk_vX_cmd_draw.c: allow_forward_pixel_to_kill was set from the render targets the fragment shader writes. A render
+    target whose write mask is empty, or whose colour write is disabled, is written by the shader but not by the draw: the blend
+    descriptor already gives it colour mask 0 and does not read it. Counted as written, the draw let the tiler kill the earlier
+    fragments it covered, and with nothing written in their place a covered tile kept the clear colour (black). Metal draws with
+    MTLColorWriteMaskNone for stencil and depth masks (VectorKit's stenciled clears, CoreAnimation's masks), which metal2vulkan
+    makes as a zero write mask. Such a render target now counts as unwritten, so the draw keeps forward pixel kill off.
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+@@ -267,6 +267,12 @@
+          }
+ 
+          uint8_t rt_written = fs_info->outputs_written >> FRAG_RESULT_DATA0;
++         /* Scion: a render target this draw does not write (its write mask is empty, or its color write is disabled) keeps what
++          * earlier draws put there, so the draw must not kill their pixels; the blend descriptor already treats it as unwritten. */
++         for (unsigned i = 0; i < MIN2(cb->attachment_count, 8); i++) {
++            if (!cb->attachments[i].write_mask || !(cb->color_write_enables & BITFIELD_BIT(i)))
++               rt_written &= ~BITFIELD_BIT(i);
++         }
+          uint8_t rt_mask = cmdbuf->state.gfx.render.bound_attachments &
+                            MESA_VK_RP_ATTACHMENT_ANY_COLOR_BITS;
+          cfg.properties.allow_forward_pixel_to_kill =
