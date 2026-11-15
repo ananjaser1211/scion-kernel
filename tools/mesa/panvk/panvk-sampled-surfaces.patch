@@ -1,0 +1,201 @@
+panvk: every IOSurface the device imported is named in each job chain's buffer list, as one it may read (Darwin only)
+
+Applied by tools/mk-panvk.sh only, after tools/mesa/*.patch and panvk-host-memory.patch, to Mesa 25.0.7 (Mesa's own
+licence, MIT, applies to the lines it adds). Written for Scion.
+
+Why. HakiosMali cleans the lines a processor wrote into an IOSurface before a job only for the buffers the submission
+names (scion-kernel drivers/gpu/mali, phase 8 of docs/metal.md). PanVK's JM submission names its pools, the framebuffer,
+a blit's two ends and the tiler heap, never a buffer or image a shader samples: a texture over a surface the CPU wrote,
+which the GPU only reads, was read stale (zeros in 5 of 6 runs of an 8x8 surface; docs/metal.md, "Real apps").
+
+What. The device keeps the IOSurfaces it imported as memory (panvk_AllocateMemory, panvk_FreeMemory). Each batch names
+those its own list does not with HAKIOS_DRM_BO_SAMPLED (tools/mesa/hakios-drm): the kernel cleans a surface's lines
+before the job where its seed says a processor may have written them since the last clean (a seed comparison for the
+others), keeps the buffer until the job is done, and does not hold the display back for a job that only reads the
+surface. hakios-drm takes the bit off for a kernel that does not take it, which then names them as any other buffer.
+
+--- a/src/panfrost/vulkan/jm/panvk_vX_queue.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_queue.c
+@@ -29,6 +29,10 @@
+ 
+ #include "drm-uapi/panfrost_drm.h"
+ 
++#ifdef __APPLE__
++#include <xf86drm.h> /* HAKIOS_DRM_BO_SAMPLED */
++#endif
++
+ static void
+ panvk_queue_submit_batch(struct panvk_queue *queue, struct panvk_batch *batch,
+                          uint32_t *bos, unsigned nr_bos, uint32_t *in_fences,
+@@ -219,6 +223,22 @@
+    unsigned nr_semaphores = submit->wait_count + 1;
+    uint32_t semaphores[nr_semaphores];
+ 
++#ifdef __APPLE__
++   /* The device's IOSurfaces as they are now (panvk_device.h: host_surfaces):
++    * each batch names those its own list does not as buffers it may read. */
++   simple_mtx_lock(&dev->host_surfaces.lock);
++   unsigned nr_surfaces = util_dynarray_num_elements(&dev->host_surfaces.bos,
++                                                     struct pan_kmod_bo *);
++   uint32_t surfaces[nr_surfaces ? nr_surfaces : 1];
++   for (unsigned i = 0; i < nr_surfaces; i++)
++      surfaces[i] = pan_kmod_bo_handle(*util_dynarray_element(
++         &dev->host_surfaces.bos, struct pan_kmod_bo *, i));
++   simple_mtx_unlock(&dev->host_surfaces.lock);
++#else
++   const unsigned nr_surfaces = 0;
++   uint32_t surfaces[1];
++#endif
++
+    semaphores[0] = queue->sync;
+    for (unsigned i = 0; i < submit->wait_count; i++) {
+       assert(vk_sync_type_is_drm_syncobj(submit->waits[i].sync->type));
+@@ -241,7 +261,7 @@
+                            (batch->blit.dst ? 1 : 0) +
+                            (batch->vtc_jc.first_tiler ? 1 : 0) + 1;
+          unsigned bo_idx = 0;
+-         uint32_t bos[nr_bos];
++         uint32_t bos[nr_bos + nr_surfaces];
+ 
+          panvk_pool_get_bo_handles(&cmdbuf->desc_pool, &bos[bo_idx]);
+          bo_idx += panvk_pool_num_bos(&cmdbuf->desc_pool);
+@@ -277,6 +297,21 @@
+             }
+          }
+ 
++         /* An imported IOSurface the batch may sample: HakiosMali cleans
++          * what a processor wrote into it before the job (by its seed: a
++          * surface nobody wrote since is not cleaned again), keeps it until
++          * the job is done, and does not hold the display back for the job,
++          * which only reads it. */
++         unsigned nr_listed = nr_bos;
++         for (unsigned s = 0; s < nr_surfaces; s++) {
++            bool listed = false;
++
++            for (unsigned x = 0; x < nr_listed && !listed; x++)
++               listed = bos[x] == surfaces[s];
++            if (!listed)
++               bos[nr_bos++] = surfaces[s] | HAKIOS_DRM_BO_SAMPLED;
++         }
++
+          unsigned nr_in_fences = 0;
+          unsigned max_wait_event_syncobjs = util_dynarray_num_elements(
+             &batch->event_ops, struct panvk_cmd_event_op);
+--- a/src/panfrost/vulkan/panvk_device.h
++++ b/src/panfrost/vulkan/panvk_device.h
+@@ -22,6 +22,7 @@
+ #include "kmod/pan_kmod.h"
+ #include "util/pan_ir.h"
+ #include "util/perf/u_trace.h"
++#include "util/u_dynarray.h"
+ 
+ #include "util/vma.h"
+ 
+@@ -44,6 +45,19 @@
+    struct panvk_priv_bo *tiler_heap;
+    struct panvk_priv_bo *sample_positions;
+ 
++#ifdef __APPLE__
++   /* The IOSurfaces imported as memory (panvk_AllocateMemory). Every job
++    * chain names each of them as a buffer it may read (jm/panvk_vX_queue.c):
++    * HakiosMali cleans the lines a processor wrote into a surface before a
++    * job only for the buffers the submission names, and a surface the GPU
++    * only samples is in no list of PanVK's own (the framebuffer, a blit's
++    * ends). */
++   struct {
++      simple_mtx_t lock;
++      struct util_dynarray bos; /* struct pan_kmod_bo * */
++   } host_surfaces;
++#endif
++
+    struct {
+       struct panvk_priv_bo *handlers_bo;
+       uint32_t handler_stride;
+--- a/src/panfrost/vulkan/panvk_device_memory.c
++++ b/src/panfrost/vulkan/panvk_device_memory.c
+@@ -193,6 +193,7 @@
+             goto err_destroy_mem;
+          }
+          mem->bo = pan_kmod_bo_import(device->kmod.dev, (int)surface, 0);
++         mem->host_surface = mem->bo != NULL;
+       } else if (pAllocateInfo->memoryTypeIndex == 1 &&
+                  panvk_host_pages_syncable(device->kmod.dev->fd) &&
+                  ((uintptr_t)host_info->pHostPointer & page) == 0 &&
+@@ -260,6 +261,15 @@
+ 
+    mem->addr.dev = op.va.start;
+ 
++#ifdef __APPLE__
++   if (mem->host_surface) {
++      simple_mtx_lock(&device->host_surfaces.lock);
++      util_dynarray_append(&device->host_surfaces.bos, struct pan_kmod_bo *,
++                           mem->bo);
++      simple_mtx_unlock(&device->host_surfaces.lock);
++   }
++#endif
++
+    if (fd_info) {
+       /* From the Vulkan spec:
+        *
+@@ -324,6 +334,15 @@
+ 
+    panvk_memory_munmap(mem);
+ 
++#ifdef __APPLE__
++   if (mem->host_surface) {
++      simple_mtx_lock(&device->host_surfaces.lock);
++      util_dynarray_delete_unordered(&device->host_surfaces.bos,
++                                     struct pan_kmod_bo *, mem->bo);
++      simple_mtx_unlock(&device->host_surfaces.lock);
++   }
++#endif
++
+    struct pan_kmod_vm_op op = {
+       .type = PAN_KMOD_VM_OP_TYPE_UNMAP,
+       .va = {
+--- a/src/panfrost/vulkan/panvk_device_memory.h
++++ b/src/panfrost/vulkan/panvk_device_memory.h
+@@ -25,6 +25,8 @@
+     * more (hakios_drm_host_pages_sealed): their lines were cleaned at the
+     * import, and stay clean */
+    bool host_sealed;
++   /* an IOSurface's buffer, in the device's host_surfaces */
++   bool host_surface;
+ #endif
+ 
+    struct {
+--- a/src/panfrost/vulkan/panvk_vX_device.c
++++ b/src/panfrost/vulkan/panvk_vX_device.c
+@@ -298,6 +298,10 @@
+    simple_mtx_init(&device->as.lock, mtx_plain);
+    util_vma_heap_init(&device->as.heap, user_va_start,
+                       user_va_end - user_va_start);
++#ifdef __APPLE__
++   simple_mtx_init(&device->host_surfaces.lock, mtx_plain);
++   util_dynarray_init(&device->host_surfaces.bos, NULL);
++#endif
+ 
+    panvk_device_init_mempools(device);
+ 
+@@ -395,6 +399,10 @@
+    pan_kmod_vm_destroy(device->kmod.vm);
+    util_vma_heap_finish(&device->as.heap);
+    simple_mtx_destroy(&device->as.lock);
++#ifdef __APPLE__
++   util_dynarray_fini(&device->host_surfaces.bos);
++   simple_mtx_destroy(&device->host_surfaces.lock);
++#endif
+ 
+ err_destroy_kdev:
+    pan_kmod_dev_destroy(device->kmod.dev);
+@@ -431,6 +439,10 @@
+    pan_kmod_vm_destroy(device->kmod.vm);
+    util_vma_heap_finish(&device->as.heap);
+    simple_mtx_destroy(&device->as.lock);
++#ifdef __APPLE__
++   util_dynarray_fini(&device->host_surfaces.bos);
++   simple_mtx_destroy(&device->host_surfaces.lock);
++#endif
+ 
+    if (device->debug.decode_ctx)
+       pandecode_destroy_context(device->debug.decode_ctx);
