@@ -887,6 +887,20 @@ static std::string quartzCoreCallers();
  NSError *error=nil;id<MTLFunction> function=[self newFunctionWithDescriptor:d error:&error];
  handler(function,error);
 }
+// SPI of _MTLLibrary: a function specialized with the help of a precompiled pipeline library, which holds Apple GPU binaries only. This
+// device opens none (-newPipelineLibraryWithFilePath:error: answers nil), so the function is specialized from the library's AIR as
+// -newFunctionWithName:constantValues:error: does. VectorKit asks for every map shader this way (VectorKit+0x92eee4), with the
+// pipeline library it was given, or nil.
+- (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values pipelineLibrary:(id)pipelineLibrary
+                                 error:(NSError **)error {
+ (void)pipelineLibrary;
+ if(!values){
+  id<MTLFunction> function=[self newFunctionWithName:name];
+  if(error)*error=function?nil:nbError([NSString stringWithFormat:@"function %@: %@",name,lastError()]);
+  return function;
+ }
+ return [self newFunctionWithName:name constantValues:values error:error];
+}
 - (NSArray<NSString *> *)functionNames {
  NSMutableArray *names=[NSMutableArray array];
  for(uint32_t i=0,n=nmb_library_function_count(_handle);i<n;i++) {
