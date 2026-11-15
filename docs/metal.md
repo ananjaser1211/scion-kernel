@@ -1507,3 +1507,13 @@ changes what VectorKit's map draws, and needs a look before it is in an image.
 
 Then Maps' map should draw where its layer is detached (Maps' main view is full screen), and the composited cases wait for the wall
 above.
+
+#### On the phone, build 64 (kernel with xnu bf3119040de5, userland at d03db94: VectorKit's library in the image, PanVK with shaderFloat16 and masked-rt-fpk, without the tile-buffer input attachments)
+
+- `metal_tri` passes.
+- Two-layer frames by tiles: MAME4iOS (Gridlee in play) reaches the panel at **59 frames a second**, 6.7–7.1 ms a
+  frame in the driver for the upper layer (build 63: 8 a second, 121 ms). The game draws correctly.
+- Home screen, window server on Metal, six swipes: 27 frames a second (GLES: 32–49; build 63 Metal: 16–29).
+- Maps: VectorKit finds its library and draws (map imagery shows in the strip under the status bar), but the map
+  view itself is black: the window server composites it and shows opaque black, the wall in "Apple apps" (an app's
+  GPU-drawn CAMetalLayer composited by the window server).
