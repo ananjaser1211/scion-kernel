@@ -1762,3 +1762,19 @@ third of the height in Photos, two thirds in Settings), then the application rig
 
 Next: the bridge's trace while an application opens (the 420f texture's formats and the draw that uses it), then the white
 band (a cross-fade frame drawn while the application's surface is half written?).
+
+### On the phone, build 67
+
+Kernel at scion-kernel 3e92cd3 (xnu 465e98532b5c, fb_planes); the system image as build 66.
+fb_planes took on the first two-layer frame: VGF1 after 3 refreshes with no IDMA or DPP
+configuration or status errors, and window 5 blending by its pixels' alpha from then on.
+
+- Maps, slow drags (the map detached as a second layer): every frame on two windows, 0.2-0.6 ms
+  in the driver (build 66: 20-22 ms of CPU blending), 23 frames a second while tiles were loaded
+  and 9 while new ones were fetched and drawn (66 ms of GPU a frame then). Maps is now set by its
+  GPU time: VectorKit through metal2vulkan and PanVK.
+- MAME4iOS (Gridlee): 60 frames a second, every frame on two windows, 0.8 ms in the driver
+  (build 66: 58-59, 7.3 ms).
+- Home screen, continuous swiping: 57 frames a second, one layer, 9 us in the driver.
+- The USB console screenshot reads the top layer only, so a detached layer's frames are checked
+  on the panel itself.
