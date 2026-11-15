@@ -1324,3 +1324,74 @@ layers in its own picture) would take that away. Then RetroArch past its first p
   MAME's commits follow the display (97 ms apart; GPU commit to completion 9 ms, the GPU 4% busy).
   Next: scan the detached layer out in its own DPU window (hardware blending), or blend only where the upper
   layer is not opaque, with NEON.
+
+### The window server's frame rate on Metal (build 63)
+
+The display's own count is the measure here ("N frames in T ms" from MiniIOMobileFramebuffer every five seconds, with "mali: GPU
+busy" beside it), not commit to completion. The run: the phone unlocked on the home screen, then fifteen pairs of page swipes
+(`rwtouch swipe 0.85 0.5 0.15 0.5 200` and back, half a second apart), three five-second windows read while they last. The test
+PanVK was given to the window server alone by `HAKIOS_VK_ICD` (`launchctl setenv` for one restart of backboardd, unset at once).
+
+**Where a frame went.** With build 63's PanVK the window server made 14 frames a second while swiping (OpenGL ES: 48), and the GPU
+was 58 to 60% busy with 2700 to 2900 fragment jobs every five seconds, about 37 a frame at 0.93 ms each (OpenGL ES: 10 a frame at
+0.43 ms). Two causes, both in PanVK:
+
+1. *Framebuffer fetch split every frame into job chains.* metal2vulkan reads Metal's framebuffer fetch (CoreAnimation reads its
+   colour attachment in its luma boost and blend shaders) as an input attachment of the colour attachment, and on a device without
+   rasterization-order access it records a barrier before each fetching draw (tools/metal/m2v/0005). On JM a barrier inside a
+   render pass ends the batch: the tiles are written out and loaded again for the next one. A test PanVK that counted why each
+   fragment batch was closed: 3240 of 5052 by such barriers, 5 to 13 a frame. Frames of several passes took a median 52 ms from
+   commit to completion, most of it submitting the many chains (commit to scheduled 10 to 16 ms).
+   **Fixed** (`tools/mesa/panvk/panvk-tile-input-attachments.patch`): a colour input attachment of the subpass's own, read at the
+   fragment's pixel, is read from the tile buffer (LD_TILE, as panfrost's framebuffer fetch), which Bifrost orders after the
+   earlier fragments at the pixel, and PanVK offers `rasterizationOrderColorAttachmentAccess`; metal2vulkan then records no
+   barrier. No batch is split by a barrier any more (0 of 5637); frames of several passes from commit to completion a median 15 ms,
+   commits a median 33 ms apart (66 before).
+2. *Metal's half emulated in 32-bit floats.* PanVK 25.0 offers no `shaderFloat16`, so metal2vulkan keeps half exact in fp32: an
+   fquantize2f16, a compare and a 2^24 rescale for denormals after every half operation, and halves read from buffers unpacked
+   with integer arithmetic. The window server's 91 fragment shaders averaged 436 instructions and 12.2 cycles a pixel
+   (`BIFROST_MESA_DEBUG=shaderdb`, written to a file by a test build), its plain textured quads 150 instructions.
+   **Fixed** (`tools/mesa/panvk/panvk-shader-float16.patch`): `shaderFloat16` on v6 and v7, whose compiler does fp16 natively (as
+   panfrost's mediump). 103 shaders, 306 instructions and 9.1 cycles a pixel on average; no fquantize2f16 left.
+
+metal_tri (plain, `--fetch` at 256 and 1024 and over a surface, `--surface`, `--ycbcr`, `--xr over|add`, the four
+`--texel-buffer` forms, the 1125-wide surface over 30 frames) passes with both. The home screen, widgets, the dock, Spotlight's
+keyboard and its materials were drawn as before (screenshots).
+
+| continuous swipes (two to three five-second windows) | build 63's PanVK | with both patches |
+|---|---|---|
+| frames a second (display) | 14, 14, 15 (74, 73, 75 frames) | 21, 21 (109, 108 frames) |
+| GPU busy | 58 to 60% | 52, 53% |
+| fragment jobs every 5 s, each | 2770 to 2890, 0.93 to 0.96 ms | 1030 to 1110, 2.1 to 2.4 ms |
+| "waiting for the GPU" a swap | 15.5 ms | 24.6 ms |
+
+(In separate runs of six swipes with pauses, before the continuous ones: tile reads alone 20 to 25 a second with 1.8 to 2.3 s of
+fragment work every five seconds, about the same as before them; with fp16 too, 21 to 34 a second and fragment jobs of 2.0 to 2.3
+ms. The GPU's time a frame went from about 36 ms to 22 while swiping continuously.)
+
+**What is left: the frame's parts follow one another.** backboardd draws into two surfaces and asks SwapWait for the swap it just
+handed over before it draws the next frame (fb_swapwait=1, which keeps the GPU out of the surface the DECON reads). So a frame
+costs the render thread's processor time, then the GPU's, then up to a refresh for the flip, one after the other. With both fixes
+a frame of several passes takes a median 10 ms of the render thread (create to commit: 29 ms of wall time) and 15 ms from commit
+to completion. Next: the processor time of encoding (the frontend and metal2vulkan: 40 to 75 us a draw on comparable cores in
+MaliMetal's notes), the GPU's 22 ms a frame while swiping (its shaders still several times OpenGL ES's: 306 instructions
+on average against tens), and whether backboardd can be given a third surface to draw into while the flip is pending.
+
+**Two layers.** MiniIOMobileFramebuffer drew the window server's surface over a detached layer pixel by pixel, reading the surface
+(write-combined scan-out memory with fb_zc) four bytes at a time: 121 ms a frame. Now (xnu `bf3119040de5`, `drawOver()`) the
+lower layer is copied as before and the upper one is taken in 64-pixel tiles: a tile's row read with one copy, opaque runs copied,
+clear pixels over the lower layer left, the others mixed with the lower layer's pixel read from its own surface. A tile read whole
+is remembered as clear, opaque or mixed while the window server's surface keeps its seed and its last Mali job, and a clear tile is
+not read again; each scan-out buffer remembers the upper layer drawn into it whole and the lower layer's rectangle, and while they
+stay the same only the part of the tiles over the lower layer is drawn. A test of the same code against the per-pixel drawing (40
+frames over three rotating buffers: the window server drawing again, a full-screen lower layer, a moved one) matched it bit for bit;
+in steady state 34 to 60 of 702 tiles were read a frame. Needs the kernel. The display's line then says "N of them two layers, the
+upper one by tiles (M drawn whole): R of its tiles read and S not a frame, U us for it".
+
+**Not retested.** RetroArch: a RetroArch process from before this work (started at 19:31, traced and stopped, `TX`) stays until the
+next boot, and later launches of the bundle wait behind it (wall 3 above), so the asynchronous-pipeline fix was not tried in it
+again. Photos and Maps went to the frontend's work in parallel.
+
+**Needs an image:** the kernel (xnu `bf3119040de5`, `make kernel`) for the two-layer tiles; PanVK with
+`panvk-tile-input-attachments.patch` and `panvk-shader-float16.patch` (`tools/mk-panvk.sh ios` re-extracts Mesa: the patch list
+changed) for the window server's frame rate.
