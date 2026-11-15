@@ -1,0 +1,144 @@
+metal2vulkan: the native 8-bit linear filter wraps its coordinate as Metal does, and PanVK on the Mali-G72 takes it (Scion)
+
+Upstream:  metal2vulkan, https://github.com/steelbrain/metal2vulkan, at 720ef1ce9ae2a2068999a8675717418b9416283e, after
+           AdrenoMetal's 16 patches to it and Scion's 0001 to 0011; tools/metal/mk-metal2vulkan.sh applies them in that order,
+           then this.
+Licence:   GPL-2.0-or-later OR LGPL-3.0-or-later, metal2vulkan's (its LICENSE); this patch is a change to it and under the same
+           terms. Nothing of it is in Scion's MIT or APSL files.
+Author:    the HakiOS authors (Scion), 15 November 2026.
+
+Why. Metal's linear filter of an 8-bit unorm texture is emulated exactly by default (four fetches and about a thousand
+instructions a sample: the class is data, so every format's decode stays in the module). CoreAnimation samples its BGRA8
+layers that way, and on the Galaxy S9's Mali-G72 the two window-server shaders that do it cost 11 of the 23 ms the GPU spends
+on the home screen's main pass while swiping (docs/metal.md). The native arm (the device's filter at the centre of Metal's
+1/256 step, DriverDeviation::Unorm8LinearFilter) is for a device measured within one code of Metal.
+
+What.
+- lower/sampler/native.rs: `cell`, the native coordinate, wraps a repeating or mirrored axis's coordinate by position::wrap,
+  as Metal does (the subtraction rounded up; down at a power-of-two size), not by the plain f32 subtraction. Where -1 < u < 0
+  the plain subtraction rounds to nearest and can cross a step's edge, so the device read the neighbouring step: a weight
+  1/256 off, up to one code of contrast. Clamping axes are unchanged. position::wrap is pub(super) for it.
+- device/driver_facts.rs: Unorm8LinearFilter measured on PanVK, Mesa 25.0.7, on the Mali-G72 (vendor 0x13b5, device
+  0x62210000) by Scion's tools/vk/vk_filter_probe.c: the m2v probe's textures, coordinates and modes, against Metal's filter
+  computed exactly from Metal's position rules: 0.89 of a code at most (0.84 clamp to edge, 0.78 clamp to zero); the
+  device's blend alone, at the step named, the same. With the old wrap it was 1.35 codes, on repeating and mirrored axes.
+
+The policy that takes the deviation (Unorm8LinearFilterPolicy::DeviceWithinOneCode) is the bridge's
+(tools/metal/bridge/NativeMetalObjects.rs).
+
+diff --git a/crates/metal2vulkan/src/device/driver_facts.rs b/crates/metal2vulkan/src/device/driver_facts.rs
+index 7ab05114..24994e8e 100644
+--- a/crates/metal2vulkan/src/device/driver_facts.rs
++++ b/crates/metal2vulkan/src/device/driver_facts.rs
+@@ -383,7 +383,13 @@ pub(crate) fn among<F: Copy + Ord>(
+ /// on LLVM 23.1.1, x86_64, whose filter answers whole codes (EV `SHB-dw-lvp`). It is a bound the
+ /// owner accepted, not Metal's answer. One row per GPU, as measured; lavapipe's on every CPU at
+ /// that release. MoltenVK (whose sampler is Metal's: `MetalSampler`) and lavapipe before Mesa
+-/// 26.2.4 are not measured.
++/// 26.2.4 are not measured. PanVK, Mesa 25.0.7 with Scion's patches on the Mali-G72 MP18 (deviceID
++/// `0x62210000`, the Galaxy S9's), measured by Scion's `tools/vk/vk_filter_probe.c` (the same
++/// textures, coordinates, modes and native coordinate, the wrap rounded as Metal rounds it, against
++/// Metal's filter computed exactly from Metal's position rules, `position`'s module docs; 2026-11-15):
++/// 0.89 of a code at most (mirrored repeat), 0.84 under clamp to edge, 0.78 under clamp to zero; at
++/// the step the coordinate names, the device's blend alone, the same. With the wrap rounded to
++/// nearest (the native coordinate before) it was 1.35 codes, so the row needs that wrap.
+ ///
+ /// Another driver has none of them, as Vulkan states, but a listed driver at a release outside
+ /// its rows, or on another vendor's GPU (or another GPU than a row's), is unmeasured: the profile
+@@ -670,6 +676,14 @@ pub(crate) const DEVIATIONS: &[Measured<DriverDeviation>] = &[
+         DriverId::INTEL_OPEN_SOURCE_MESA,
+         (INTEL_VENDOR_ID, INTEL_UHD_770_RPL_S),
+     ),
++    Measured {
++        fact: DriverDeviation::Unorm8LinearFilter,
++        driver: DriverId::MESA_PANVK,
++        vendor: Some(ARM_VENDOR_ID),
++        device: Some(ARM_MALI_G72),
++        first: mesa(25, 0, 7),
++        last: mesa(25, 0, 7),
++    },
+     Measured {
+         fact: DriverDeviation::Unorm8LinearFilter,
+         driver: DriverId::MESA_LLVMPIPE,
+@@ -683,6 +697,12 @@ pub(crate) const DEVIATIONS: &[Measured<DriverDeviation>] = &[
+ /// NVIDIA's `vendorID`.
+ const NVIDIA_VENDOR_ID: u32 = 0x10de;
+ 
++/// Arm's `vendorID`.
++const ARM_VENDOR_ID: u32 = 0x13b5;
++
++/// The `deviceID` PanVK reports for the Mali-G72 (its product ID `0x6221` in the top half).
++pub(crate) const ARM_MALI_G72: u32 = 0x6221_0000;
++
+ /// The `deviceID` of the GeForce RTX 3090.
+ pub(crate) const NVIDIA_RTX_3090: u32 = 0x2204;
+ 
+diff --git a/crates/metal2vulkan/src/lower/sampler/native.rs b/crates/metal2vulkan/src/lower/sampler/native.rs
+index 3faee30b..b71de6cd 100644
+--- a/crates/metal2vulkan/src/lower/sampler/native.rs
++++ b/crates/metal2vulkan/src/lower/sampler/native.rs
+@@ -17,13 +17,16 @@
+ //! The module hands the device the coordinate of the centre of Metal's step, `X' = q / 256 + 1/2`
+ //! (`position::AxisSnap::Cell`'s), on each plane axis: a device with eight subtexel bits then reads
+ //! Metal's taps and weights, and only its blend of them is its own. The position is the cheap one
+-//! ([`cell`]): the coordinate wrapped into its period by `floor` (a repeating axis's `floor(u)`, a
+-//! mirrored one's `2 floor(u / 2)`, a constexpr sampler's by its address modes, a runtime sampler
+-//! slot's by the modes its word states) and scaled, rounded to nearest. Metal rounds the wrap of
+-//! `-1 < u < 0` up and the product's ties away from zero (`position::position`); where that moves
+-//! `X` across a step's edge (a coordinate within an `f32` unit of it) the device reads the
+-//! neighbouring step, a weight 1/256 off. The bound below is measured with this position (the
+-//! probe's `cell` variant).
++//! ([`cell`]): the coordinate wrapped into its period from `floor` (a repeating axis's `floor(u)`,
++//! a mirrored one's `2 floor(u / 2)`, a constexpr sampler's by its address modes, a runtime sampler
++//! slot's by the modes its word states) as Metal wraps it (`position::wrap`: the subtraction
++//! rounded up, or down at a power-of-two size), and scaled, rounded to nearest. Metal rounds the
++//! product's ties away from zero (`position::position`), which moves a footprint only at a negative
++//! position of a clamping axis or at a size of `2^13` or more; there the device reads the
++//! neighbouring step, a weight 1/256 off. (The wrap was once the plain `f32` subtraction, rounded to
++//! nearest: then a repeating or mirrored axis's `-1 < u < 0` read the neighbouring step wherever
++//! the rounding crossed a step's edge, which on PanVK's Mali-G72, whose blend is off by up to 0.89
++//! of a code, made 1.35 codes; the bounds of the devices measured before were measured with it.)
+ //!
+ //! **The class** ([`CLASSES`]): the slot's `TexelFormat` specialization masked by [`CLASS_MASK`] is
+ //! `EXACT | UNORM` with the channels of `R8Unorm`, `RG8Unorm`, or `RGBA8Unorm` and `BGRA8Unorm`,
+@@ -303,9 +306,9 @@ fn mirror_start(fb: &mut FunctionBuilder<'_>, t: &Tys, u: SValue) -> BResult<SVa
+ 
+ /// The normalized coordinate of the centre of the 1/256 footprint step Metal reads coordinate
+ /// `u` (an `f32`) at, on an axis of size `n` (a `u32`) whose period starts at `start` (an `f32`;
+-/// `None` on a clamping axis): the position `X = (u - start) N`, `c = floor(256 X) + [frac(256 X)
+-/// >= 1/2]` (`q + 128` for Metal's step `q`, as `position::AxisSnap::Cell` reads it), and
+-/// `c / 256 / N`.
++/// `None` on a clamping axis): the position `X = (u - start) N`, the subtraction rounded as Metal
++/// rounds it (`position::wrap`), `c = floor(256 X) + [frac(256 X) >= 1/2]` (`q + 128` for Metal's
++/// step `q`, as `position::AxisSnap::Cell` reads it), and `c / 256 / N`.
+ fn cell(
+     fb: &mut FunctionBuilder<'_>,
+     t: &Tys,
+@@ -314,7 +317,13 @@ fn cell(
+     start: Option<SValue>,
+ ) -> BResult<SValue> {
+     let w = match start {
+-        Some(k) => fb.binary(BinOp::FSub, u, k)?,
++        Some(k) => {
++            let one = scalar(fb, t.u32_, 1)?;
++            let one = value(fb, one)?;
++            let zero = scalar(fb, t.u32_, 0)?;
++            let zero = value(fb, zero)?;
++            super::position::wrap(fb, u, k, n, (one, zero))?
++        }
+         None => u,
+     };
+     let f = fb.module().ty(SType::Float { width: 32 })?;
+diff --git a/crates/metal2vulkan/src/lower/sampler/position.rs b/crates/metal2vulkan/src/lower/sampler/position.rs
+index 6b52b1c5..fe987e46 100644
+--- a/crates/metal2vulkan/src/lower/sampler/position.rs
++++ b/crates/metal2vulkan/src/lower/sampler/position.rs
+@@ -737,7 +737,7 @@ fn scale(
+ /// negative) is its bits plus one; it lies below `s` exactly when `u < z`, and then the next `f32`
+ /// down is its bits minus one. The three float operations are `NoContraction`: a device rounds each
+ /// on its own and never folds `(u - k) + k` to `u`.
+-fn wrap(
++pub(super) fn wrap(
+     fb: &mut FunctionBuilder<'_>,
+     u: SValue,
+     k: SValue,

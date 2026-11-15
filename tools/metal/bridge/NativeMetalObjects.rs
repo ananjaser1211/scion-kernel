@@ -190,6 +190,11 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         // refused. Programs written for Apple's GPUs assume the fetch (CoreAnimation's luma_boost_lph), and a full-screen pass that reads
         // each pixel once reads Metal's value. The compile layer announces the precision note once per pipeline that takes it.
         options.policy.framebuffer_fetch = metal2vulkan::device::FramebufferFetchPolicy::AcceptUnordered;
+        // An 8-bit unorm texture's linear sample is the device's filter at the centre of Metal's 1/256 step where the driver is measured
+        // within one code of Metal (PanVK on the Mali-G72: 0.89 of a code, tools/vk/vk_filter_probe.c, tools/metal/m2v/0012), not the exact
+        // emulation, whose four fetches and thousand instructions a sample were half the window server's GPU time a frame on the home screen.
+        // An unmeasured device keeps the emulation.
+        options.policy.unorm8_linear_filter = metal2vulkan::device::Unorm8LinearFilterPolicy::DeviceWithinOneCode;
         // Every texture given a shadow image is announced with why no image aliases its bytes (`shadow.log`), and every other
         // degradation once (`degradations.log`).
         options.announce_each.insert(metal2vulkan_runtime::Degradation::ShadowedTexture);
