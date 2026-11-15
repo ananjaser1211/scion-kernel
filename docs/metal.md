@@ -1517,3 +1517,109 @@ above.
 - Maps: VectorKit finds its library and draws (map imagery shows in the strip under the status bar), but the map
   view itself is black: the window server composites it and shows opaque black, the wall in "Apple apps" (an app's
   GPU-drawn CAMetalLayer composited by the window server).
+
+## The black composited layer was the display's: a swap names only the layers it changes (15 November 2026, on build 64)
+
+**How it was taken apart.** A test application (not committed): an `MKMapView` of a fixed public place, inset in an orange window, run
+with the test frontend by `DYLD_LIBRARY_PATH` as in "Apple apps"; a mode with a plain `CAMetalLayer` of its own that clears to a colour
+every frame (opaque or not, drawable full or half size, `presentsWithTransaction`, `displaySyncEnabled`, presenting continuously or
+stopping after 30 frames); and a nearly clear view over half of the layer whose colour changes every second, so that the window server
+keeps swapping while the map draws nothing new. The test frontend did one thing at each present of a drawable (a file chose which).
+Test PanVKs reached the window server by `HAKIOS_VK_ICD` for one restart of backboardd and logged, through hakios-drm, every
+submission's IOSurfaces and every image, view and binding of 400x400 pixels or more; the image's PanVK was given back after.
+
+**The earlier table did not hold.** With the half-veil, every way of presenting showed the map black: as the frontend presents (after
+the GPU work that writes it), with a lock and unlock for writing first, with the GPU write announced again (a device's write: a new
+seed, no clean), 8 ms later, and with a magenta square written into the drawable by the processor under the lock before the present.
+Without the veil the same runs were right or black from one run to the next. What decided it was whether the window server swapped
+again after the map's last frame, not the present.
+
+- The drawable's pixels were right all along: read by the processor from another process, and by **the GPU from another process**
+  (a texture over the surface blitted into a buffer: 1024 of 1024 grid points the map, as the processor read them).
+- The window server imported the drawables (a texture view over each) and named them in its submissions, yet a magenta square written
+  into the drawable afterwards never showed either: it was not drawing the layer at all.
+- The plain `CAMetalLayer`: right while composited every frame (not opaque), right at half size (scaled, so composited), right while
+  presenting continuously (handed to the display). **Black as soon as it stopped presenting**: the kernel's log went from "surfaces in
+  layers 0x3: 726 4" (the drawable in layer 0, the window server's surface in layer 1) to "**0x2: 0 515**".
+
+**The cause.** In IOMobileFramebuffer of 20F66, `IOMobileFramebufferSwapSetLayer` (`kern_SwapSetLayer`, +0x18a4) sets the layer's bit
+in the swap's layers-set word (`SWAP_LAYERS_SET`, 0x104) and clears it in the layers-cleared word (0x108); with no surface it sets
+both. A layer a swap does not name keeps what it showed. CoreAnimation counts on that: a `CAMetalLayer` it handed to the display stays
+in layer 0 while the application draws nothing new, the window server's surface (clear over it) goes on in layer 1, and the swaps
+after name layer 1 alone. MiniIOMobileFramebuffer drew only the layers whose surface word was set in that swap, so layer 0 was empty
+and the clear pixels of the window server's surface came out black. That is the inset map in an application, Maps' map view as soon
+as anything else on the screen changes, and Photos' grid (its drawable 3524 in layer 0, the next swap "0x2: 0 3455", 98% of the grid
+black). It was never the GPU, the caches or the frontend, and neither side's Metal is involved: the GLES window server would have
+shown the same.
+
+**Fixed in the kernel** (xnu fork `7e2114893101`, `MiniIOMobileFramebuffer.cpp`, `keepLayers()`): what each layer shows (surface,
+enable word, source and destination rectangles) is kept from the swaps handed over, and a swap is made whole before it is queued: a
+layer it does not name shows what it showed; one it names with no surface is taken away, as before. A swap not shown (the queue lost
+it) still changes what the layers show. The window server's connection closing forgets them, so a new window server starts from
+nothing. The "same surface again" statistic counts only a bottom layer the swap names. The file compiles in the xnu build (the
+build's own command, to a scratch object); it needs the kernel to be tried.
+
+`IOSurfaceSharedEvent` is not on this path: QuartzCore's present (+0x1a67c) waits on the drawable's `sharedEvent` only when there is
+one, and here there is none (`-[IOSurfaceSharedEvent init]` answers nil). "IOSurfaceSharedEventAddEventListener failed" is logged
+once per application.
+
+**Found on the way.** A `CAMetalLayer` that is not opaque, with `presentsWithTransaction` and display sync off (VectorKit sets both,
+but its layer is opaque), makes the window server ask, every frame, a 2313x1125 texture over its 1125x2313 display surface (rows of
+4608 bytes): the frontend refuses it ("texture over buffer refused: RowPitch"), QuartzCore logs "Failed to allocate [2313 x 1125] BGRA
+framebuffer" 60 times a second, and the application's window never appears. Not looked at further.
+
+## The window server's frame rate: framebuffer fetch from the tile buffer again, multisampled reads too (on build 64)
+
+The measure: the display's own count while swiping home pages continuously (fifteen pairs of `rwtouch swipe 0.85 0.5 0.15 0.5 200` and
+back, half a second apart, three five-second windows, after three pairs to settle). The test PanVK reached backboardd by
+`HAKIOS_VK_ICD` for one restart; OpenGL ES by `-backboardd` in the clients file for one restart, taken out again after.
+
+| continuous swipes | GLES | Metal, build 64's PanVK | with the tile reads again |
+|---|---|---|---|
+| frames a second | 43 to 45 | 18 to 19 | 22 to 23 |
+| fragment job chains a frame | 13, 0.43 ms each | 37, 0.71 ms each | 10, 2.1 ms each |
+| GPU a frame (the kernel's busy time over the frames) | about 7 ms | about 30 ms | about 23 ms |
+| "waiting for the GPU" a swap | 1.3 ms | 11.6 ms | 22.6 ms |
+
+(The 27 a second of "On the phone, build 64" was six swipes with pauses; this run swipes without them.)
+
+**Why the first form spoiled VectorKit's map.** `panvk-tile-input-attachments.patch` (`831377b`, reverted in `d03db94`) read a colour
+input attachment of the subpass from the tile buffer only where it was single-sampled, but offered rasterization-order access for every
+colour attachment. VectorKit draws the map four times multisampled and reads the colour attachment in many of its shaders
+(`framebufferFetchSupport`, `fetch_color` in its library), and metal2vulkan reads a multisampled pass's attachment as a multisampled
+subpass input at the invocation's `SampleId`, under sample shading (`lower/fragment/color.rs`). Those reads stayed in memory, now with
+no barrier before them: the speckled water and the black rail lines. The patch now lowers a multisampled subpass input read at
+`load_sample_id` to the tile buffer as well, and the Bifrost compiler reads the tile buffer at the invocation's own sample in a
+fragment shader that runs per sample (`bi_pixel_indices`, as a multisampled blend shader does). With it MapKit's map is drawn as
+without the patch (half-size shots of the two differ only where labels were placed), metal_tri's set passes, and the window server's
+home screen, widgets and dock material are drawn as before (`4ce6c75`, `efc971d`).
+
+**Where a frame goes now.** A test PanVK logged each JM batch's framebuffer. Each frame while swiping has one pass over the whole
+screen with two colour attachments: the display surface, loaded, and a second 1125x2313 BGRA8 one, cleared, transient (usage `0xd0`: a
+memoryless texture of CoreAnimation's, which metal2vulkan hands over with `STORE_OP_DONT_CARE`) and read as an input attachment; then
+small passes (64x64, 128x64, 269x107, 568x413) for the materials. PanVK 25.0.7 writes back every colour attachment whatever its store
+operation. A test patch (not committed) that writes back no attachment stored `DONT_CARE` in the pass's last batch (not resolved;
+depth and stencil only where every aspect is `DONT_CARE`; such a render target keeps its own format in the tile buffer) took the second
+attachment's 10 MB a frame of writes away, drew MapKit's map and the home screen as before and passed metal_tri, but left the frame
+rate and the fragment jobs' time as they were (21 a second, 2.1 ms each): the GPU's time is in the shading. CoreAnimation's fragment
+shaders through metal2vulkan average 306 instructions (OpenGL ES's are tens), over every pixel of the screen once or more a frame.
+
+## Needs a build (kernel and userland)
+
+- **Kernel**: `make kernel` with the xnu fork at `7e2114893101` (`profiles/ios-16.5.conf`, `343dad6`): the layers a swap does not name.
+- **PanVK**: the work tree at `efc971d` (`tools/mk-panvk.sh ios`: the patch list changed, Mesa is extracted again), then the image as
+  build 64 (`userland/build.sh ALONE=1 RC=rc.launchd DEVICE=star2lte REST=1 GL=1 NO_AIR=1 SYSTEM=1 PANVK_DIR=... M2V_DIR=... METAL=vk
+  METAL_ICD=/redwood/lib/libvulkan_panfrost.dylib`). The plug-in and metal2vulkan are unchanged.
+
+Then: Maps' map view and an inset map stay drawn while the screen changes around them (the kernel's line keeps the drawable in layer
+0, no "0x2: 0 ..." while it shows), Photos' grid shows its pictures, MAME4iOS and PPSSPP as before; the swipe run above gives 22 to 23
+frames a second on Metal, and VectorKit's water and rail lines are right with the new PanVK.
+
+## Next walls
+
+1. **The window server's GPU time on Metal**: about 23 ms a frame while swiping against OpenGL ES's 7, nearly all fragment shading.
+   Where the instructions go in CoreAnimation's shaders (metal2vulkan's translation of their AIR) is the next look; then frames in
+   flight (the swap handed to the display when the command buffer is scheduled).
+2. A non-opaque `CAMetalLayer` with `presentsWithTransaction` and display sync off: the window server's transposed framebuffer (above).
+3. Idle and partial frames: a pass that loads everything could have its fragment job's extent cut to what its draws touch, once
+   transient attachments are not written back (the test patch above).
