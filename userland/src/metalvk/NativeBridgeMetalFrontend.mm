@@ -768,9 +768,35 @@ static NBTexture *textureOnSurface(NBBuffer *buffer,MTLTextureDescriptor *d,IOSu
 @property(nonatomic) MTLFunctionType functionType;
 @property(nonatomic) std::string constantsText;   // name:type:hex of each constant value it was specialized with (the journal's)
 @end
+// A function constant as the function declares it (MTLFunctionConstant's own initializer is not public; its readers are).
+@interface NBFunctionConstant : MTLFunctionConstant
+@property(nonatomic,copy) NSString *constantName;
+@property(nonatomic) MTLDataType constantType;
+@property(nonatomic) NSUInteger constantIndex;
+@property(nonatomic) BOOL constantRequired;
+@end
+@implementation NBFunctionConstant
+- (NSString *)name {return _constantName;}
+- (MTLDataType)type {return _constantType;}
+- (NSUInteger)index {return _constantIndex;}
+- (BOOL)required {return _constantRequired;}
+@end
 @implementation NBFunction
 - (void)dealloc {nmb_function_release(_handle);}
 - (MTLFunctionOptions)options {return MTLFunctionOptionNone;}
+- (NSDictionary<NSString *,MTLFunctionConstant *> *)functionConstantsDictionary {
+ NSMutableDictionary *constants=[NSMutableDictionary dictionary];
+ const uint32_t count=nmb_function_constant_count(_handle);
+ for(uint32_t i=0;i<count;i++) {
+  char name[256]={};uint64_t type=0,index=0;bool required=false;
+  if(!nmb_function_constant_at(_handle,i,name,sizeof name,&type,&index,&required))continue;
+  NBFunctionConstant *constant=[NBFunctionConstant new];
+  constant.constantName=[NSString stringWithUTF8String:name];constant.constantType=(MTLDataType)type;
+  constant.constantIndex=(NSUInteger)index;constant.constantRequired=required;
+  constants[constant.constantName]=constant;
+ }
+ return constants;
+}
 @end
 // The target's own accessors of MTLFunctionConstantValues (as the offline frontend reads them); their ABI is checked before any call.
 @interface MTLFunctionConstantValues (NBOriginalConstantAccess)
