@@ -36,7 +36,8 @@ for every colour attachment: VectorKit draws its map four times multisampled and
 and its rail lines black.
 
 Checked on the phone (Mali-G72, PanVK by HAKIOS_VK_ICD): MapKit's map of a fixed public place (full screen, the drawable handed to the
-display) is the same, pixel for pixel, as with PanVK without this patch; metal_tri plain, --fetch (256, 1024, over an IOSurface),
+display) is drawn as with PanVK without this patch, the water even and the rail lines grey (half-size shots of the two differ only
+where labels were placed or fading in); metal_tri plain, --fetch (256, 1024, over an IOSurface),
 --surface, --ycbcr, --xr over/add, --texel-buffer 16, 6912 --a8, 256 --blit, 64 --render and --surface --size 1125 --row-bytes 4608
 --frames 30 pass. The window server: about 10 fragment job chains a frame while swiping (37 without), the home screen, its widgets and
 the dock's material drawn as before; 22 to 23 frames a second through continuous home-page swipes against 18 (docs/metal.md).
