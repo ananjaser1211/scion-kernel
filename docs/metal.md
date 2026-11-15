@@ -313,6 +313,9 @@ variables itself, only for that driver and only in a process the device is shown
 
 ### Maps (VectorKit): the honest route
 
+(Corrected on 15 November 2026, "Apple apps" below: VectorKit's `default.metallib` is in 20F66's root filesystem, AIR, and only the image's
+2 MiB rule left it out. What follows was read from the selected files and is kept as it was written.)
+
 - **The blocker is the shaders, not the GPU.** On 20F66, VectorKit ships its map shaders (`DaVinci::ground_*`, ribbons, flyover and the
   rest) **only as Apple GPU binaries**: `VectorKit.framework/iphoneos.pipelinelib/pipelines.g11p` and the files beside it, `LPPM`
   archives, one per AGX generation. Its `functions` file is empty, and `pipelines.desc` names a `default.metallib` that is not in the
