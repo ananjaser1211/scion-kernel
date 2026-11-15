@@ -1669,3 +1669,19 @@ render targets that are not written, forward pixel kill past an unwritten
 attachment. Its numbers come from a Valhall CSF GPU, a much stronger part
 than the 9810's Bifrost G72, so 1 and 2 are where to start here; the
 shader cost per frame (above) is ours to cut on top of them.
+
+### On the phone, build 66
+
+The S9+ defaults changed (scion-star2lte 00fb90c): the G3D up to the APM's own 598 MHz level while
+frames are shown (mali_max=598; 731.25 mV in the APM's table, BUCK6 still at 950 mV, the governor's
+85 C cap unchanged), and the window server on OpenGL ES with applications on Metal (camtl=0;
+camtl=1 puts backboardd on Metal again). metal2vulkan 0012 (the device's 8-bit linear filter for
+CoreAnimation's samples, measured within one code of Metal) is in. The GPU busy lines now say the
+clock, the governor's switches and the G3D's temperature.
+
+- Home screen, continuous swiping: 56-59 frames a second, about 1.2 ms of GPU a frame, the clock
+  at 598 MHz, the G3D at 55-61 C (build 65: 20 on Metal, 43-45 on OpenGL ES at 572 MHz).
+- Maps panning: 15 frames a second (build 65: 6), drawn correctly. About 20 ms of each frame is
+  MiniIOMobileFramebuffer blending Maps' Metal layer under the window server's on the CPU: the
+  next wall (the display's own layers, or the blend on the GPU).
+- MAME4iOS (Gridlee): 58-59 frames a second, drawn correctly.
