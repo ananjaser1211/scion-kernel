@@ -1143,3 +1143,91 @@ PANVK_DIR=... M2V_DIR=... METAL=vk METAL_ICD=/redwood/lib/libvulkan_panfrost.dyl
 
 The window server on Metal now matches GLES in GPU time, is within a few points of its CPU, and uses about 40 MB
 less memory. Metal is the default on the S9+ from this build on.
+
+## Real apps (15 November 2026, on build 61)
+
+metal_tri and the window server were the only clients until now. This is what third-party applications ask of Metal, and what Apple's
+own applications do, on build 61 (`metal=2`, the window server on Metal by default).
+
+**The applications.** Only freely distributed, unencrypted IPAs (cryptid 0, checked before installing; `install-ipa.sh` checks it
+again with the minimum iOS), never an App Store download:
+
+| application | where from | licence | version | Metal through |
+|---|---|---|---|---|
+| MAME4iOS | github.com/yoshisuga/MAME4iOS, release 2022.5 (`MAME4iOS-2022.5-139.ipa`) | GPL-2.0 (MAME's own terms for MAME) | 2022.5, MAME 0.139u1, iOS 13.4+ | its own Metal view (CAMetalLayer, MSL shaders in its `default.metallib`) |
+| PPSSPP | github.com/hrydgard/ppsspp, release v1.20.4 (`PPSSPP-iOS-v1.20.4.ipa`) | GPL-2.0-or-later | 1.20.4, iOS 11+ | Vulkan through MoltenVK (`libMoltenVK.dylib`), set in `ppsspp.ini` (`GraphicsBackend = 3`) |
+| RetroArch | buildbot.libretro.com/stable/1.22.2/apple/ios-arm64/RetroArch.ipa | GPL-3.0 | 1.22.2, iOS 12+ | Vulkan through MoltenVK (its default video driver on iOS) |
+
+The game content was the MAME project's own freely distributed ROMs (mamedev.org/roms: Gridlee, Robby Roto, Alien Arena, for
+non-commercial use). No other ROM was used.
+
+**How the plug-in under test reached an application.** The plug-in's path is on the read-only system volume and an application
+takes no `launchctl setenv`. A test launcher (not committed) stood in for the application's executable on the phone: it set
+`DYLD_LIBRARY_PATH` to a directory holding the test `HakiosMetalVK.dylib` and `libmetal2vulkan.dylib` (with a `HakiosMetal.icd`
+beside them) and exec'd the real executable; `DYLD_PRINT_TO_FILE` confirmed that both came from there. The applications were put
+back as installed afterwards.
+
+**What each did** (logs: `HakiosMetal.log`, the per-process `m2v` directory, `dmesg | grep mali`; no crash reports are written on
+this system, the system log was read with `oslog` instead):
+
+| application | build 61 (the image) | with this section's plug-in and runtime |
+|---|---|---|
+| MAME4iOS | starts; its game list and menus (UIKit) draw; a game runs at 50 frames a second (Gridlee: 300 draws a frame, 3 to 5 ms GPU), but the game area stays black | the same: the frames are right in the drawable's surface (read from another process while the screen showed black), so they are lost between `-present` and the window server (below) |
+| PPSSPP | OpenGL ES (its default) has no EAGLContext in an application (`Failed to create EAGLContext`, abort); Vulkan ends at `copyFromBuffer:...options:` | Vulkan on MoltenVK on Metal on Vulkan runs: its 45 861-character MSL library compiles (Apple's front end), the menu renders at about 150 commits a second, 1.2 to 1.8 ms GPU each; on screen bands of the menu over black, as MAME4iOS |
+| RetroArch | ends at `heapTextureSizeAndAlignWithDescriptor:`, and the aborted process cannot be ended (below) | past the heap sizes, `makeAliasable` and `functionConstantsDictionary`; its MSL compiles (62 504 characters, 1.9 s); stops after its first commit with no error yet (not diagnosed) |
+| Photos | `NSInternalInconsistencyException` in PhotosUICore (`PXGCreateContext`: `!PXPixelSizeAreaIsZero(roundedSize)`) right after the device opens; the app goes | not tried |
+| Camera | starts; the location prompt's map (a Metal view of CoreLocation's prompt plug-in, BGRA8 sRGB, presented by itself) stays black but for its dot | not tried |
+| Books, Freeform | start and draw (UIKit; Books opens the device for VideoToolbox) | not tried |
+
+**What was missing, and is now there** (tools/metal/bridge, userland/src/metalvk/NativeBridgeMetalFrontend.mm):
+
+- *Libraries from MSL source.* MoltenVK compiles every shader at run time (SPIR-V to MSL), and RetroArch does too. `_MTLDevice`'s
+  own `-newLibraryWithSource:options:error:` works on this device: MTLCompilerService makes the library's AIR without any GPU of
+  Apple's (on Apple's GPUs the GPU code is made at pipeline creation as well). The frontend now calls it, reads the `_MTLLibrary`
+  back as a metallib (`-libraryDataContents`) and makes it this device's library. A compute kernel and a render pipeline from source
+  run and read back right (248 ms for the first library, 40 ms for the front end once its cache has it).
+- *The calls MoltenVK, RetroArch and MAME4iOS make.* `heapTextureSizeAndAlignWithDescriptor:` and
+  `heapBufferSizeAndAlignWithLength:options:` (the runtime places heap textures, the C ABI did not carry the answer), blits with
+  `MTLBlitOption` and of whole slices and levels, store actions stated at the end of a pass, `setViewports:count:` and
+  `setScissorRects:count:`, indirect draws and dispatches, sampler arrays and LOD clamps, vertex texture arrays,
+  `useResource`/`useHeap`, `memoryBarrier...` (the compute encoder's barrier was empty), encoder descriptors,
+  `presentDrawable:afterMinimumDuration:`, `makeAliasable`, `functionConstantsDictionary`, and the answers of a texture that is not
+  sparse, shareable or lossy. A tool on the phone (`protocol_copyMethodDescriptionList` against the objects' classes) listed the
+  rest of the public protocols that no class answers; what MoltenVK's binaries name is covered but for counters, tessellation, tile
+  shaders and indirect command buffers, which the device does not offer.
+- *Texture swizzles* were dropped: a texture made with a swizzle, or a view with one, read its channels unswizzled, and `-swizzle`
+  was not answered (CoreAnimation and MoltenVK both ask it). The descriptor now carries the swizzle (0 the default, so older callers
+  of the C ABI are unchanged) and views take one; checked with a texture of alpha 0 read through (R, G, B, One).
+- *A drawable presented by itself* (`-present`, as MoltenVK does from the command buffer's scheduled handler) now waits for the GPU
+  work that writes it, whatever its format; only extended-range drawables waited before.
+
+metal_tri, `--surface`, `--fetch` and `--ycbcr` pass with all of it.
+
+**Found, not fixed:**
+
+1. **A CAMetalLayer's frames do not stay on screen.** MAME4iOS's and PPSSPP's drawables hold their frames when presented (and when
+   read from another process later), but the window server shows the layer black, with the GLES compositor as with the Metal one;
+   with the application stopped (SIGSTOP) the layer is black throughout, and while it runs a slow screenshot catches bands of
+   frames. Forcing every pixel's alpha to 1 before the present changed nothing, so it is not the alpha these applications leave at
+   0. The surfaces answer `IOSurfaceIsInUse` 0 and the window server imported no texture over them. The path between
+   `-[CAMetalDrawable present]` and the render server's layer contents (CAImageQueue) has had no client before; that is the next
+   wall for every continuously drawing Metal application.
+2. **PanVK does not name sampled buffers in a job chain's buffer list** (`jm/panvk_vX_queue.c`: the pools, the framebuffer, a
+   blit's source and destination, the tiler heap). HakiosMali cleans an IOSurface's cache lines before a job only for the buffers
+   the submission names, so a surface a processor wrote and the GPU only samples is read stale: a texture over a CPU-written 8x8
+   surface read zeros in 5 of 6 runs. The window server's framebuffers are render targets and were never affected. The fix belongs in
+   PanVK's host-surface import (name every imported surface of the device in each submission, which costs a seed comparison each).
+3. **An aborting RetroArch cannot be ended.** RetroArch makes itself traced (`PT_TRACE_ME`, its JIT test) with launchd as the
+   tracer; its abort stops it (`TX`), and xnu leaves a stopped traced process stopped through SIGKILL (`psignal_internal`: a traced
+   process already stopped needs no further action), `task_terminate()` fails too. The stuck process keeps its launch screen in front
+   until the next boot, and later launches of the same bundle wait behind it. Stock iOS behaves the same; it matters here only because
+   the plug-in made it abort. Four RetroArch processes stay stopped on the phone until it restarts (three that aborted, and one
+   stopped for a screenshot, which SIGCONT does not resume either); `ps` hung on the phone after the last of them.
+4. Applications have no OpenGL ES (`libhakios.gl.dylib` serves only the window server): PPSSPP's default backend aborts.
+
+**Needs an image** (userland only, the kernel is build 60's): the plug-in with the new frontend and `libmetal2vulkan.dylib` with the
+new bridge (`userland/build.sh ... METAL=vk`, as build 61). Then MAME4iOS, PPSSPP (Vulkan) and RetroArch run without the test
+launcher.
+
+**Next walls.** The CAMetalLayer present path (1); PanVK's buffer list for sampled host surfaces (2); RetroArch's stall after its
+first commit; Photos' exception in `PXGCreateContext`; the Camera prompt's map (VectorKit, as Maps).
