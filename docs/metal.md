@@ -1312,3 +1312,15 @@ opens.
 
 **Next walls.** Two-layer frames cost the processors about 10 ms a swap: the DPU's own windows (or the window server keeping detached
 layers in its own picture) would take that away. Then RetroArch past its first pipelines, and whatever Photos asks next.
+
+#### On the phone, build 63 (kernel with xnu 939a69a2862e, userland at b5f63ff)
+
+- PPSSPP 1.20.4 (Vulkan on MoltenVK on our Metal): its menu is on the panel, whole (two layers: its drawable
+  detached as layer 0, the window server's framebuffer as layer 1).
+- MAME4iOS: Gridlee's attract mode is on the panel, the controls drawn by the window server around it.
+- Photos: opens and shows "What's New in Photos" (it threw in `PXGCreateContext` on build 62).
+- The cost: with two layers the panel gets **8 frames a second**: "42 frames in 5103 ms, 121193 us each in the driver"
+  (the processors blending both layers by alpha), against 37 a second at 10.4 ms each when the layers were copied.
+  MAME's commits follow the display (97 ms apart; GPU commit to completion 9 ms, the GPU 4% busy).
+  Next: scan the detached layer out in its own DPU window (hardware blending), or blend only where the upper
+  layer is not opaque, with NEON.
