@@ -35,6 +35,11 @@
  *               default, is off), the TE trigger is masked (HW_TRIG_MASKED): no refresh, no read of DRAM over DSI. A new
  *               frame unmasks it. Samsung's decon_reg_set_trigger() masks it after every frame.
  *
+ *   fb_planes   (with fb_dpp and fb_zc; MiniIOMobileFramebuffer.cpp's boot-arg, on by default) Two layers on two windows:
+ *               the window server's surface on the boot loader's window through VGF0, blended by its alpha, over a
+ *               layer CoreAnimation detached on window 4 through VGF1 (hakios_scanout_planes(), below), instead of the
+ *               processor blending them.
+ *
  * The scaler's coefficients are not Samsung's. They are Catmull-Rom (a cubic through the four nearest pixels), computed
  * at start for each of the nine phases the registers take. The other seven of the hardware's sixteen phases are mirrors
  * of these. Units are 1/512, and each row sums to 512.
@@ -93,6 +98,8 @@ int hakios_scanout_carve(uint64_t bytes, uint64_t *phys);
 void hakios_scanout_uncarve(uint64_t phys);
 int hakios_scanout_carved(uint64_t phys);
 int hakios_scanout_show(uint64_t phys, uint32_t rowbytes);
+int hakios_scanout_planes(uint64_t upper, uint32_t upper_rowbytes, uint64_t lower, uint32_t lower_rowbytes, uint32_t x,
+    uint32_t y, uint32_t w, uint32_t h);
 
 #define DECON_PA                EXYNOS_DECON_PA
 #define DPP_PA                  EXYNOS_DPP_PA
@@ -413,6 +420,7 @@ static uint32_t psr_ms;
 static thread_call_t psr_call;
 static uint64_t psr_last_frame;
 static bool psr_masked;
+static void plane_off(void);            /* fb_planes (below): the lower window off at the next update */
 
 /* a frame is coming: unmask the trigger before the shadow update is requested, or that update is never taken */
 static void
@@ -474,6 +482,7 @@ hakios_scanout_show(uint64_t phys, uint32_t rowbytes)
 	}
 	wr(i, IDMA_BASE_Y, (uint32_t)phys);
 	wr(i, IDMA_BASE_C, (uint32_t)phys);
+	plane_off();                            /* (fb_planes: one layer again) */
 	__asm__ volatile ("dsb sy" ::: "memory");
 	wr(decon, SHADOW_REQ, rd(decon, SHADOW_REQ) | SHADOW_ALL);
 	return 0;
@@ -508,6 +517,7 @@ hakios_scanout_flip(unsigned index)
 	}
 	wr(i, IDMA_BASE_Y, (uint32_t)buffers[index]);
 	wr(i, IDMA_BASE_C, (uint32_t)buffers[index]);
+	plane_off();                            /* (fb_planes: a frame drawn whole) */
 	__asm__ volatile ("dsb sy" ::: "memory");
 	wr(decon, SHADOW_REQ, rd(decon, SHADOW_REQ) | SHADOW_ALL);
 	return 0;
@@ -548,8 +558,9 @@ coefficients(int16_t table[9][4])
 	}
 }
 
+/* the scaler's taps: Catmull-Rom, both banks */
 static void
-setup_scaler(vm_offset_t d, uint32_t sw, uint32_t sh, uint32_t dw, uint32_t dh)
+setup_taps(vm_offset_t d)
 {
 	int16_t c[9][4];
 
@@ -567,15 +578,281 @@ setup_scaler(vm_offset_t d, uint32_t sw, uint32_t sh, uint32_t dw, uint32_t dh)
 			}
 		}
 	}
+}
+
+/* the scaler's ratios and start positions for sw x sh to dw x dh */
+static void
+setup_ratio(vm_offset_t d, uint32_t sw, uint32_t sh, uint32_t dw, uint32_t dh)
+{
 	wr(d, DPP_H_RATIO, (uint32_t)(((uint64_t)sw << 20) / dw));
 	wr(d, DPP_V_RATIO, (uint32_t)(((uint64_t)sh << 20) / dh));
 	wr(d, DPP_YH_POS, (uint32_t)(int32_t)((((int64_t)sw - dw) << 20) / (2 * (int64_t)dw)));
 	wr(d, DPP_YV_POS, (uint32_t)(int32_t)((((int64_t)sh - dh) << 20) / (2 * (int64_t)dh)));
 	wr(d, DPP_CH_POS, (uint32_t)(int32_t)((((int64_t)sw - dw) << 20) / (2 * (int64_t)dw)));
 	wr(d, DPP_CV_POS, (uint32_t)(int32_t)((((int64_t)sh - dh) << 20) / (2 * (int64_t)dh)));
+}
+
+static void
+setup_scaler(vm_offset_t d, uint32_t sw, uint32_t sh, uint32_t dw, uint32_t dh)
+{
+	int16_t c[9][4];
+
+	coefficients(c);
+	setup_taps(d);
+	setup_ratio(d, sw, sh, dw, dh);
 	say("exynos_dpu: VGF0 scaler: %ux%u to %ux%u, ratio %x/%x, phases %d/%d, Catmull-Rom taps at half a pixel "
 	    "%d %d %d %d\n", sw, sh, dw, dh, rd(d, DPP_H_RATIO), rd(d, DPP_V_RATIO), (int32_t)rd(d, DPP_YH_POS),
 	    (int32_t)rd(d, DPP_YV_POS), c[8][0], c[8][1], c[8][2], c[8][3]);
+}
+
+/*
+ * fb_planes: two of the DECON's windows (MiniIOMobileFramebuffer.cpp, planeShow()). CoreAnimation hands the display a
+ * layer it detached from its picture (a CAMetalLayer's drawable) under the window server's surface, which is clear over
+ * it. The window server's surface stays where fb_zc puts it, on the boot loader's window (5, the top one) and VGF0, now
+ * blended by its premultiplied alpha: the DPP takes the alpha of every pixel and the window's function is the user-defined
+ * one with Cr = Cf + (1 - Af) Cb, Ar = Af + (1 - Af) Ab. The detached layer, copied by the processor into a buffer of
+ * the scan-out's at its place on the display, goes on a window below it (PLANE_WIN) through the other channel that has
+ * a scaler, VGF1, enlarged to its rectangle on the panel and copied there as it is (function COPY). Both windows change
+ * at the same shadow update, so no refresh shows one layer's new picture with the other's old one. hakios_scanout_show()
+ * and hakios_scanout_flip() take the lower window away in the update they ask for.
+ *
+ * The first time, VGF1 is set up and tried unseen: the lower window is turned on under the top one while that is still
+ * opaque (alpha per frame, 255), three refreshes are waited for and VGF1's error state is read, as attach_vgf0() does.
+ * Only then is the top window made to blend. Any error, and the planes are never asked for again (-1: the caller blends
+ * on the processor, as before).
+ *
+ * Registers (Samsung's dpu_9810, regs-decon.h, decon_reg.c: decon_reg_set_win_bnd_function, decon_reg_set_win_enable;
+ * regs-dpp.h, dpp_reg.c: dpp_reg_set_alpha_sel, dma_reg_set_buf_offset): WIN_CONTROL_0 0x1000 + 0x30 w (alpha 1 at
+ * bits 24-31, alpha 0 at 16-23, the function at 8-11: 1 COPY, 0xD user-defined; the alpha-mult source at 0-1, 2 the
+ * foreground's alpha), WIN_CONTROL_1 0x1004 + 0x30 w (the coefficients of the FG colour, BG colour, FG alpha and BG
+ * alpha at bits 24, 16, 8 and 0: 1 one, 3 one minus the foreground's alpha), WIN_START_TIME_CONTROL 0x1018 + 0x30 w;
+ * DATA_PATH_CONTROL_0 bits 4w (window on) and 4w+1 (window filled with a colour); the blender's background colour
+ * BLENDER_BG_IMAGE_COLOR_0/1 0x208/0x20C (alpha at 16, red at 0; green at 16, blue at 0); DPP_IN_CON bit 3 (the alpha
+ * per pixel); the HDR block's DPP_VGRF_HDR_CON 0x600 (VGF1 has one: off); IDMA_SRC_OFFSET (y at 16, x at 0).
+ */
+#define PLANE_WIN               4
+#define IDMA_VGF1               5
+#define CHANNEL_VGF1            2
+#define WIN_CONTROL_0(w)        (0x1000 + 0x30 * (w))
+#define WIN_CONTROL_1(w)        (0x1004 + 0x30 * (w))
+#define WIN_START_TIME(w)       (0x1018 + 0x30 * (w))
+#define  WIN_OPAQUE_COPY        (0xffu << 24 | 0xffu << 16 | 0x1u << 8 | 2u)
+#define  WIN_OPAQUE_USER        (0xffu << 24 | 0xffu << 16 | 0xdu << 8 | 2u)
+#define  WIN_PREMULTIPLIED      (1u << 24 | 3u << 16 | 1u << 8 | 3u)
+#define WIN_BITS(w)             (3u << (4 * (w)))
+#define BG_COLOR_0              0x208
+#define BG_COLOR_1              0x20C
+#define DPP_ALPHA_PIXEL         (1u << 3)
+#define DPP_HDR_CON             0x600
+
+static int planes;                      /* 0 not set up yet, 1 set up and tried, -1 failed: not again */
+static bool plane_on;                   /* the lower window is on, or will be at the update asked for */
+static uint32_t saved_ctl0, saved_ctl1, saved_dpp_in, saved_bg0, saved_bg1;
+static uint32_t plane_scaled[4];        /* the lower layer's size and its size on the panel, as VGF1's scaler has them */
+
+/* (fb_planes) the lower window off at the next shadow update, which the caller asks for */
+static void
+plane_off(void)
+{
+	if (plane_on) {
+		wr(decon, DATA_PATH_0, rd(decon, DATA_PATH_0) & ~WIN_BITS(PLANE_WIN));
+		plane_on = false;
+	}
+}
+
+/* VGF1 to read w x h at x, y of `lower` (rowbytes a row, `rows` rows), enlarged to px0, py0 - px1, py1 of the panel */
+static void
+plane_place(uint64_t lower, uint32_t rowbytes, uint32_t rows, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+    uint32_t px0, uint32_t py0, uint32_t px1, uint32_t py1)
+{
+	vm_offset_t i = idma(IDMA_VGF1), d = dppc(IDMA_VGF1);
+	uint32_t dw = px1 - px0, dh = py1 - py0;
+
+	wr(i, IDMA_SRC_SIZE, rows << 16 | (rowbytes / 4));
+	wr(i, IDMA_SRC_OFFSET, y << 16 | x);
+	wr(i, IDMA_IMG_SIZE, h << 16 | w);
+	wr(i, IDMA_BASE_Y, (uint32_t)lower);
+	wr(i, IDMA_BASE_C, (uint32_t)lower);
+	wr(d, DPP_IMG_SIZE, h << 16 | w);
+	wr(d, DPP_SCALED_SIZE, dh << 16 | dw);
+	if (plane_scaled[0] != w || plane_scaled[1] != h || plane_scaled[2] != dw || plane_scaled[3] != dh) {
+		setup_ratio(d, w, h, dw, dh);
+		plane_scaled[0] = w;
+		plane_scaled[1] = h;
+		plane_scaled[2] = dw;
+		plane_scaled[3] = dh;
+	}
+	wr(decon, WIN_START(PLANE_WIN), py0 << 16 | px0);
+	wr(decon, WIN_END(PLANE_WIN), (py1 - 1) << 16 | (px1 - 1));
+	if (!plane_on) {
+		wr(decon, DATA_PATH_0, (rd(decon, DATA_PATH_0) & ~WIN_BITS(PLANE_WIN)) | 1u << (4 * PLANE_WIN));
+		plane_on = true;
+	}
+}
+
+/* The first time: VGF1 set up, tried under the still opaque top window, and the top window made to blend. 0 if it works. */
+static int
+plane_setup(uint64_t lower, uint32_t rowbytes, uint32_t rows, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+    uint32_t px0, uint32_t py0, uint32_t px1, uint32_t py1)
+{
+	vm_offset_t vi = idma(IDMA_VGF0), vd = dppc(IDMA_VGF0), i = idma(IDMA_VGF1), d = dppc(IDMA_VGF1);
+	uint32_t path0 = rd(decon, DATA_PATH_0), path1 = rd(decon, DATA_PATH_1), frames, errors_i, errors_d, irq_i, irq_d;
+
+	if (win <= PLANE_WIN || channel_type != IDMA_VGF0 || (path0 & WIN_BITS(PLANE_WIN)) || (rd(i, IDMA_ENABLE) & OP_BUSY)) {
+		say("exynos_dpu: fb_planes: not set up (window %u on %s, window %u %s, VGF1 %s): the layers are blended on the "
+		    "processor\n", win, type_name[channel_type], PLANE_WIN, (path0 & WIN_BITS(PLANE_WIN)) ? "on" : "off",
+		    (rd(i, IDMA_ENABLE) & OP_BUSY) ? "busy" : "idle");
+		return -1;
+	}
+	for (unsigned k = 0; k < WINDOWS; k++) {
+		if (((path1 >> (4 * k)) & 7) == CHANNEL_VGF1 && (path0 & (1u << (4 * k)))) {
+			say("exynos_dpu: fb_planes: VGF1 is window %u's already: not set up\n", k);
+			return -1;
+		}
+	}
+	dump_channel("fb_planes, before,", IDMA_VGF1);
+	/* IDMA: VGF0's format and bus settings */
+	wr(i, IDMA_IN_CON, rd(vi, IDMA_IN_CON) & IN_CON_KEEP);
+	wr(i, IDMA_OUT_CON, rd(vi, IDMA_OUT_CON));
+	wr(i, IDMA_DEADLOCK, rd(vi, IDMA_DEADLOCK));
+	wr(i, IDMA_BUS_CON, rd(vi, IDMA_BUS_CON));
+	wr(i, IDMA_GATING, rd(vi, IDMA_GATING));
+	wr(i, IDMA_REQ_DEST, rd(vi, IDMA_REQ_DEST));
+	/* DPP: ARGB, the alpha per frame (the window copies), no HDR; the scaler's taps, as VGF0's */
+	wr(d, DPP_IN_CON, (rd(d, DPP_IN_CON) & ~DPP_IN_KEEP) | (rd(vd, DPP_IN_CON) & 7));
+	wr(d, DPP_HDR_CON, 0);
+	setup_taps(d);
+	wr(d, DPP_GATING, rd(vd, DPP_GATING));
+	memset(plane_scaled, 0, sizeof(plane_scaled));
+	/* the window: VGF1, copied as it is, at the top window's start time */
+	wr(decon, WIN_CONTROL_0(PLANE_WIN), WIN_OPAQUE_COPY);
+	wr(decon, WIN_START_TIME(PLANE_WIN), rd(decon, WIN_START_TIME(win)));
+	wr(decon, DATA_PATH_1, (path1 & ~(7u << (4 * PLANE_WIN))) | (uint32_t)CHANNEL_VGF1 << (4 * PLANE_WIN));
+	plane_on = false;
+	plane_place(lower, rowbytes, rows, x, y, w, h, px0, py0, px1, py1);
+	wr(i, IDMA_ENABLE, rd(i, IDMA_ENABLE) | SFR_UPDATE_FORCE);
+	wr(d, DPP_ENABLE, rd(d, DPP_ENABLE) | SFR_UPDATE_FORCE);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	frames = rd(decon, FRAME_COUNT);
+	psr_wake();
+	wr(decon, SHADOW_REQ, rd(decon, SHADOW_REQ) | SHADOW_ALL);
+	if (wait_taken(100) != 0) {
+		say("exynos_dpu: fb_planes: the DECON did not take the lower window in 100 ms\n");
+		goto off;
+	}
+	for (unsigned ms = 0; ms < 100 && rd(decon, FRAME_COUNT) - frames < 3; ms++) {
+		psr_wake();
+		IOSleep(1);
+	}
+	errors_i = rd(i, IDMA_CFG_ERR) & 0x7ff;
+	errors_d = rd(d, DPP_CFG_ERR) & 0x1f;
+	irq_i = rd(i, IDMA_IRQ) & IDMA_IRQ_ERRORS;
+	irq_d = rd(d, DPP_IRQ) & DPP_IRQ_ERRORS;
+	dump_channel("fb_planes, tried,", IDMA_VGF1);
+	say("exynos_dpu: fb_planes: VGF1 after %u refreshes under the opaque window %u: IDMA configuration errors %x, DPP's %x, "
+	    "IDMA error status %x, DPP's %x; window %u control %x/%x, start time %x, background %x/%x\n",
+	    rd(decon, FRAME_COUNT) - frames, win, errors_i, errors_d, irq_i, irq_d, win, rd(decon, WIN_CONTROL_0(win)),
+	    rd(decon, WIN_CONTROL_1(win)), rd(decon, WIN_START_TIME(win)), rd(decon, BG_COLOR_0), rd(decon, BG_COLOR_1));
+	if (errors_i || errors_d || irq_i || irq_d) {
+		goto off;
+	}
+	/* the top window blends by the alpha of its pixels, over a black background where no window is */
+	saved_ctl0 = rd(decon, WIN_CONTROL_0(win));
+	saved_ctl1 = rd(decon, WIN_CONTROL_1(win));
+	saved_dpp_in = rd(vd, DPP_IN_CON);
+	saved_bg0 = rd(decon, BG_COLOR_0);
+	saved_bg1 = rd(decon, BG_COLOR_1);
+	wr(decon, BG_COLOR_0, saved_bg0 & ~0x3ffu);
+	wr(decon, BG_COLOR_1, 0);
+	wr(decon, WIN_CONTROL_1(win), WIN_PREMULTIPLIED);
+	wr(decon, WIN_CONTROL_0(win), WIN_OPAQUE_USER);
+	wr(vd, DPP_IN_CON, saved_dpp_in | DPP_ALPHA_PIXEL);
+	say("exynos_dpu: fb_planes: a detached layer goes on window %u through VGF1 under window %u, which blends by the alpha "
+	    "of its pixels\n", PLANE_WIN, win);
+	return 0;
+off:
+	plane_off();
+	__asm__ volatile ("dsb sy" ::: "memory");
+	wr(decon, SHADOW_REQ, rd(decon, SHADOW_REQ) | SHADOW_ALL);
+	(void)wait_taken(100);
+	say("exynos_dpu: fb_planes: VGF1 not usable: the layers are blended on the processor\n");
+	return -1;
+}
+
+/* (fb_planes) the top window as the boot loader had it, the lower one off: at the update the caller asks for */
+static void
+plane_restore(void)
+{
+	plane_off();
+	if (planes > 0) {
+		wr(decon, WIN_CONTROL_0(win), saved_ctl0);
+		wr(decon, WIN_CONTROL_1(win), saved_ctl1);
+		wr(dppc(IDMA_VGF0), DPP_IN_CON, saved_dpp_in);
+		wr(decon, BG_COLOR_0, saved_bg0);
+		wr(decon, BG_COLOR_1, saved_bg1);
+		planes = 0;
+	}
+}
+
+/*
+ * fb_planes: from the next refresh on, `upper` (a surface of the pool, the display's size, upper_rowbytes a row) on the
+ * top window, and under it w x h at x, y of `lower` (a buffer of the scan-out's, the display's size, lower_rowbytes a
+ * row) at its place, both enlarged to the panel. As for hakios_scanout_show(), the caller has waited for any earlier
+ * shadow update to be taken. 0 if asked for; -1 if this one cannot be (its rectangle), -2 if none can (the windows could
+ * not be set up): the caller blends on the processor.
+ */
+int
+hakios_scanout_planes(uint64_t upper, uint32_t upper_rowbytes, uint64_t lower, uint32_t lower_rowbytes, uint32_t x,
+    uint32_t y, uint32_t w, uint32_t h)
+{
+	vm_offset_t ui;
+	uint32_t img, sw, sh, pw, ph, px0, py0, px1, py1, dw, dh;
+
+	if (planes < 0) {
+		return -2;
+	}
+	if (mode != 2 || channel_type != IDMA_VGF0) {
+		return -1;
+	}
+	ui = idma(channel_type);
+	img = rd(ui, IDMA_IMG_SIZE);
+	sw = img & 0x3fff;
+	sh = img >> 16 & 0x3fff;
+	pw = (rd(decon, WIN_END(win)) & 0x3fff) + 1;
+	ph = (rd(decon, WIN_END(win)) >> 16 & 0x3fff) + 1;
+	if ((upper & 0xff) || (upper_rowbytes & 3) || !hakios_scanout_carved(upper) || upper_rowbytes / 4 < sw ||
+	    upper_rowbytes / 4 > 0xffff || (lower & 0xff) || lower == 0 || (lower >> 32) || (lower_rowbytes & 3) ||
+	    lower_rowbytes / 4 > 0xffff || sw == 0 || sh == 0 || (uint64_t)x + w > sw || (uint64_t)y + h > sh ||
+	    lower_rowbytes / 4 < x + w) {
+		return -1;
+	}
+	px0 = (uint32_t)((uint64_t)x * pw / sw);
+	py0 = (uint32_t)((uint64_t)y * ph / sh);
+	px1 = (uint32_t)(((uint64_t)x + w) * pw / sw);
+	py1 = (uint32_t)(((uint64_t)y + h) * ph / sh);
+	dw = px1 - px0;
+	dh = py1 - py0;
+	/* (dpp.h's limits: 16 pixels at least, scaled from half to eight times) */
+	if (w < 16 || h < 16 || dw < 16 || dh < 16 || w > 2 * dw || h > 2 * dh || dw > 8 * w || dh > 8 * h) {
+		return -1;
+	}
+	if (planes == 0) {
+		planes = plane_setup(lower, lower_rowbytes, sh, x, y, w, h, px0, py0, px1, py1) == 0 ? 1 : -1;
+		if (planes < 0) {
+			return -2;
+		}
+	}
+	psr_wake();
+	if (upper_rowbytes != shown_rowbytes) {
+		wr(ui, IDMA_SRC_SIZE, (rd(ui, IDMA_SRC_SIZE) & 0xffff0000u) | (upper_rowbytes / 4));
+		shown_rowbytes = upper_rowbytes;
+	}
+	wr(ui, IDMA_BASE_Y, (uint32_t)upper);
+	wr(ui, IDMA_BASE_C, (uint32_t)upper);
+	plane_place(lower, lower_rowbytes, sh, x, y, w, h, px0, py0, px1, py1);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	wr(decon, SHADOW_REQ, rd(decon, SHADOW_REQ) | SHADOW_ALL);
+	return 0;
 }
 
 /* back to the boot loader's channel and buffer */
@@ -587,6 +864,7 @@ hakios_scanout_detach(const char *why)
 	}
 	say("exynos_dpu: back to the boot loader's window (%s)\n", why);
 	psr_wake();
+	plane_restore();
 	psr_ms = 0;
 	if (mode == 2) {
 		wr(decon, DATA_PATH_1, boot_data_path_1);
