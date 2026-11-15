@@ -2135,10 +2135,16 @@ mali_worker(__unused void *parameter, __unused wait_result_t result)
 			} else {
 				absolutetime_to_nanoseconds(now - since, &ns);
 				if (ns >= 5ull * NSEC_PER_SEC) {
+					int32_t mc = hakios_exynos_tmu_zone_mc(2);
+
+					/* with the clock now, the governor's switches since boot and the G3D's temperature */
 					printf("mali: GPU busy %llu%% of %llu s: vertex and tiler %llu jobs %llu ms (%llu us each), "
-					    "fragment %llu jobs %llu ms (%llu us each)\n", (busy[0] + busy[1]) * 100 / ns,
+					    "fragment %llu jobs %llu ms (%llu us each); %u MHz now, %u switches (%u up, %u capped), "
+					    "G3D %d.%d C\n", (busy[0] + busy[1]) * 100 / ns,
 					    ns / NSEC_PER_SEC, jobs[0], busy[0] / 1000000, jobs[0] ? busy[0] / 1000 / jobs[0] : 0,
-					    jobs[1], busy[1] / 1000000, jobs[1] ? busy[1] / 1000 / jobs[1] : 0);
+					    jobs[1], busy[1] / 1000000, jobs[1] ? busy[1] / 1000 / jobs[1] : 0, pll_mhz(),
+					    gov_switches, gov_ups, gov_capped, mc == GOV_NOT_READ_MC ? 0 : mc / 1000,
+					    mc == GOV_NOT_READ_MC ? 0 : mc % 1000 / 100);
 					busy[0] = busy[1] = jobs[0] = jobs[1] = 0;
 					since = now;
 				}
