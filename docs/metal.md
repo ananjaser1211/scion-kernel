@@ -1685,3 +1685,80 @@ clock, the governor's switches and the G3D's temperature.
   MiniIOMobileFramebuffer blending Maps' Metal layer under the window server's on the CPU: the
   next wall (the display's own layers, or the blend on the GPU).
 - MAME4iOS (Gridlee): 58-59 frames a second, drawn correctly.
+
+## Two layers on two of the display's windows (fb_planes), and the zoom that opens an application (16 November 2026, on build 66)
+
+**What a Maps frame costs, by the kind of pan.** Panning Maps (satellite) gives two kinds of frames, and the line of build 66
+was one of them:
+
+| | quick flings (`rwtouch swipe ... 300`, back and forth) | slow drags (`swipe ... 900`) |
+|---|---|---|
+| layers handed to the display | one: the window server composites the map itself | two: Maps' CAMetalLayer detached as layer 0 |
+| frames a second | 11 | 8 to 14 |
+| in the driver a frame | 82 us (fb_zc, nothing copied) | 21.3 to 22.4 ms, of which 20.0 to 21.0 ms `drawOver()` |
+| waiting for the GPU a frame | 44 ms | 26 to 34 ms |
+
+In the slow drags `drawOver()` read 666 of the 702 tiles of the window server's surface every frame: the window server draws
+its surface again every frame while the map moves (its seed and Mali job change), so no tile is known clear, and each is read
+from the pool's write-combined memory. The lower layer's copy was the other 1.3 ms.
+
+**Why not the GPU.** The other way to take the blend off the processor is for the window server not to detach the layer at
+all and to composite it on the GPU, as it does in the flings. QuartzCore (20F66) decides that itself, layer by layer
+(`windowserver-apple-display.cpp`; the reasons are named in tables at 0x1d5b43a30 of the cache's data, `kCADetachReasonCode*`,
+`kServerDetachReasonCode*`, `kDisplayDetachReasonCode*`). What it reads of the display is its source limits
+(`IOMFBMaxSrcPixels`: `MaxSrcBufferWidth`/`Height`, `MaxSrcRectWidth`, `MaxSrcRectTotal`, each per layer: a layer larger is
+not detached, "DestRectTooLarge"), its formats and alignments (`DisplayPipeStrideRequirements`, `DisplayPipePlaneBaseAlignment`)
+and scaling limits (`IOMFBScalingLimits`); none of these says "no layers", and a limit made up to stop full-screen layers
+would still let smaller ones through. A swap the display refuses (`IOMobileFramebufferSwapEnd` returning an error) is only
+logged (+0x1882ca83c), not composited again, so refusing would show nothing. The environment variable `CA_DISABLE_DETACHED` is
+a debugging switch, not a fix. And a blend on the GPU from the kernel would need HakiosMali to build fragment jobs and shaders
+of its own. The display controller has the windows for it.
+
+**Fixed in the kernel: fb_planes** (xnu fork `465e98532b5c`, `MiniIOMobileFramebuffer.cpp`, `planeShow()`; scion-kernel
+`33355ca`, `drivers/display/dpu/hakios.exynos_dpu.c`, `hakios_scanout_planes()`). A frame of two layers -- a detached layer
+not scaled, under the window server's surface of the scan-out pool over the whole display: `overEligible()`'s frames -- is
+put together by the DECON:
+
+- The window server's surface stays on the boot loader's window (5, the top one) and VGF0, scanned out as it is (as fb_zc
+  does with one layer), held from its flip until another's is taken, and now blended by its alpha: DPP per-pixel alpha
+  (`DPP_IN_CON` bit 3), the window's function user-defined with Cr = Cf + (1 - Af) Cb, over a black background (the
+  blender's `BLENDER_BG_IMAGE_COLOR`). Over black, as the processor blended it, so frames of one layer look the same.
+- The detached layer is copied into a buffer of the scan-out's at its place on the display (the processor's unscaled row
+  copy, `drawLayer()`, shared out over the helpers), and shown on window 4 through VGF1 (the other channel with a scaler:
+  its own taps, HDR off, its rectangle by `IDMA_SRC_OFFSET` and `IMG_SIZE`, enlarged to its rectangle on the panel, function
+  COPY). It is copied only when it changed: each buffer remembers the surface, seed, last Mali job and rectangles it holds,
+  and a layer the swap does not name (`keepLayers()`) or that did not change is shown from the buffer that has it.
+- Both windows change at the same shadow update, at a refresh: no refresh shows one layer's new picture with the other's old
+  one. Every other flip (a frame of one layer scanned out, a frame drawn into a buffer) takes window 4 away in its own update.
+  The three scan-out buffers are shared between the windows: of three, at most two are shown or about to be.
+- The first time, VGF1 is set up and tried unseen: window 4 is turned on under the top window while that is still opaque, three
+  refreshes are waited for and VGF1's error state read (as for VGF0 at attach); only then does the top window blend. An error,
+  and the planes are not asked for again (the line "fb_planes: VGF1 not usable"); a frame whose lower layer the windows cannot
+  take (smaller than 16 pixels, scaled, more layers) is blended on the processor as before. Boot-arg `fb_planes=0` turns it off.
+- Registers from Samsung's dpu_9810 (`decon_reg_set_win_bnd_function`, `dpp_reg_set_alpha_sel`, `dma_reg_set_buf_offset`).
+
+The kernel compiles (`make kernel`); nothing of it has run yet. Expected on the phone: Maps' slow drags at about 1.3 ms in the
+driver a frame (the copy of the map, and nothing when only the window server changed) against 21; the frame rate then set by
+the GPU (26 to 34 ms a frame there); the flings unchanged (one layer). MAME4iOS and PPSSPP the same way (their layers are not
+scaled). The display's line says "N of them two layers on two windows (fb_planes), the lower one copied for M, U us each"; the
+loader's log "exynos_dpu: fb_planes: VGF1 after 3 refreshes ..." once, with the top window's registers as the boot loader left
+them. The USB console's shot shows the top layer alone in such frames (`hakios_fb_scanned()` gives the surface VGF0 scans out).
+
+**The zoom that opens an application.** Reproduced by tapping an icon (`rwtouch tap`) while taking the USB console's shots in a
+row (0.4 s each; `w3-settings-*`, `w3-photos-*`): Settings and Photos open with a **black** window in the zoom (Photos for
+about 2.5 s, until its first frame), then a cross-fade in which a **band of white blocks** crosses the whole width (at about a
+third of the height in Photos, two thirds in Settings), then the application right.
+
+- It is not the display's: every frame of the opening was one layer, scanned out as it is ("9 us each in the driver", no
+  "surfaces in layers" line), so keepLayers, the tiles and the layer rectangles play no part, and the shots, which are the
+  window server's surface itself, show what CoreAnimation drew.
+- The zoom's picture is the application's snapshot: SplashBoard's JPEG (right, light and dark, `snap_test`) decoded by
+  SpringBoard into an IOSurface of **`420f`, two planes**, 1125x2313 (a test tool listing surfaces: id 3769, Y plane 1136 bytes
+  a row, CbCr plane at +2628704; its Y averages 241, the white of Settings, as IOSurface.framework reads it from another
+  process). The window server (OpenGL ES since build 66) draws it black. The OpenGL ES bridge (`userland/src/eagl.c`) copies
+  each plane of a planar surface into its texture once, at `-texImageIOSurface`, and never looks at it again
+  (`surface_changed()` returns false for planar surfaces); whether CoreAnimation's YCbCr drawing over those two textures is what
+  fails, or the copy, needs the bridge's trace (`gltrace`), which takes a boot.
+
+Next: the bridge's trace while an application opens (the 420f texture's formats and the draw that uses it), then the white
+band (a cross-fade frame drawn while the application's surface is half written?).
