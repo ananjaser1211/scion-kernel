@@ -239,10 +239,19 @@ struct NmbPassAttachment {
     uint64_t level, slice, depth_plane, load, store;
     double clear[4]; /* color, or clear[0] depth / stencil */
 };
+/* An attachment's resolveTexture, resolveLevel, resolveSlice and resolveDepthPlane: the single-sample texture a resolving store action
+ * writes; a null texture for none. */
+struct NmbPassResolve {
+    NmbTexture *texture;
+    uint64_t level, slice, depth_plane;
+};
 struct NmbRenderPassDescriptor {
     struct NmbPassAttachment colors[8], depth, stencil;
     uint64_t width, height, array_length, samples;
     NmbBuffer *visibility; /* the pass's visibility result buffer, or null */
+    /* Scion: each attachment's resolve (VectorKit draws the map four times multisampled and resolves it into its drawable, and the
+     * drawable stayed black while no resolve texture reached the runtime) */
+    struct NmbPassResolve color_resolves[8], depth_resolve, stencil_resolve;
 };
 NmbEncoder *nmb_render_encoder_new(NmbCommandBuffer *, const struct NmbRenderPassDescriptor *);
 bool nmb_encoder_end(NmbEncoder *);

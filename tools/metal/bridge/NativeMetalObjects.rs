@@ -1873,10 +1873,26 @@ pub struct NmbRenderPassDescriptor {
     pub array_length: u64,
     pub samples: u64,
     pub visibility: *const NmbBuffer,
+    /// Scion: each attachment's resolve texture, level, slice and depth plane (a null texture for none).
+    pub color_resolves: [NmbPassResolve; 8],
+    pub depth_resolve: NmbPassResolve,
+    pub stencil_resolve: NmbPassResolve,
+}
+
+#[repr(C)]
+pub struct NmbPassResolve {
+    pub texture: *mut NmbTexture,
+    pub level: u64,
+    pub slice: u64,
+    pub depth_plane: u64,
 }
 
 fn texture_of(a: &NmbPassAttachment) -> Result<Option<Texture>, String> {
     if a.texture.is_null() { Ok(None) } else { Ok(Some(get(a.texture)?.0.clone())) }
+}
+
+fn resolve_of(r: &NmbPassResolve) -> Result<Option<Texture>, String> {
+    if r.texture.is_null() { Ok(None) } else { Ok(Some(get(r.texture)?.0.clone())) }
 }
 
 #[unsafe(no_mangle)]
@@ -1885,11 +1901,15 @@ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer, 
     guard(std::ptr::null_mut(), || {
         let d = get(descriptor)?;
         let mut pass = RenderPassDescriptor::new();
-        for (slot, a) in pass.color_attachments.iter_mut().zip(d.colors.iter()) {
+        for ((slot, a), r) in pass.color_attachments.iter_mut().zip(d.colors.iter()).zip(d.color_resolves.iter()) {
             slot.texture = texture_of(a)?;
             slot.level = a.level;
             slot.slice = a.slice;
             slot.depth_plane = a.depth_plane;
+            slot.resolve_texture = resolve_of(r)?;
+            slot.resolve_level = r.level;
+            slot.resolve_slice = r.slice;
+            slot.resolve_depth_plane = r.depth_plane;
             slot.load_action = LoadAction::from_raw(a.load).map_err(e("load action"))?;
             slot.store_action = StoreAction::from_raw(a.store).map_err(e("store action"))?;
             slot.clear_color = ClearColor::new(a.clear[0], a.clear[1], a.clear[2], a.clear[3]);
@@ -1899,6 +1919,10 @@ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer, 
         depth.level = d.depth.level;
         depth.slice = d.depth.slice;
         depth.depth_plane = d.depth.depth_plane;
+        depth.resolve_texture = resolve_of(&d.depth_resolve)?;
+        depth.resolve_level = d.depth_resolve.level;
+        depth.resolve_slice = d.depth_resolve.slice;
+        depth.resolve_depth_plane = d.depth_resolve.depth_plane;
         depth.load_action = LoadAction::from_raw(d.depth.load).map_err(e("load action"))?;
         depth.store_action = StoreAction::from_raw(d.depth.store).map_err(e("store action"))?;
         depth.clear_depth = d.depth.clear[0];
@@ -1907,6 +1931,10 @@ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer, 
         stencil.level = d.stencil.level;
         stencil.slice = d.stencil.slice;
         stencil.depth_plane = d.stencil.depth_plane;
+        stencil.resolve_texture = resolve_of(&d.stencil_resolve)?;
+        stencil.resolve_level = d.stencil_resolve.level;
+        stencil.resolve_slice = d.stencil_resolve.slice;
+        stencil.resolve_depth_plane = d.stencil_resolve.depth_plane;
         stencil.load_action = LoadAction::from_raw(d.stencil.load).map_err(e("load action"))?;
         stencil.store_action = StoreAction::from_raw(d.stencil.store).map_err(e("store action"))?;
         stencil.clear_stencil = d.stencil.clear[0] as u32;

@@ -1549,12 +1549,22 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs);
   out.texture=texture.handle;out.level=a.level;out.slice=a.slice;out.depth_plane=a.depthPlane;out.load=a.loadAction;out.store=a.storeAction;
   return true;
  };
+ // The texture a resolving store action writes (VectorKit draws the map four times multisampled and resolves it into its drawable).
+ auto resolve=[&](MTLRenderPassAttachmentDescriptor *a,NmbPassResolve &out)->bool {
+  if(!a.texture || !a.resolveTexture)return true;
+  if(![(id)a.resolveTexture isKindOfClass:[NBTexture class]])return false;
+  NBTexture *texture=(NBTexture *)a.resolveTexture;if(texture.surface)[_surfaces addObject:texture];
+  [_resourceOwners addObject:texture];
+  out.texture=texture.handle;out.level=a.resolveLevel;out.slice=a.resolveSlice;out.depth_plane=a.resolveDepthPlane;
+  return true;
+ };
  for(unsigned i=0;i<8;i++) {
   MTLRenderPassColorAttachmentDescriptor *c=d.colorAttachments[i];
-  if(!attachment(c,pass.colors[i])){[self refuse:@"foreign color attachment"];return nil;}
+  if(!attachment(c,pass.colors[i]) || !resolve(c,pass.color_resolves[i])){[self refuse:@"foreign color attachment"];return nil;}
   pass.colors[i].clear[0]=c.clearColor.red;pass.colors[i].clear[1]=c.clearColor.green;pass.colors[i].clear[2]=c.clearColor.blue;pass.colors[i].clear[3]=c.clearColor.alpha;
  }
- if(!attachment(d.depthAttachment,pass.depth) || !attachment(d.stencilAttachment,pass.stencil)){[self refuse:@"foreign depth/stencil attachment"];return nil;}
+ if(!attachment(d.depthAttachment,pass.depth) || !attachment(d.stencilAttachment,pass.stencil) ||
+    !resolve(d.depthAttachment,pass.depth_resolve) || !resolve(d.stencilAttachment,pass.stencil_resolve)){[self refuse:@"foreign depth/stencil attachment"];return nil;}
  pass.depth.clear[0]=d.depthAttachment.clearDepth;pass.stencil.clear[0]=d.stencilAttachment.clearStencil;
  pass.width=d.renderTargetWidth;pass.height=d.renderTargetHeight;pass.array_length=d.renderTargetArrayLength;pass.samples=d.defaultRasterSampleCount;
  if(d.visibilityResultBuffer) {
